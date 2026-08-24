@@ -31,6 +31,8 @@ pub use tools::{OpenAiFunction, OpenAiTool, tools_to_openai};
 /// The `input` portion of a `POST /responses` request body.
 #[derive(Debug, Serialize)]
 pub struct ResponsesInput<'a> {
+    /// Always false, we don't need statefulness
+    store: bool,
     pub model: String,
     pub stream: bool,
     /// System prompt, hoisted out of the item list (top-level request parameter).
@@ -232,6 +234,7 @@ pub fn to_responses_input<'a>(
     }
 
     Ok(ResponsesInput {
+        store: false,
         model: config.kind.get_model_name().to_string(),
         instructions,
         tools: tools_to_openai(&config.tools),
