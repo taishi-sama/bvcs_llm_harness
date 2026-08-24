@@ -1,10 +1,60 @@
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize)]
 pub struct History {
-    pub entries: Vec<Entry>
+    pub entries: Vec<Entry>,
+}
+#[derive(Serialize, Deserialize)]
+pub struct ToolCall {
+    pub tool_name: String,
+    pub toolcall_params: String,
+    pub tool_use_id: String,
+}
+#[derive(Serialize, Deserialize)]
+pub struct ToolCallResult {
+    pub result: String,
+    pub is_error: bool,
+    pub tool_use_id: String,
+}
+#[derive(Serialize, Deserialize)]
+pub enum Thinking {
+    Normal { thinking: String },
+    Secret { thinking: String, signature: String },
+}
+#[derive(Serialize, Deserialize)]
+pub enum ImageMIME {
+    PNG,
+    JPEG,
+}
+#[derive(Serialize, Deserialize)]
+pub struct Image {
+    pub mime: ImageMIME,
+    pub base64: String,
+}
+#[derive(Serialize, Deserialize)]
+pub struct MessageContent {
+    pub text: Option<String>,
+    pub image: Option<Image>, //Support passing as Base64-encoded image for now
 }
 
+#[derive(Serialize, Deserialize)]
 pub enum Entry {
-    UserMessage{content: String},
-    ResponseNormal{thinking: Option<String>, content: String},
-    ResponseToolCall{thinking: Option<String>, tool_call: String, toolcall_params: String},
-    ToolCallResult{result: String}
+    /// Should be only one in beginning of history
+    SystemPrompt {
+        content: String,
+    },
+    UserMessage {
+        content: MessageContent,
+    },
+    ResponseNormal {
+        thinking: Option<Thinking>,
+        content: String,
+    },
+    ResponseToolCall {
+        thinking: Option<Thinking>,
+        tool_call: Vec<ToolCall>,
+    },
+    ToolCallResult {
+        tool_call: Vec<ToolCallResult>,
+    },
 }
