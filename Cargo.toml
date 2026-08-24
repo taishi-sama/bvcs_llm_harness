@@ -1,0 +1,13 @@
+[package]
+name = "bvcs_llm_harness"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+resolver = "3"
+members = [
+  "crates/*",
+]
+
+[dependencies]
+bevy = "0.19.1"
