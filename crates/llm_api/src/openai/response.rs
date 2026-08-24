@@ -297,6 +297,7 @@ mod tests {
                 model_name: "qwen3.6-35b-a3b".into(),
                 streaming: false,
             },
+            tools: Default::default(),
         }
     }
 

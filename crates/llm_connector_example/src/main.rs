@@ -15,9 +15,9 @@ async fn main() -> Result<(), anyhow::Error> {
             model_name: "qwen3.6-35b-a3b".into(),
             streaming: false,
         },
+        tools: Default::default(),
     };
     let model = GlobalConfig {
-        tools: vec!["magic_ball".into()],
         model_config: model,
         token: "".into(),
         endpoint: "http://127.0.0.1:8080/v1/responses".into(),
@@ -44,7 +44,7 @@ async fn main() -> Result<(), anyhow::Error> {
             }
             return Ok(());
         }
-        
+
         let response = validation.unwrap();
         let res = client
             .post(model.endpoint.clone())
@@ -60,8 +60,11 @@ async fn main() -> Result<(), anyhow::Error> {
         history.append(&mut entries);
         let mut buffer = String::new();
         io::stdin().read_line(&mut buffer)?;
-        history.push(
-            Entry::UserMessage { content: MessageContent { text: Some(buffer), image: None } }
-        );
-    } 
+        history.push(Entry::UserMessage {
+            content: MessageContent {
+                text: Some(buffer),
+                image: None,
+            },
+        });
+    }
 }

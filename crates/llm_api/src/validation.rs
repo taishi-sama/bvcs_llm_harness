@@ -227,6 +227,7 @@ mod tests {
                 model_name: "gpt-test".into(),
                 streaming: false,
             },
+            tools: Default::default(),
         }
     }
 
@@ -235,6 +236,7 @@ mod tests {
             kind: ModelKind::AnthropicCompatible {
                 model_name: "claude-test".into(),
             },
+            tools: Default::default(),
         }
     }
 

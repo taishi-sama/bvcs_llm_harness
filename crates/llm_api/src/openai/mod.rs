@@ -246,6 +246,7 @@ mod tests {
                 model_name: "gpt-test".into(),
                 streaming: false,
             },
+            tools: Default::default(),
         }
     }
 

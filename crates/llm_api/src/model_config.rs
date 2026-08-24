@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::generic_tool::Tool;
+
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ModelKind {
     OpenAICompatible { model_name: String, streaming: bool },
@@ -23,11 +25,11 @@ impl ModelKind {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ModelConfig {
     pub kind: ModelKind,
+    pub tools: Vec<Tool>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GlobalConfig {
-    pub tools: Vec<String>,
     pub model_config: ModelConfig,
     pub token: String,
     pub endpoint: String,
