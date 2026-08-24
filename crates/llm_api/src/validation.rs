@@ -1,4 +1,5 @@
-use crate::history::Entry;
+use crate::model_config::{ModelConfig, ModelKind};
+use llm_history_model::history::{Entry, Thinking};
 use serde_json::Value;
 use std::collections::HashSet;
 
@@ -30,6 +31,9 @@ pub enum ValidationError {
     DuplicateToolCallId { tool_use_id: String },
     /// History ends with tool calls that have no results
     UnansweredToolCalls { tool_use_ids: Vec<String> },
+    /// Anthropic requires a signature to resend thinking blocks;
+    /// `Thinking::Normal` cannot be round-tripped and would be silently dropped.
+    UnsignedThinkingRejected { index: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,7 +87,35 @@ fn is_json_object(s: &str) -> bool {
     matches!(serde_json::from_str::<Value>(s), Ok(Value::Object(_)))
 }
 
-/// Validates a raw history for serializability into OpenAI-compatible wire formats.
+/// Provider-specific checks layered on top of the shared structural rules.
+fn check_provider_rules(
+    entries: &[Entry],
+    config: &ModelConfig,
+    errors: &mut Vec<ValidationError>,
+) {
+    match &config.kind {
+        ModelKind::AnthropicCompatible { .. } => {
+            // Unsigned thinking cannot be resent to Anthropic (signature required).
+            for (i, entry) in entries.iter().enumerate() {
+                let thinking = match entry {
+                    Entry::ResponseNormal { thinking, .. }
+                    | Entry::ResponseToolCall { thinking, .. } => thinking,
+                    _ => continue,
+                };
+                if matches!(thinking, Some(Thinking::Normal { .. })) {
+                    errors.push(ValidationError::UnsignedThinkingRejected { index: i });
+                }
+            }
+        }
+        ModelKind::OpenAICompatible { .. } => {
+            // No additional constraints yet; both signed and unsigned thinking
+            // serialize fine as reasoning items.
+        }
+    }
+}
+
+/// Validates a raw history against `config` for serializability into the
+/// configured provider's wire format.
 ///
 /// Enforced rules:
 /// - at most one [`Entry::SystemPrompt`], at index 0
@@ -92,7 +124,14 @@ fn is_json_object(s: &str) -> bool {
 /// - every `toolcall_params` parses as a JSON object
 /// - every result references a call from the immediately preceding batch
 /// - no duplicate tool_use_ids, no unanswered calls at the end of history
-pub fn validate_entries(entries: &[Entry]) -> Result<(), Vec<ValidationError>> {
+///
+/// Provider-specific (`config.kind`):
+/// - `AnthropicCompatible`: rejects unsigned [`Thinking::Normal`] blocks
+/// - `OpenAICompatible`: no extra rules yet
+pub fn validate_entries(
+    entries: &[Entry],
+    config: &ModelConfig,
+) -> Result<(), Vec<ValidationError>> {
     let mut errors = Vec::new();
     let mut call_ids: HashSet<&str> = HashSet::new();
     let mut result_ids: HashSet<&str> = HashSet::new();
@@ -168,6 +207,8 @@ pub fn validate_entries(entries: &[Entry]) -> Result<(), Vec<ValidationError>> {
         });
     }
 
+    check_provider_rules(entries, config, &mut errors);
+
     if errors.is_empty() {
         Ok(())
     } else {
@@ -178,7 +219,23 @@ pub fn validate_entries(entries: &[Entry]) -> Result<(), Vec<ValidationError>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history::{Image, ImageMIME, MessageContent, Thinking, ToolCall, ToolCallResult};
+    use llm_history_model::history::{Image, ImageMIME, MessageContent, ToolCall, ToolCallResult};
+
+    fn openai_config() -> ModelConfig {
+        ModelConfig {
+            kind: ModelKind::OpenAICompatible {
+                model_name: "gpt-test".into(), streaming: false,
+            },
+        }
+    }
+
+    fn anthropic_config() -> ModelConfig {
+        ModelConfig {
+            kind: ModelKind::AnthropicCompatible {
+                model_name: "claude-test".into(),
+            },
+        }
+    }
 
     fn text_user(t: &str) -> Entry {
         Entry::UserMessage {
@@ -225,7 +282,8 @@ mod tests {
             tool_result("call_1"),
             assistant_text("It is sunny."),
         ];
-        assert_eq!(validate_entries(&h), Ok(()));
+        assert_eq!(validate_entries(&h, &openai_config()), Ok(()));
+        assert_eq!(validate_entries(&h, &anthropic_config()), Ok(()));
     }
 
     #[test]
@@ -233,8 +291,9 @@ mod tests {
         let h = vec![
             text_user("q"),
             Entry::ResponseToolCall {
-                thinking: Some(Thinking::Normal {
+                thinking: Some(Thinking::Secret {
                     thinking: "hmm".into(),
+                    signature: "sig".into(),
                 }),
                 tool_call: vec![
                     ToolCall {
@@ -271,7 +330,41 @@ mod tests {
                 content: "done".into(),
             },
         ];
-        assert_eq!(validate_entries(&h), Ok(()));
+        assert_eq!(validate_entries(&h, &openai_config()), Ok(()));
+        assert_eq!(validate_entries(&h, &anthropic_config()), Ok(()));
+    }
+
+    #[test]
+    fn anthropic_rejects_unsigned_thinking_but_openai_accepts() {
+        let h = vec![
+            text_user("q"),
+            Entry::ResponseNormal {
+                thinking: Some(Thinking::Normal {
+                    thinking: "hmm".into(),
+                }),
+                content: "answer".into(),
+            },
+        ];
+        assert_eq!(validate_entries(&h, &openai_config()), Ok(()));
+        assert_eq!(
+            validate_entries(&h, &anthropic_config()),
+            Err(vec![ValidationError::UnsignedThinkingRejected { index: 1 }])
+        );
+    }
+
+    #[test]
+    fn anthropic_accepts_signed_thinking() {
+        let h = vec![
+            text_user("q"),
+            Entry::ResponseNormal {
+                thinking: Some(Thinking::Secret {
+                    thinking: "hmm".into(),
+                    signature: "sig==".into(),
+                }),
+                content: "answer".into(),
+            },
+        ];
+        assert_eq!(validate_entries(&h, &anthropic_config()), Ok(()));
     }
 
     #[test]
@@ -283,7 +376,7 @@ mod tests {
             },
         ];
         assert!(matches!(
-            validate_entries(&h),
+            validate_entries(&h, &openai_config()),
             Err(e) if e.contains(&ValidationError::MisplacedSystemPrompt { index: 1 })
         ));
     }
@@ -292,7 +385,7 @@ mod tests {
     fn rejects_history_starting_with_assistant() {
         let h = vec![assistant_text("hello")];
         assert!(matches!(
-            validate_entries(&h),
+            validate_entries(&h, &openai_config()),
             Err(e) if e.contains(&ValidationError::IllegalTransition {
                 index: 0,
                 from: "start",
@@ -305,7 +398,7 @@ mod tests {
     fn rejects_consecutive_user_messages() {
         let h = vec![text_user("a"), text_user("b")];
         assert!(matches!(
-            validate_entries(&h),
+            validate_entries(&h, &openai_config()),
             Err(e) if e.iter().any(|err| matches!(
                 err,
                 ValidationError::IllegalTransition { index: 1, .. }
@@ -322,7 +415,7 @@ mod tests {
             },
         }];
         assert!(matches!(
-            validate_entries(&h),
+            validate_entries(&h, &openai_config()),
             Err(e) if e.contains(&ValidationError::EmptyUserMessage { index: 0 })
         ));
     }
@@ -338,14 +431,14 @@ mod tests {
                 }),
             },
         }];
-        assert_eq!(validate_entries(&h), Ok(()));
+        assert_eq!(validate_entries(&h, &openai_config()), Ok(()));
     }
 
     #[test]
     fn rejects_orphan_tool_result() {
         let h = vec![text_user("q"), tool_result("ghost")];
         assert!(matches!(
-            validate_entries(&h),
+            validate_entries(&h, &openai_config()),
             Err(e) if e.iter().any(|err| matches!(
                 err,
                 ValidationError::OrphanToolResult { tool_use_id, .. } if tool_use_id == "ghost"
@@ -363,7 +456,7 @@ mod tests {
             tool_result("dup"),
         ];
         assert!(matches!(
-            validate_entries(&h),
+            validate_entries(&h, &openai_config()),
             Err(e) if e.contains(&ValidationError::DuplicateToolCallId {
                 tool_use_id: "dup".into()
             })
@@ -385,7 +478,7 @@ mod tests {
             tool_result("c"),
         ];
         assert!(matches!(
-            validate_entries(&h),
+            validate_entries(&h, &openai_config()),
             Err(e) if e.contains(&ValidationError::InvalidToolParams { entry: 1, call: 0 })
         ));
     }
@@ -394,7 +487,7 @@ mod tests {
     fn rejects_unanswered_trailing_calls() {
         let h = vec![text_user("q"), tool_call("dangling")];
         assert!(matches!(
-            validate_entries(&h),
+            validate_entries(&h, &openai_config()),
             Err(e) if e.contains(&ValidationError::UnansweredToolCalls {
                 tool_use_ids: vec!["dangling".into()]
             })
@@ -404,6 +497,6 @@ mod tests {
     #[test]
     fn collects_multiple_errors() {
         let h = vec![tool_call("x"), tool_result("y")];
-        assert!(matches!(validate_entries(&h), Err(e) if e.len() >= 3));
+        assert!(matches!(validate_entries(&h, &openai_config()), Err(e) if e.len() >= 3));
     }
 }

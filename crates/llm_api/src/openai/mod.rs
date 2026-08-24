@@ -18,13 +18,15 @@
 //! - Reasoning items get synthesized ids (`rs_NNNNNN`) since the model does not
 //!   track provider item ids.
 
-use crate::history::{Entry, ImageMIME, Thinking};
+use crate::model_config::ModelConfig;
 use crate::validation::validate_entries;
+use llm_history_model::history::{Entry, ImageMIME, MessageContent, Thinking};
 use serde::Serialize;
 
 /// The `input` portion of a `POST /responses` request body.
 #[derive(Debug, Serialize)]
 pub struct ResponsesInput<'a> {
+    pub model: String,
     /// System prompt, hoisted out of the item list (top-level request parameter).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instructions: Option<&'a str>,
@@ -139,7 +141,7 @@ fn push_reasoning(items: &mut Vec<InputItem>, thinking: Option<&Thinking>, count
     }));
 }
 
-fn user_content(content: &crate::history::MessageContent) -> Content {
+fn user_content(content: &MessageContent) -> Content {
     match (&content.text, &content.image) {
         (Some(text), None) => Content::Text(text.clone()),
         (text, image) => {
@@ -159,14 +161,16 @@ fn user_content(content: &crate::history::MessageContent) -> Content {
     }
 }
 
-/// Validates `entries` and converts them into the Responses API `input` shape.
+/// Validates `entries` against `config` and converts them into the Responses
+/// API `input` shape.
 ///
 /// Returns all validation errors if the history is malformed; serialization is
 /// total otherwise (no additional failure modes).
-pub fn to_responses_input(
-    entries: &[Entry],
-) -> Result<ResponsesInput<'_>, Vec<crate::validation::ValidationError>> {
-    validate_entries(entries)?;
+pub fn to_responses_input<'a>(
+    entries: &'a [Entry],
+    config: &ModelConfig,
+) -> Result<ResponsesInput<'a>, Vec<crate::validation::ValidationError>> {
+    validate_entries(entries, config)?;
 
     let mut instructions: Option<&str> = None;
     let mut items: Vec<InputItem> = Vec::new();
@@ -219,6 +223,7 @@ pub fn to_responses_input(
     }
 
     Ok(ResponsesInput {
+        model: config.kind.get_model_name().to_string(),
         instructions,
         input: items,
     })
@@ -227,8 +232,18 @@ pub fn to_responses_input(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history::{Image, MessageContent, ToolCall, ToolCallResult};
+    use crate::model_config::ModelKind;
+    use llm_history_model::history::{Image, MessageContent, ToolCall, ToolCallResult};
     use serde_json::{Value, json};
+
+    fn config() -> ModelConfig {
+        ModelConfig {
+            kind: ModelKind::OpenAICompatible {
+                model_name: "gpt-test".into(),
+                streaming: false,
+            },
+        }
+    }
 
     fn text_user(t: &str) -> Entry {
         Entry::UserMessage {
@@ -240,7 +255,8 @@ mod tests {
     }
 
     fn serialize(entries: &[Entry]) -> Value {
-        serde_json::to_value(to_responses_input(entries).expect("valid history")).unwrap()
+        serde_json::to_value(to_responses_input(entries, &config()).expect("valid history"))
+            .unwrap()
     }
 
     #[test]
@@ -416,7 +432,7 @@ mod tests {
 
     #[test]
     fn invalid_history_propagates_errors() {
-        let err = to_responses_input(&[text_user("a"), text_user("b")]).unwrap_err();
+        let err = to_responses_input(&[text_user("a"), text_user("b")], &config()).unwrap_err();
         assert!(err.iter().any(|e| matches!(
             e,
             crate::validation::ValidationError::IllegalTransition { .. }
