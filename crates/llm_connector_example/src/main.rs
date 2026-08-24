@@ -1,3 +1,6 @@
+use std::io;
+
+use futures_util::StreamExt;
 use llm_api::{
     model_config::{GlobalConfig, ModelConfig, ModelKind},
     openai,
@@ -14,11 +17,12 @@ async fn main() -> Result<(), anyhow::Error> {
         },
     };
     let model = GlobalConfig {
+        tools: vec!["magic_ball".into()],
         model_config: model,
         token: "".into(),
         endpoint: "http://127.0.0.1:8080/v1/responses".into(),
     };
-    let history = vec![
+    let mut history = vec![
         Entry::SystemPrompt {
             content: "You are useful assistant".into(),
         },
@@ -29,20 +33,35 @@ async fn main() -> Result<(), anyhow::Error> {
             },
         },
     ];
-    let validation = openai::to_responses_input(&history, &model.model_config);
-    if let Err(errors) = validation {
-        for e in errors {
-            println!("{:?}", e)
-        }
-        return Ok(());
+    for i in &history {
+        println!("{:?}", i)
     }
-    let response = validation.unwrap();
-
-    let res = client
-        .post(model.endpoint.clone())
-        .json(&response)
-        .send()
-        .await?;
-    println!("{}", String::from_utf8_lossy(&res.bytes().await?.to_vec()));
-    Ok(())
+    loop {
+        let validation = openai::to_responses_input(&history, &model.model_config);
+        if let Err(errors) = validation {
+            for e in errors {
+                println!("{:?}", e)
+            }
+            return Ok(());
+        }
+        
+        let response = validation.unwrap();
+        let res = client
+            .post(model.endpoint.clone())
+            .json(&response)
+            .send()
+            .await?;
+        // println!("{}", String::from_utf8_lossy(&res.bytes().await?.to_vec()));
+        let res: openai::response::Response = res.json().await?;
+        let mut entries = res.to_entries();
+        for i in &entries {
+            println!("{:?}", i)
+        }
+        history.append(&mut entries);
+        let mut buffer = String::new();
+        io::stdin().read_line(&mut buffer)?;
+        history.push(
+            Entry::UserMessage { content: MessageContent { text: Some(buffer), image: None } }
+        );
+    } 
 }

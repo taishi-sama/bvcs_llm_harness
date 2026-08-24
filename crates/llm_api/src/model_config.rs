@@ -9,7 +9,13 @@ impl ModelKind {
     pub fn get_model_name(&self) -> &str {
         match self {
             ModelKind::OpenAICompatible { model_name, .. }
-            | ModelKind::AnthropicCompatible { model_name, .. } => model_name,
+            | ModelKind::AnthropicCompatible { model_name } => model_name,
+        }
+    }
+    pub fn get_streamable(&self) -> bool {
+        match self {
+            ModelKind::OpenAICompatible { streaming, .. } => *streaming,
+            ModelKind::AnthropicCompatible { .. } => false,
         }
     }
 }
@@ -21,6 +27,7 @@ pub struct ModelConfig {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GlobalConfig {
+    pub tools: Vec<String>,
     pub model_config: ModelConfig,
     pub token: String,
     pub endpoint: String,

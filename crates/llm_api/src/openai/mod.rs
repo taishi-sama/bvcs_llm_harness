@@ -18,6 +18,8 @@
 //! - Reasoning items get synthesized ids (`rs_NNNNNN`) since the model does not
 //!   track provider item ids.
 
+pub mod response;
+
 use crate::model_config::ModelConfig;
 use crate::validation::validate_entries;
 use llm_history_model::history::{Entry, ImageMIME, MessageContent, Thinking};
@@ -27,6 +29,7 @@ use serde::Serialize;
 #[derive(Debug, Serialize)]
 pub struct ResponsesInput<'a> {
     pub model: String,
+    pub stream: bool,
     /// System prompt, hoisted out of the item list (top-level request parameter).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instructions: Option<&'a str>,
@@ -226,6 +229,7 @@ pub fn to_responses_input<'a>(
         model: config.kind.get_model_name().to_string(),
         instructions,
         input: items,
+        stream: config.kind.get_streamable(),
     })
 }
 
@@ -275,6 +279,8 @@ mod tests {
         assert_eq!(
             v,
             json!({
+                "model": "gpt-test",
+                "stream": false,
                 "instructions": "Be terse.",
                 "input": [
                     {"type": "message", "role": "user", "content": "hi"},

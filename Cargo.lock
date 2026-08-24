@@ -3634,6 +3634,7 @@ name = "llm_connector_example"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "futures-util",
  "llm_api",
  "llm_history_model",
  "reqwest",
