@@ -224,7 +224,8 @@ mod tests {
     fn openai_config() -> ModelConfig {
         ModelConfig {
             kind: ModelKind::OpenAICompatible {
-                model_name: "gpt-test".into(), streaming: false,
+                model_name: "gpt-test".into(),
+                streaming: false,
             },
         }
     }

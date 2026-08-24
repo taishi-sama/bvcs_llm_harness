@@ -8,7 +8,8 @@ pub enum ModelKind {
 impl ModelKind {
     pub fn get_model_name(&self) -> &str {
         match self {
-            ModelKind::OpenAICompatible { model_name, .. } | ModelKind::AnthropicCompatible { model_name , ..} => model_name,
+            ModelKind::OpenAICompatible { model_name, .. }
+            | ModelKind::AnthropicCompatible { model_name, .. } => model_name,
         }
     }
 }
