@@ -1,11 +1,9 @@
-use std::io;
+use std::{collections::HashMap, io};
 
-use futures_util::StreamExt;
 use llm_api::{
-    model_config::{GlobalConfig, ModelConfig, ModelKind},
-    openai,
+    generic_tool::{ParameterDescription, ParameterType, Tool}, model_config::{GlobalConfig, ModelConfig, ModelKind}, openai,
 };
-use llm_history_model::history::{Entry, MessageContent};
+use llm_history_model::history::{Entry, MessageContent, ToolCallResult};
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
@@ -15,7 +13,11 @@ async fn main() -> Result<(), anyhow::Error> {
             model_name: "qwen3.6-35b-a3b".into(),
             streaming: false,
         },
-        tools: Default::default(),
+        tools: vec![Tool{ name: "get_weather".into(), parameters: {
+            let mut hashmap = HashMap::new();
+            hashmap.insert("city".to_string(), ParameterDescription{ r#type: ParameterType::String, description: "City".into() });
+            hashmap
+        } }],
     };
     let model = GlobalConfig {
         model_config: model,
@@ -58,13 +60,23 @@ async fn main() -> Result<(), anyhow::Error> {
             println!("{:?}", i)
         }
         history.append(&mut entries);
-        let mut buffer = String::new();
-        io::stdin().read_line(&mut buffer)?;
-        history.push(Entry::UserMessage {
-            content: MessageContent {
-                text: Some(buffer),
-                image: None,
-            },
-        });
+        if let Entry::ResponseToolCall{ thinking: _, tool_call } = history.last().unwrap() {
+            let mut tool_response = vec![];
+            for i in tool_call {
+                if i.tool_name == "get_weather" {
+                    tool_response.push(ToolCallResult{ result: "30 degrees Celsius".into(), is_error: false, tool_use_id: i.tool_use_id.clone() });
+                }
+            }
+            history.push(Entry::ToolCallResult { tool_call: tool_response });
+        } else {
+            let mut buffer = String::new();
+            io::stdin().read_line(&mut buffer)?;
+            history.push(Entry::UserMessage {
+                content: MessageContent {
+                    text: Some(buffer),
+                    image: None,
+                },
+            });
+        }
     }
 }

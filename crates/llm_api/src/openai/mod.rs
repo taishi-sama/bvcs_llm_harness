@@ -19,11 +19,14 @@
 //!   track provider item ids.
 
 pub mod response;
+pub mod tools;
 
 use crate::model_config::ModelConfig;
 use crate::validation::validate_entries;
 use llm_history_model::history::{Entry, ImageMIME, MessageContent, Thinking};
 use serde::Serialize;
+
+pub use tools::{OpenAiFunction, OpenAiTool, tools_to_openai};
 
 /// The `input` portion of a `POST /responses` request body.
 #[derive(Debug, Serialize)]
@@ -33,6 +36,9 @@ pub struct ResponsesInput<'a> {
     /// System prompt, hoisted out of the item list (top-level request parameter).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instructions: Option<&'a str>,
+    /// Function tools forwarded from `ModelConfig.tools`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<OpenAiTool>,
     pub input: Vec<InputItem>,
 }
 
@@ -228,6 +234,7 @@ pub fn to_responses_input<'a>(
     Ok(ResponsesInput {
         model: config.kind.get_model_name().to_string(),
         instructions,
+        tools: tools_to_openai(&config.tools),
         input: items,
         stream: config.kind.get_streamable(),
     })
@@ -295,6 +302,47 @@ mod tests {
     fn no_system_prompt_omits_instructions() {
         let v = serialize(&[text_user("hi")]);
         assert!(v.get("instructions").is_none());
+        assert!(v.get("tools").is_none()); // empty config.tools omitted
+    }
+
+    #[test]
+    fn config_tools_are_forwarded() {
+        let mut parameters = std::collections::HashMap::new();
+        parameters.insert(
+            "city".to_owned(),
+            crate::generic_tool::ParameterDescription {
+                r#type: crate::generic_tool::ParameterType::String,
+                description: "City name".to_owned(),
+            },
+        );
+        let cfg = ModelConfig {
+            tools: vec![crate::generic_tool::Tool {
+                name: "get_weather".to_owned(),
+                parameters,
+            }],
+            ..config()
+        };
+
+        let v = serde_json::to_value(
+            to_responses_input(&[text_user("hi")], &cfg).expect("valid history"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            v["tools"],
+            json!([{
+                "type": "function",
+                "name": "get_weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string", "description": "City name"}
+                    },
+                    "required": ["city"],
+                    "additionalProperties": false
+                }
+            }])
+        );
     }
 
     #[test]
