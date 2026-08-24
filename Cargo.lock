@@ -3361,6 +3361,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 
 [[package]]
+name = "llm_api"
+version = "0.1.0"
+dependencies = [
+ "llm_history_model",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "llm_history_model"
 version = "0.1.0"
 dependencies = [
