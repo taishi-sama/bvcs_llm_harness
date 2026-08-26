@@ -296,6 +296,7 @@ mod tests {
             kind: ModelKind::OpenAICompatible {
                 model_name: "qwen3.6-35b-a3b".into(),
                 streaming: false,
+                prompt_cache_key: "prompt_cache_key".into(),
             },
             tools: Default::default(),
         }

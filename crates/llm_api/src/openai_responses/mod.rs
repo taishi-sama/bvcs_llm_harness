@@ -35,6 +35,8 @@ pub struct ResponsesInput<'a> {
     store: bool,
     pub model: String,
     pub stream: bool,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    prompt_cache_key: String,
     /// System prompt, hoisted out of the item list (top-level request parameter).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instructions: Option<&'a str>,
@@ -232,14 +234,15 @@ pub fn to_responses_input<'a>(
             }
         }
     }
-
+    let crate::model_config::ModelKind::OpenAICompatible { model_name, streaming, prompt_cache_key } = &config.kind else { return Err(vec![])};
     Ok(ResponsesInput {
+        prompt_cache_key: prompt_cache_key.clone(),
         store: false,
-        model: config.kind.get_model_name().to_string(),
+        model: model_name.to_string(),
         instructions,
         tools: tools_to_openai(&config.tools),
         input: items,
-        stream: config.kind.get_streamable(),
+        stream: *streaming,
     })
 }
 
@@ -253,6 +256,7 @@ mod tests {
     fn config() -> ModelConfig {
         ModelConfig {
             kind: ModelKind::OpenAICompatible {
+                prompt_cache_key: "prompt_cache_key".into(),
                 model_name: "gpt-test".into(),
                 streaming: false,
             },
@@ -319,10 +323,7 @@ mod tests {
             },
         );
         let cfg = ModelConfig {
-            tools: vec![crate::generic_tool::Tool {
-                name: "get_weather".to_owned(),
-                parameters,
-            }],
+            tools: vec![crate::generic_tool::Tool {name:"get_weather".to_owned(),parameters, description: None }],
             ..config()
         };
 

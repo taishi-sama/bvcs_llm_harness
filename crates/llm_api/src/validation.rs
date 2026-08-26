@@ -226,6 +226,7 @@ mod tests {
             kind: ModelKind::OpenAICompatible {
                 model_name: "gpt-test".into(),
                 streaming: false,
+                prompt_cache_key: "test_key".into(),
             },
             tools: Default::default(),
         }

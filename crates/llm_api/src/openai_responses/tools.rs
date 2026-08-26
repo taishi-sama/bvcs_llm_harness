@@ -66,7 +66,7 @@ impl OpenAiTool {
             r#type: "function",
             function: OpenAiFunction {
                 name: tool.name.clone(),
-                description: String::new(),
+                description: tool.description.clone().unwrap_or_default(),
                 parameters: parameters_schema(tool),
             },
         }
@@ -103,6 +103,7 @@ mod tests {
         Tool {
             name: "get_weather".to_owned(),
             parameters,
+            description: None
         }
     }
 

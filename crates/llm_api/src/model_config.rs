@@ -2,9 +2,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::generic_tool::Tool;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum ModelKind {
-    OpenAICompatible { model_name: String, streaming: bool },
+    OpenAICompatible { model_name: String, streaming: bool, prompt_cache_key: String },
     AnthropicCompatible { model_name: String },
 }
 impl ModelKind {
@@ -22,7 +22,7 @@ impl ModelKind {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ModelConfig {
     pub kind: ModelKind,
     pub tools: Vec<Tool>,

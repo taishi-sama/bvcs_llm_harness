@@ -10,7 +10,7 @@ pub struct ToolCall {
     pub toolcall_params: String,
     pub tool_use_id: String,
 }
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ToolCallResult {
     pub result: String,
     pub is_error: bool,
