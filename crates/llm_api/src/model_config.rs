@@ -4,8 +4,14 @@ use crate::generic_tool::Tool;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum ModelKind {
-    OpenAICompatible { model_name: String, streaming: bool, prompt_cache_key: String },
-    AnthropicCompatible { model_name: String },
+    OpenAICompatible {
+        model_name: String,
+        streaming: bool,
+        prompt_cache_key: String,
+    },
+    AnthropicCompatible {
+        model_name: String,
+    },
 }
 impl ModelKind {
     pub fn get_model_name(&self) -> &str {

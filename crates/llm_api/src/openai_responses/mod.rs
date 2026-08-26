@@ -234,7 +234,14 @@ pub fn to_responses_input<'a>(
             }
         }
     }
-    let crate::model_config::ModelKind::OpenAICompatible { model_name, streaming, prompt_cache_key } = &config.kind else { return Err(vec![])};
+    let crate::model_config::ModelKind::OpenAICompatible {
+        model_name,
+        streaming,
+        prompt_cache_key,
+    } = &config.kind
+    else {
+        return Err(vec![]);
+    };
     Ok(ResponsesInput {
         prompt_cache_key: prompt_cache_key.clone(),
         store: false,
@@ -323,7 +330,11 @@ mod tests {
             },
         );
         let cfg = ModelConfig {
-            tools: vec![crate::generic_tool::Tool {name:"get_weather".to_owned(),parameters, description: None }],
+            tools: vec![crate::generic_tool::Tool {
+                name: "get_weather".to_owned(),
+                parameters,
+                description: None,
+            }],
             ..config()
         };
 

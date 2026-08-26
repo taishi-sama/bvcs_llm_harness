@@ -4,8 +4,8 @@ use std::{
     io::{self, Write},
 };
 
-use http_body_util::{BodyExt as _, Empty};
-use hyper::{Request, body::Bytes, client::conn::http1};
+use http_body_util::BodyExt as _;
+use hyper::{Request, client::conn::http1};
 use hyper_util::rt::TokioIo;
 use llm_api::{
     generic_tool::{ParameterDescription, ParameterType, Tool},
@@ -18,7 +18,7 @@ use tokio::net::TcpStream;
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
-    let client = reqwest::Client::new();
+    let _client = reqwest::Client::new();
     let model = ModelConfig {
         kind: ModelKind::OpenAICompatible {
             prompt_cache_key: "llm_connector_example".into(),

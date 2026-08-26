@@ -103,7 +103,7 @@ mod tests {
         Tool {
             name: "get_weather".to_owned(),
             parameters,
-            description: None
+            description: None,
         }
     }
 
