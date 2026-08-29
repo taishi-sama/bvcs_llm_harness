@@ -301,8 +301,10 @@ mod tests {
         assert_eq!(
             v,
             json!({
+                "store": false,
                 "model": "gpt-test",
                 "stream": false,
+                "prompt_cache_key": "prompt_cache_key",
                 "instructions": "Be terse.",
                 "input": [
                     {"type": "message", "role": "user", "content": "hi"},

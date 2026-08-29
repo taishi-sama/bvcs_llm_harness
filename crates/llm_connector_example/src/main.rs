@@ -8,9 +8,7 @@ use http_body_util::BodyExt as _;
 use hyper::{Request, client::conn::http1};
 use hyper_util::rt::TokioIo;
 use llm_api::{
-    generic_tool::{ParameterDescription, ParameterType, Tool},
-    model_config::{GlobalConfig, ModelConfig, ModelKind},
-    openai_responses::{self, response::Response},
+    generic_tool::{ParameterDescription, ParameterType, Tool}, model_config::{GlobalConfig, ModelConfig, ModelKind}, openai_completions, openai_responses::{self, response::ResponsesResponse},
 };
 use llm_history_model::history::{Entry, MessageContent, ToolCallResult};
 use serde_json::Value;
@@ -79,15 +77,15 @@ async fn main() -> Result<(), anyhow::Error> {
     let model = GlobalConfig {
         model_config: model,
         token: "".into(),
-        endpoint: "http://127.0.0.1:8080/v1/responses".into(),
+        endpoint: "http://127.0.0.1:8080/v1/chat/completions".into(),
     };
     let mut history = vec![
         Entry::SystemPrompt {
-            content: "You are useful assistant".into(),
+            content: "You are automatic diagnostics system running under generic Linux system platform.".into(),
         },
         Entry::UserMessage {
             content: MessageContent {
-                text: Some("Hello!".into()),
+                text: Some("Determine in minimal amount of steps what are characteristics of current machine using only available tools.".into()),
                 image: None,
             },
         },
@@ -96,7 +94,7 @@ async fn main() -> Result<(), anyhow::Error> {
         println!("{:?}", i)
     }
     loop {
-        let validation = openai_responses::to_responses_input(&history, &model.model_config);
+        let validation = openai_completions::to_completions_input(&history, &model.model_config);
         if let Err(errors) = validation {
             for e in errors {
                 println!("{:?}", e)
@@ -153,7 +151,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 buffer.write_all(chunk).unwrap();
             }
         }
-        let response_parsed: Response = serde_json::from_slice(&buffer).unwrap();
+        let response_parsed: openai_completions::response::CompletionResponse = serde_json::from_slice(&buffer).unwrap();
         let mut entries = response_parsed.to_entries();
         for i in &entries {
             println!("{:?}", i)

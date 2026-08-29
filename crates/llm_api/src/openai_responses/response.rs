@@ -18,7 +18,7 @@ use serde_json::Value;
 
 /// Top-level `POST /responses` response body.
 #[derive(Debug, Clone, Deserialize)]
-pub struct Response {
+pub struct ResponsesResponse {
     pub id: String,
     /// Always `"response"`; optional for lenient parsing.
     #[serde(default)]
@@ -170,7 +170,7 @@ fn normalize_output(output: &Option<Value>) -> String {
     }
 }
 
-impl Response {
+impl ResponsesResponse {
     pub fn from_json(json: &str) -> serde_json::Result<Self> {
         serde_json::from_str(json)
     }
@@ -337,7 +337,7 @@ mod tests {
 
     #[test]
     fn parses_real_endpoint_payload() {
-        let resp = Response::from_json(REAL_PAYLOAD).expect("parses");
+        let resp = ResponsesResponse::from_json(REAL_PAYLOAD).expect("parses");
         assert_eq!(resp.model, "qwen3.6-35b-a3b");
         assert_eq!(resp.status.as_deref(), Some("completed"));
         let usage = resp.usage.as_ref().expect("usage");
@@ -363,7 +363,7 @@ mod tests {
 
     #[test]
     fn merges_parallel_calls_and_outputs() {
-        let resp = Response::from_value(serde_json::json!({
+        let resp = ResponsesResponse::from_value(serde_json::json!({
             "id": "resp_x", "model": "m", "status": "completed",
             "output": [
                 {"type": "reasoning", "id": "rs_0", "summary": [], "content": [{"type": "reasoning_text", "text": "plan"}]},
@@ -402,7 +402,7 @@ mod tests {
 
     #[test]
     fn skips_items_without_call_id_and_empty_messages() {
-        let resp = Response::from_value(serde_json::json!({
+        let resp = ResponsesResponse::from_value(serde_json::json!({
             "id": "resp_y", "model": "m",
             "output": [
                 {"type": "function_call_output", "output": "orphan"},
