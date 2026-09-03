@@ -8,8 +8,8 @@
 //! - `n` > 1 produces multiple choices; only `index` 0 is honored
 //!
 //! Tool results arrive as later `role:"tool"` messages produced client-side, so
-//! this parser yields assistant-side entries only. Reasoning has no legacy
-//! representation and is never present.
+//! this parser yields assistant-side entries only. `reasoning_content` is
+//! attached as [`Thinking::Normal`] to the produced assistant entry.
 
 use llm_history_model::history::{Entry, Thinking, ToolCall};
 use serde::Deserialize;

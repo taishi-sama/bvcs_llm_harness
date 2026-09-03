@@ -8,7 +8,9 @@ use http_body_util::BodyExt as _;
 use hyper::{Request, client::conn::http1};
 use hyper_util::rt::TokioIo;
 use llm_api::{
-    generic_tool::{ParameterDescription, ParameterType, Tool}, model_config::{GlobalConfig, ModelConfig, ModelKind}, openai_completions, openai_responses::{self, response::ResponsesResponse},
+    generic_tool::{ParameterDescription, ParameterType, Tool},
+    model_config::{GlobalConfig, ModelConfig, ModelKind},
+    openai_completions,
 };
 use llm_history_model::history::{Entry, MessageContent, ToolCallResult};
 use serde_json::Value;
@@ -151,7 +153,8 @@ async fn main() -> Result<(), anyhow::Error> {
                 buffer.write_all(chunk).unwrap();
             }
         }
-        let response_parsed: openai_completions::response::CompletionResponse = serde_json::from_slice(&buffer).unwrap();
+        let response_parsed: openai_completions::response::CompletionResponse =
+            serde_json::from_slice(&buffer).unwrap();
         let mut entries = response_parsed.to_entries();
         for i in &entries {
             println!("{:?}", i)

@@ -12,7 +12,8 @@
 //! - `ToolCallResult`    -> one `{role:"tool", tool_call_id, content}` per result
 //!
 //! Notes:
-//! - `Thinking` has no representation in the legacy API and is dropped.
+//! - `Thinking` is preserved as `reasoning_content` on assistant messages
+//!   (both plain and tool-call ones); only the plaintext is kept.
 //! - `is_error` has no native flag; errors are prefixed `"ERROR: "`.
 
 use crate::model_config::ModelConfig;
@@ -154,7 +155,7 @@ pub fn to_completions_input(
     let crate::model_config::ModelKind::OpenAICompatible {
         model_name,
         streaming,
-        ..
+        prompt_cache_key,
     } = &config.kind
     else {
         return Err(vec![]);
@@ -229,14 +230,6 @@ pub fn to_completions_input(
             }
         }
     }
-    let crate::model_config::ModelKind::OpenAICompatible {
-        model_name,
-        streaming,
-        prompt_cache_key,
-    } = &config.kind
-    else {
-        return Err(vec![]);
-    };
     Ok(CompletionsInput {
         model: model_name.to_string(),
         stream: *streaming,
@@ -294,8 +287,10 @@ mod tests {
         assert_eq!(
             v,
             serde_json::json!({
+                "store": false,
                 "model": "gpt-test",
                 "stream": false,
+                "prompt_cache_key": "prompt_cache_key",
                 "messages": [
                     {"role": "system", "content": "Be terse."},
                     {"role": "user", "content": "hi"},
@@ -340,6 +335,50 @@ mod tests {
                 },
                 {"role": "tool", "tool_call_id": "call_1", "content": "ERROR: sunny"}
             ])
+        );
+    }
+
+    #[test]
+    fn config_tools_are_forwarded() {
+        let mut parameters = std::collections::HashMap::new();
+        parameters.insert(
+            "city".to_owned(),
+            crate::generic_tool::ParameterDescription {
+                r#type: crate::generic_tool::ParameterType::String,
+                description: "City name".to_owned(),
+            },
+        );
+        let cfg = ModelConfig {
+            tools: vec![crate::generic_tool::Tool {
+                name: "get_weather".to_owned(),
+                description: Some("Get the weather".to_owned()),
+                parameters,
+            }],
+            ..config()
+        };
+
+        let v = serde_json::to_value(
+            to_completions_input(&[text_user("hi")], &cfg).expect("valid history"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            v["tools"],
+            serde_json::json!([{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get the weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string", "description": "City name"}
+                        },
+                        "required": ["city"],
+                        "additionalProperties": false
+                    }
+                }
+            }])
         );
     }
 
