@@ -181,26 +181,29 @@ impl ResponsesResponse {
 
     /// Converts the response output back into history entries.
     ///
+    /// - each `reasoning` item becomes one [`Thinking::Normal`] block attached
+    ///   to the following assistant entry
     /// - consecutive `function_call` items merge into one
-    ///   [`Entry::ResponseToolCall`] (parallel calls live in one entry)
+    ///   [`Entry::ResponseToolCall`] (parallel calls live in one entry);
+    ///   an adjacent assistant message becomes its `content`
     /// - consecutive `function_call_output` items merge into one
     ///   [`Entry::ToolCallResult`]
-    /// - `reasoning` items attach as [`Thinking::Normal`] to the following
-    ///   assistant entry; multiple consecutive reasonings are concatenated
     /// - empty messages and items without `call_id` are skipped
     ///
     /// The result contains assistant-side entries only (`ResponseNormal`,
     /// `ResponseToolCall`, `ToolCallResult`) — append them to an existing
     /// user-first history before validation or re-serialization.
     pub fn to_entries(&self) -> Vec<Entry> {
-        fn flush_calls(
-            thinking: &mut Option<Thinking>,
+        fn flush_tool_entry(
+            thinking: &mut Vec<Thinking>,
+            text: &mut Option<String>,
             calls: &mut Vec<ToolCall>,
             entries: &mut Vec<Entry>,
         ) {
             if !calls.is_empty() {
                 entries.push(Entry::ResponseToolCall {
-                    thinking: thinking.take(),
+                    thinking: std::mem::take(thinking),
+                    content: text.take().filter(|t| !t.is_empty()),
                     tool_call: std::mem::take(calls),
                 });
             }
@@ -214,12 +217,24 @@ impl ResponsesResponse {
             }
         }
 
+        fn merge_text(into: &mut Option<String>, text: &str) {
+            match into {
+                Some(prev) => {
+                    prev.push_str("\n\n");
+                    prev.push_str(text);
+                }
+                None => *into = Some(text.to_owned()),
+            }
+        }
+
         let mut entries = Vec::with_capacity(self.output.len());
-        let mut pending_thinking: Option<Thinking> = None;
+        let mut pending_thinking: Vec<Thinking> = Vec::new();
+        let mut pending_text: Option<String> = None;
         let mut calls: Vec<ToolCall> = Vec::new();
         let mut results: Vec<ToolCallResult> = Vec::new();
 
-        for item in &self.output {
+        let mut items = self.output.iter().peekable();
+        while let Some(item) = items.next() {
             match item {
                 OutputItem::Other => {}
 
@@ -229,13 +244,7 @@ impl ResponsesResponse {
                         continue;
                     }
                     flush_results(&mut results, &mut entries);
-                    match &mut pending_thinking {
-                        Some(Thinking::Normal { thinking }) => {
-                            thinking.push_str("\n\n");
-                            thinking.push_str(&text);
-                        }
-                        _ => pending_thinking = Some(Thinking::Normal { thinking: text }),
-                    }
+                    pending_thinking.push(Thinking::Normal { thinking: text });
                 }
 
                 OutputItem::Message(m) => {
@@ -244,11 +253,19 @@ impl ResponsesResponse {
                         continue;
                     }
                     flush_results(&mut results, &mut entries);
-                    flush_calls(&mut pending_thinking, &mut calls, &mut entries);
-                    entries.push(Entry::ResponseNormal {
-                        thinking: pending_thinking.take(),
-                        content: text,
-                    });
+                    let next_is_call = matches!(items.peek(), Some(OutputItem::FunctionCall(_)));
+                    if !calls.is_empty() || next_is_call {
+                        // Text belongs to the in-progress tool-call entry.
+                        merge_text(&mut pending_text, &text);
+                    } else {
+                        // Defensive merge: pending_text should be None here.
+                        let mut full = pending_text.take();
+                        merge_text(&mut full, &text);
+                        entries.push(Entry::ResponseNormal {
+                            thinking: std::mem::take(&mut pending_thinking),
+                            content: full.unwrap_or_default(),
+                        });
+                    }
                 }
 
                 OutputItem::FunctionCall(fc) => {
@@ -266,7 +283,12 @@ impl ResponsesResponse {
                 }
 
                 OutputItem::FunctionCallOutput(out) => {
-                    flush_calls(&mut pending_thinking, &mut calls, &mut entries);
+                    flush_tool_entry(
+                        &mut pending_thinking,
+                        &mut pending_text,
+                        &mut calls,
+                        &mut entries,
+                    );
                     let Some(tool_use_id) = &out.call_id else {
                         continue;
                     };
@@ -279,7 +301,12 @@ impl ResponsesResponse {
             }
         }
 
-        flush_calls(&mut pending_thinking, &mut calls, &mut entries);
+        flush_tool_entry(
+            &mut pending_thinking,
+            &mut pending_text,
+            &mut calls,
+            &mut entries,
+        );
         flush_results(&mut results, &mut entries);
         entries
     }
@@ -353,8 +380,8 @@ mod tests {
             panic!("expected ResponseNormal");
         };
         assert_eq!(content, "Hello! How can I assist you today?");
-        let Some(Thinking::Normal { thinking }) = thinking else {
-            panic!("expected attached thinking");
+        let [Thinking::Normal { thinking }] = thinking.as_slice() else {
+            panic!("expected one attached thinking block");
         };
         assert!(thinking.contains("Analyze User Input"));
 
@@ -381,12 +408,14 @@ mod tests {
 
         let Entry::ResponseToolCall {
             thinking,
+            content,
             tool_call,
         } = &entries[0]
         else {
             panic!("expected merged ResponseToolCall");
         };
-        assert!(matches!(thinking, Some(Thinking::Normal { .. })));
+        assert!(matches!(thinking.as_slice(), [Thinking::Normal { .. }]));
+        assert_eq!(*content, None);
         assert_eq!(tool_call.len(), 2);
         assert_eq!(tool_call[1].toolcall_params, "{}"); // empty arguments defaulted
 
@@ -419,6 +448,36 @@ mod tests {
             panic!("expected ResponseNormal");
         };
         assert_eq!(content, "cannot comply");
-        assert!(thinking.is_none());
+        assert!(thinking.is_empty());
+    }
+
+    #[test]
+    fn message_before_calls_becomes_tool_call_content() {
+        let resp = ResponsesResponse::from_value(serde_json::json!({
+            "id": "resp_z", "model": "m",
+            "output": [
+                {"type": "message", "role": "assistant",
+                 "content": [{"type": "output_text", "text": "working on it"}]},
+                {"type": "function_call", "call_id": "c1", "name": "a", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c1", "output": "r"}
+            ]
+        }))
+        .expect("parses");
+
+        let entries = resp.to_entries();
+        assert_eq!(entries.len(), 2);
+        let Entry::ResponseToolCall {
+            thinking,
+            content,
+            tool_call,
+        } = &entries[0]
+        else {
+            panic!("expected ResponseToolCall with content");
+        };
+        assert!(thinking.is_empty());
+        assert_eq!(content.as_deref(), Some("working on it"));
+        assert_eq!(tool_call.len(), 1);
+
+        validated_history(entries);
     }
 }

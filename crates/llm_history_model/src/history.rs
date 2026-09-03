@@ -19,7 +19,8 @@ pub struct ToolCallResult {
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Thinking {
     Normal { thinking: String },
-    Secret { thinking: String, signature: String },
+    Signed { thinking: String, signature: String },
+    Redacted { thinking: String },
 }
 #[derive(Serialize, Deserialize, Debug)]
 pub enum ImageMIME {
@@ -47,11 +48,12 @@ pub enum Entry {
         content: MessageContent,
     },
     ResponseNormal {
-        thinking: Option<Thinking>,
+        thinking: Vec<Thinking>,
         content: String,
     },
     ResponseToolCall {
-        thinking: Option<Thinking>,
+        thinking: Vec<Thinking>,
+        content: Option<String>,
         tool_call: Vec<ToolCall>,
     },
     ToolCallResult {

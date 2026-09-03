@@ -136,22 +136,25 @@ fn mime_str(mime: &ImageMIME) -> &'static str {
 fn thinking_text(t: &Thinking) -> &str {
     match t {
         Thinking::Normal { thinking } => thinking,
-        Thinking::Secret { thinking, .. } => thinking,
+        Thinking::Signed { thinking, .. } => thinking,
+        // No redacted variant in Responses input; best effort as plaintext.
+        Thinking::Redacted { thinking } => thinking,
     }
 }
 
-fn push_reasoning(items: &mut Vec<InputItem>, thinking: Option<&Thinking>, counter: &mut usize) {
-    let Some(t) = thinking else { return };
-    let id = format!("rs_{counter:06}");
-    *counter += 1;
-    items.push(InputItem::Reasoning(ReasoningItem {
-        id,
-        summary: vec![],
-        content: vec![ReasoningText {
-            r#type: "reasoning_text",
-            text: thinking_text(t).to_owned(),
-        }],
-    }));
+fn push_reasoning(items: &mut Vec<InputItem>, thinking: &[Thinking], counter: &mut usize) {
+    for t in thinking {
+        let id = format!("rs_{counter:06}");
+        *counter += 1;
+        items.push(InputItem::Reasoning(ReasoningItem {
+            id,
+            summary: vec![],
+            content: vec![ReasoningText {
+                r#type: "reasoning_text",
+                text: thinking_text(t).to_owned(),
+            }],
+        }));
+    }
 }
 
 fn user_content(content: &MessageContent) -> Content {
@@ -199,7 +202,7 @@ pub fn to_responses_input<'a>(
             })),
 
             Entry::ResponseNormal { thinking, content } => {
-                push_reasoning(&mut items, thinking.as_ref(), &mut reasoning_count);
+                push_reasoning(&mut items, thinking, &mut reasoning_count);
                 items.push(InputItem::Message(MessageItem {
                     role: Role::Assistant,
                     content: Content::Text(content.clone()),
@@ -208,9 +211,18 @@ pub fn to_responses_input<'a>(
 
             Entry::ResponseToolCall {
                 thinking,
+                content,
                 tool_call,
             } => {
-                push_reasoning(&mut items, thinking.as_ref(), &mut reasoning_count);
+                push_reasoning(&mut items, thinking, &mut reasoning_count);
+                if let Some(text) = content
+                    && !text.is_empty()
+                {
+                    items.push(InputItem::Message(MessageItem {
+                        role: Role::Assistant,
+                        content: Content::Text(text.clone()),
+                    }));
+                }
                 for tc in tool_call {
                     items.push(InputItem::FunctionCall(FunctionCallItem {
                         call_id: tc.tool_use_id.clone(),
@@ -293,7 +305,7 @@ mod tests {
             },
             text_user("hi"),
             Entry::ResponseNormal {
-                thinking: None,
+                thinking: Vec::new(),
                 content: "Hello!".into(),
             },
         ]);
@@ -367,9 +379,10 @@ mod tests {
         let v = serialize(&[
             text_user("weather in Oslo?"),
             Entry::ResponseToolCall {
-                thinking: Some(Thinking::Normal {
+                thinking: vec![Thinking::Normal {
                     thinking: "need to check".into(),
-                }),
+                }],
+                content: None,
                 tool_call: vec![ToolCall {
                     tool_name: "get_weather".into(),
                     toolcall_params: r#"{"city":"Oslo"}"#.into(),
@@ -384,10 +397,10 @@ mod tests {
                 }],
             },
             Entry::ResponseNormal {
-                thinking: Some(Thinking::Secret {
+                thinking: vec![Thinking::Signed {
                     thinking: "it said sunny".into(),
                     signature: "sig==".into(),
-                }),
+                }],
                 content: "Sunny!".into(),
             },
         ]);
@@ -421,11 +434,70 @@ mod tests {
     }
 
     #[test]
+    fn tool_call_with_content_and_multiple_thinking() {
+        let v = serialize(&[
+            text_user("do both"),
+            Entry::ResponseToolCall {
+                thinking: vec![
+                    Thinking::Normal {
+                        thinking: "first".into(),
+                    },
+                    Thinking::Signed {
+                        thinking: "second".into(),
+                        signature: "sig".into(),
+                    },
+                ],
+                content: Some("working on it".into()),
+                tool_call: vec![ToolCall {
+                    tool_name: "a".into(),
+                    toolcall_params: "{}".into(),
+                    tool_use_id: "c1".into(),
+                }],
+            },
+            Entry::ToolCallResult {
+                tool_call: vec![ToolCallResult {
+                    result: "r".into(),
+                    is_error: false,
+                    tool_use_id: "c1".into(),
+                }],
+            },
+        ]);
+
+        assert_eq!(
+            v["input"],
+            json!([
+                {"type": "message", "role": "user", "content": "do both"},
+                {
+                    "type": "reasoning",
+                    "id": "rs_000000",
+                    "summary": [],
+                    "content": [{"type": "reasoning_text", "text": "first"}]
+                },
+                {
+                    "type": "reasoning",
+                    "id": "rs_000001",
+                    "summary": [],
+                    "content": [{"type": "reasoning_text", "text": "second"}]
+                },
+                {"type": "message", "role": "assistant", "content": "working on it"},
+                {
+                    "type": "function_call",
+                    "call_id": "c1",
+                    "name": "a",
+                    "arguments": "{}"
+                },
+                {"type": "function_call_output", "call_id": "c1", "output": "r"}
+            ])
+        );
+    }
+
+    #[test]
     fn parallel_calls_and_error_prefix() {
         let v = serialize(&[
             text_user("two things"),
             Entry::ResponseToolCall {
-                thinking: None,
+                thinking: Vec::new(),
+                content: None,
                 tool_call: vec![
                     ToolCall {
                         tool_name: "a".into(),
@@ -472,7 +544,7 @@ mod tests {
 
     fn assistant_done() -> Entry {
         Entry::ResponseNormal {
-            thinking: None,
+            thinking: Vec::new(),
             content: "done".into(),
         }
     }

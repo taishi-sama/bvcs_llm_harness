@@ -97,12 +97,15 @@ fn check_provider_rules(
         ModelKind::AnthropicCompatible { .. } => {
             // Unsigned thinking cannot be resent to Anthropic (signature required).
             for (i, entry) in entries.iter().enumerate() {
-                let thinking = match entry {
+                let thinking: &[Thinking] = match entry {
                     Entry::ResponseNormal { thinking, .. }
                     | Entry::ResponseToolCall { thinking, .. } => thinking,
                     _ => continue,
                 };
-                if matches!(thinking, Some(Thinking::Normal { .. })) {
+                if thinking
+                    .iter()
+                    .any(|t| matches!(t, Thinking::Normal { .. }))
+                {
                     errors.push(ValidationError::UnsignedThinkingRejected { index: i });
                 }
             }
@@ -168,7 +171,12 @@ pub fn validate_entries(
                     errors.push(ValidationError::EmptyAssistantContent { index: i });
                 }
             }
-            Entry::ResponseToolCall { tool_call, .. } => {
+            Entry::ResponseToolCall {
+                tool_call, content, ..
+            } => {
+                if matches!(content, Some(t) if t.is_empty()) {
+                    errors.push(ValidationError::EmptyAssistantContent { index: i });
+                }
                 pending.clear();
                 for (ci, tc) in tool_call.iter().enumerate() {
                     if !call_ids.insert(tc.tool_use_id.as_str()) {
@@ -252,14 +260,15 @@ mod tests {
 
     fn assistant_text(t: &str) -> Entry {
         Entry::ResponseNormal {
-            thinking: None,
+            thinking: Vec::new(),
             content: t.into(),
         }
     }
 
     fn tool_call(id: &str) -> Entry {
         Entry::ResponseToolCall {
-            thinking: None,
+            thinking: Vec::new(),
+            content: None,
             tool_call: vec![ToolCall {
                 tool_name: "get_weather".into(),
                 toolcall_params: r#"{"city":"Oslo"}"#.into(),
@@ -295,10 +304,11 @@ mod tests {
         let h = vec![
             text_user("q"),
             Entry::ResponseToolCall {
-                thinking: Some(Thinking::Secret {
+                thinking: vec![Thinking::Signed {
                     thinking: "hmm".into(),
                     signature: "sig".into(),
-                }),
+                }],
+                content: None,
                 tool_call: vec![
                     ToolCall {
                         tool_name: "a".into(),
@@ -327,10 +337,10 @@ mod tests {
                 }],
             },
             Entry::ResponseNormal {
-                thinking: Some(Thinking::Secret {
+                thinking: vec![Thinking::Signed {
                     thinking: "t".into(),
                     signature: "sig".into(),
-                }),
+                }],
                 content: "done".into(),
             },
         ];
@@ -343,9 +353,9 @@ mod tests {
         let h = vec![
             text_user("q"),
             Entry::ResponseNormal {
-                thinking: Some(Thinking::Normal {
+                thinking: vec![Thinking::Normal {
                     thinking: "hmm".into(),
-                }),
+                }],
                 content: "answer".into(),
             },
         ];
@@ -361,10 +371,10 @@ mod tests {
         let h = vec![
             text_user("q"),
             Entry::ResponseNormal {
-                thinking: Some(Thinking::Secret {
+                thinking: vec![Thinking::Signed {
                     thinking: "hmm".into(),
                     signature: "sig==".into(),
-                }),
+                }],
                 content: "answer".into(),
             },
         ];
@@ -472,7 +482,8 @@ mod tests {
         let h = vec![
             text_user("q"),
             Entry::ResponseToolCall {
-                thinking: None,
+                thinking: Vec::new(),
+                content: None,
                 tool_call: vec![ToolCall {
                     tool_name: "t".into(),
                     toolcall_params: "[1,2]".into(),

@@ -8,9 +8,7 @@ use http_body_util::BodyExt as _;
 use hyper::{Request, client::conn::http1};
 use hyper_util::rt::TokioIo;
 use llm_api::{
-    generic_tool::{ParameterDescription, ParameterType, Tool},
-    model_config::{GlobalConfig, ModelConfig, ModelKind},
-    openai_completions,
+    anthropic, generic_tool::{ParameterDescription, ParameterType, Tool}, model_config::{GlobalConfig, ModelConfig, ModelKind}, openai_completions,
 };
 use llm_history_model::history::{Entry, MessageContent, ToolCallResult};
 use serde_json::Value;
@@ -19,12 +17,16 @@ use tokio::net::TcpStream;
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     let _client = reqwest::Client::new();
-    let model = ModelConfig {
-        kind: ModelKind::OpenAICompatible {
+    let kind =  ModelKind::OpenAICompatible {
             prompt_cache_key: "llm_connector_example".into(),
             model_name: "qwen3.6-35b-a3b".into(),
             streaming: false,
-        },
+        };
+    let kind =  ModelKind::AnthropicCompatible {
+            model_name: "qwen3.6-35b-a3b".into(),
+        };
+    let model = ModelConfig {
+        kind,
         tools: vec![
             Tool {
                 name: "get_weather".into(),
@@ -79,15 +81,15 @@ async fn main() -> Result<(), anyhow::Error> {
     let model = GlobalConfig {
         model_config: model,
         token: "".into(),
-        endpoint: "http://127.0.0.1:8080/v1/chat/completions".into(),
+        endpoint: "http://127.0.0.1:8080/v1/messages".into(),
     };
     let mut history = vec![
         Entry::SystemPrompt {
-            content: "You are automatic diagnostics system running under generic Linux system platform.".into(),
+            content: "You are helpful assistant.".into(),
         },
         Entry::UserMessage {
             content: MessageContent {
-                text: Some("Determine in minimal amount of steps what are characteristics of current machine using only available tools.".into()),
+                text: Some("Hi! List all available tools and try guess what they do.".into()),
                 image: None,
             },
         },
@@ -96,7 +98,7 @@ async fn main() -> Result<(), anyhow::Error> {
         println!("{:?}", i)
     }
     loop {
-        let validation = openai_completions::to_completions_input(&history, &model.model_config);
+        let validation = anthropic::to_anthropic_messages(&history, &model.model_config, 50000);
         if let Err(errors) = validation {
             for e in errors {
                 println!("{:?}", e)
@@ -153,7 +155,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 buffer.write_all(chunk).unwrap();
             }
         }
-        let response_parsed: openai_completions::response::CompletionResponse =
+        let response_parsed: anthropic::response::MessagesResponse =
             serde_json::from_slice(&buffer).unwrap();
         let mut entries = response_parsed.to_entries();
         for i in &entries {
@@ -162,6 +164,7 @@ async fn main() -> Result<(), anyhow::Error> {
         history.append(&mut entries);
         if let Entry::ResponseToolCall {
             thinking: _,
+            content: _,
             tool_call,
         } = history.last().unwrap()
         {

@@ -115,7 +115,26 @@ fn mime_str(mime: &ImageMIME) -> &'static str {
 fn thinking_text(t: &Thinking) -> &str {
     match t {
         Thinking::Normal { thinking } => thinking,
-        Thinking::Secret { thinking, .. } => thinking,
+        Thinking::Signed { thinking, .. } => thinking,
+        // No redacted variant in Chat Completions; best effort as plaintext.
+        Thinking::Redacted { thinking } => thinking,
+    }
+}
+
+/// Joins multiple thinking blocks into one `reasoning_content` string.
+fn thinking_joined(thinking: &[Thinking]) -> Option<String> {
+    if thinking.is_empty() {
+        return None;
+    }
+    let joined = thinking
+        .iter()
+        .map(thinking_text)
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if joined.is_empty() {
+        None
+    } else {
+        Some(joined)
     }
 }
 
@@ -184,13 +203,14 @@ pub fn to_completions_input(
             Entry::ResponseNormal { thinking, content } => messages.push(Message {
                 role: Role::Assistant,
                 content: Some(Content::Text(content.clone())),
-                reasoning_content: thinking.as_ref().map(thinking_text).map(str::to_owned),
+                reasoning_content: thinking_joined(thinking),
                 tool_calls: Vec::new(),
                 tool_call_id: None,
             }),
 
             Entry::ResponseToolCall {
                 thinking,
+                content,
                 tool_call,
             } => {
                 let tool_calls = tool_call
@@ -206,8 +226,11 @@ pub fn to_completions_input(
                     .collect();
                 messages.push(Message {
                     role: Role::Assistant,
-                    content: None,
-                    reasoning_content: thinking.as_ref().map(thinking_text).map(str::to_owned),
+                    content: content
+                        .as_ref()
+                        .filter(|t| !t.is_empty())
+                        .map(|t| Content::Text(t.clone())),
+                    reasoning_content: thinking_joined(thinking),
                     tool_calls,
                     tool_call_id: None,
                 });
@@ -279,7 +302,7 @@ mod tests {
             },
             text_user("hi"),
             Entry::ResponseNormal {
-                thinking: None,
+                thinking: Vec::new(),
                 content: "Hello!".into(),
             },
         ]);
@@ -305,7 +328,8 @@ mod tests {
         let v = serialize(&[
             text_user("weather?"),
             Entry::ResponseToolCall {
-                thinking: None,
+                thinking: Vec::new(),
+                content: None,
                 tool_call: vec![HistoryToolCall {
                     tool_name: "get_weather".into(),
                     toolcall_params: r#"{"city":"Oslo"}"#.into(),
@@ -408,23 +432,24 @@ mod tests {
         let v = serialize(&[
             text_user("q"),
             Entry::ResponseNormal {
-                thinking: Some(llm_history_model::history::Thinking::Secret {
+                thinking: vec![llm_history_model::history::Thinking::Signed {
                     thinking: "secret".into(),
                     signature: "sig".into(),
-                }),
+                }],
                 content: "answer".into(),
             },
         ]);
         assert_eq!(v["messages"][1]["content"], "answer");
         assert_eq!(v["messages"][1]["reasoning_content"], "secret");
 
-        // tool-call assistant messages also carry reasoning_content
+        // tool-call assistant messages also carry reasoning_content and content
         let v = serialize(&[
             text_user("q"),
             Entry::ResponseToolCall {
-                thinking: Some(llm_history_model::history::Thinking::Normal {
+                thinking: vec![llm_history_model::history::Thinking::Normal {
                     thinking: "need to check".into(),
-                }),
+                }],
+                content: Some("looking into it".into()),
                 tool_call: vec![HistoryToolCall {
                     tool_name: "a".into(),
                     toolcall_params: "{}".into(),
@@ -440,5 +465,6 @@ mod tests {
             },
         ]);
         assert_eq!(v["messages"][1]["reasoning_content"], "need to check");
+        assert_eq!(v["messages"][1]["content"], "looking into it");
     }
 }

@@ -96,13 +96,22 @@ impl CompletionResponse {
         };
         let msg = &choice.message;
 
-        let thinking = msg
+        let thinking: Vec<Thinking> = msg
             .reasoning_content
             .as_deref()
             .filter(|t| !t.is_empty())
             .map(|t| Thinking::Normal {
                 thinking: t.to_owned(),
-            });
+            })
+            .into_iter()
+            .collect();
+
+        // Assistant text is valid alongside `tool_calls` in this API.
+        let content: Option<String> = msg
+            .content
+            .as_deref()
+            .filter(|t| !t.is_empty())
+            .map(str::to_owned);
 
         if !msg.tool_calls.is_empty() {
             let tool_call = msg
@@ -120,6 +129,7 @@ impl CompletionResponse {
                 .collect();
             return vec![Entry::ResponseToolCall {
                 thinking,
+                content,
                 tool_call,
             }];
         }
@@ -197,8 +207,8 @@ mod tests {
         };
         assert_eq!(content, "Hello!");
         assert!(matches!(
-            thinking,
-            Some(Thinking::Normal { thinking }) if thinking == "thinking here"
+            thinking.as_slice(),
+            [Thinking::Normal { thinking }] if thinking == "thinking here"
         ));
         validated_history(entries);
     }
@@ -221,15 +231,17 @@ mod tests {
         assert_eq!(entries.len(), 1);
         let E::ResponseToolCall {
             thinking,
+            content,
             tool_call,
         } = &entries[0]
         else {
             panic!("expected ResponseToolCall");
         };
         assert!(matches!(
-            thinking,
-            Some(Thinking::Normal { thinking }) if thinking == "planning"
+            thinking.as_slice(),
+            [Thinking::Normal { thinking }] if thinking == "planning"
         ));
+        assert_eq!(*content, None);
         assert_eq!(tool_call.len(), 2);
         assert_eq!(tool_call[0].tool_name, "a");
         assert_eq!(tool_call[1].toolcall_params, "{}"); // empty arguments defaulted
