@@ -23,7 +23,8 @@ pub mod tools;
 
 use crate::model_config::ModelConfig;
 use crate::validation::validate_entries;
-use llm_history_model::history::{Entry, ImageMIME, MessageContent, Thinking};
+use crate::wire_common::{mime_str, thinking_text};
+use llm_history_model::history::{Entry, MessageContent, Thinking};
 use serde::Serialize;
 
 pub use tools::{OpenAiFunction, OpenAiTool, tools_to_openai};
@@ -124,22 +125,6 @@ pub struct ReasoningText {
     /// Always `"reasoning_text"`
     pub r#type: &'static str,
     pub text: String,
-}
-
-fn mime_str(mime: &ImageMIME) -> &'static str {
-    match mime {
-        ImageMIME::PNG => "png",
-        ImageMIME::JPEG => "jpeg",
-    }
-}
-
-fn thinking_text(t: &Thinking) -> &str {
-    match t {
-        Thinking::Normal { thinking } => thinking,
-        Thinking::Signed { thinking, .. } => thinking,
-        // No redacted variant in Responses input; best effort as plaintext.
-        Thinking::Redacted { thinking } => thinking,
-    }
 }
 
 fn push_reasoning(items: &mut Vec<InputItem>, thinking: &[Thinking], counter: &mut usize) {
@@ -252,7 +237,10 @@ pub fn to_responses_input<'a>(
         prompt_cache_key,
     } = &config.kind
     else {
-        return Err(vec![]);
+        return Err(vec![crate::validation::ValidationError::WrongProviderKind {
+            expected: "openai_compatible",
+            actual: config.kind.name(),
+        }]);
     };
     Ok(ResponsesInput {
         prompt_cache_key: prompt_cache_key.clone(),
@@ -267,6 +255,7 @@ pub fn to_responses_input<'a>(
 
 #[cfg(test)]
 mod tests {
+    use llm_history_model::history::ImageMIME;
     use super::*;
     use crate::model_config::ModelKind;
     use llm_history_model::history::{Image, MessageContent, ToolCall, ToolCallResult};
@@ -582,5 +571,23 @@ mod tests {
             e,
             crate::validation::ValidationError::IllegalTransition { .. }
         )));
+    }
+
+    #[test]
+    fn non_openai_kind_is_rejected() {
+        let cfg = ModelConfig {
+            kind: ModelKind::AnthropicCompatible {
+                model_name: "claude".into(),
+            },
+            tools: Default::default(),
+            max_tokens: None,
+        };
+        assert!(matches!(
+            to_responses_input(&[text_user("hi")], &cfg),
+            Err(e) if e.contains(&crate::validation::ValidationError::WrongProviderKind {
+                expected: "openai_compatible",
+                actual: "anthropic_compatible",
+            })
+        ));
     }
 }

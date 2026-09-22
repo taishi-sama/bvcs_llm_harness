@@ -18,7 +18,8 @@
 
 use crate::model_config::ModelConfig;
 use crate::validation::validate_entries;
-use llm_history_model::history::{Entry, ImageMIME, MessageContent, Thinking};
+use crate::wire_common::{mime_str, thinking_joined};
+use llm_history_model::history::{Entry, MessageContent};
 use serde::Serialize;
 
 pub mod response;
@@ -105,39 +106,6 @@ pub struct ToolCallFunction {
     pub arguments: String,
 }
 
-fn mime_str(mime: &ImageMIME) -> &'static str {
-    match mime {
-        ImageMIME::PNG => "png",
-        ImageMIME::JPEG => "jpeg",
-    }
-}
-
-fn thinking_text(t: &Thinking) -> &str {
-    match t {
-        Thinking::Normal { thinking } => thinking,
-        Thinking::Signed { thinking, .. } => thinking,
-        // No redacted variant in Chat Completions; best effort as plaintext.
-        Thinking::Redacted { thinking } => thinking,
-    }
-}
-
-/// Joins multiple thinking blocks into one `reasoning_content` string.
-fn thinking_joined(thinking: &[Thinking]) -> Option<String> {
-    if thinking.is_empty() {
-        return None;
-    }
-    let joined = thinking
-        .iter()
-        .map(thinking_text)
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    if joined.is_empty() {
-        None
-    } else {
-        Some(joined)
-    }
-}
-
 fn user_content(content: &MessageContent) -> Content {
     match (&content.text, &content.image) {
         (Some(text), None) => Content::Text(text.clone()),
@@ -177,7 +145,10 @@ pub fn to_completions_input(
         prompt_cache_key,
     } = &config.kind
     else {
-        return Err(vec![]);
+        return Err(vec![crate::validation::ValidationError::WrongProviderKind {
+            expected: "openai_compatible",
+            actual: config.kind.name(),
+        }]);
     };
 
     let mut messages: Vec<Message> = Vec::new();
@@ -265,6 +236,7 @@ pub fn to_completions_input(
 
 #[cfg(test)]
 mod tests {
+    use llm_history_model::history::ImageMIME;
     use super::*;
     use crate::model_config::ModelKind;
     use llm_history_model::history::{Image, ToolCall as HistoryToolCall, ToolCallResult};
@@ -467,5 +439,23 @@ mod tests {
         ]);
         assert_eq!(v["messages"][1]["reasoning_content"], "need to check");
         assert_eq!(v["messages"][1]["content"], "looking into it");
+    }
+
+    #[test]
+    fn non_openai_kind_is_rejected() {
+        let cfg = ModelConfig {
+            kind: ModelKind::AnthropicCompatible {
+                model_name: "claude".into(),
+            },
+            tools: Default::default(),
+            max_tokens: None,
+        };
+        assert!(matches!(
+            to_completions_input(&[text_user("hi")], &cfg),
+            Err(e) if e.contains(&crate::validation::ValidationError::WrongProviderKind {
+                expected: "openai_compatible",
+                actual: "anthropic_compatible",
+            })
+        ));
     }
 }

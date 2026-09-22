@@ -34,6 +34,12 @@ pub enum ValidationError {
     /// Anthropic requires a signature to resend thinking blocks;
     /// `Thinking::Normal` cannot be round-tripped and would be silently dropped.
     UnsignedThinkingRejected { index: usize },
+    /// Config kind does not match the serializer used (e.g. calling an
+    /// Anthropic serializer with an `OpenAICompatible` config).
+    WrongProviderKind {
+        expected: &'static str,
+        actual: &'static str,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

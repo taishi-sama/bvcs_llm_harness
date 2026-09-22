@@ -4,9 +4,9 @@
 //! `"function"` key:
 //! `{"type":"function","function":{"name":...,"parameters":<json schema>}}`.
 
-use crate::generic_tool::{ParameterType, Tool};
+use crate::generic_tool::Tool;
 use serde::Serialize;
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 /// A function tool in Chat Completions wire format.
 #[derive(Debug, Clone, Serialize)]
@@ -27,42 +27,13 @@ pub struct FunctionDefinition {
     pub parameters: Value,
 }
 
-const fn parameter_type_str(t: &ParameterType) -> &'static str {
-    match t {
-        ParameterType::String => "string",
-        ParameterType::Number => "number",
-    }
-}
-
-/// Builds the `parameters` JSON Schema for one tool.
-///
-/// Every declared parameter is listed as required and unknown extra arguments
-/// are rejected (`additionalProperties: false`) — matching what OpenAI's
-/// `strict` mode expects. A tool with no parameters yields `Value::Null` so it
-/// is omitted (the spec treats that as an empty parameter list).
+/// A tool with no parameters yields `Value::Null` so it is omitted (the spec
+/// treats that as an empty parameter list).
 fn parameters_schema(tool: &Tool) -> Value {
     if tool.parameters.is_empty() {
         return Value::Null;
     }
-    let mut properties = Map::new();
-    for (name, param) in &tool.parameters {
-        properties.insert(
-            name.clone(),
-            serde_json::json!({
-                "type": parameter_type_str(&param.r#type),
-                "description": param.description,
-            }),
-        );
-    }
-    let mut required: Vec<&str> = tool.parameters.keys().map(String::as_str).collect();
-    required.sort_unstable();
-
-    serde_json::json!({
-        "type": "object",
-        "properties": properties,
-        "required": required,
-        "additionalProperties": false,
-    })
+    crate::wire_common::parameters_schema(tool)
 }
 
 impl CompletionTool {
@@ -86,7 +57,7 @@ pub fn tools_to_completions(tools: &[Tool]) -> Vec<CompletionTool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::generic_tool::ParameterDescription;
+    use crate::generic_tool::{ParameterDescription, ParameterType};
     use std::collections::HashMap;
 
     fn sample() -> Tool {

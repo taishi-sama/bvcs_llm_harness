@@ -159,6 +159,7 @@ mod tests {
     use crate::model_config::{ModelConfig, ModelKind};
     use crate::validation::validate_entries;
     use llm_history_model::history::Entry as E;
+    use llm_history_model::history::ToolCallResult;
 
     fn config() -> ModelConfig {
         ModelConfig {
@@ -310,5 +311,98 @@ mod tests {
             ] if t1 == "one" && s1 == "s1" && t2 == "two" && s2 == "s2"
         ));
         validated_history(entries);
+    }
+
+    /// Serialize a history into the request, feed the assistant content blocks
+    /// back through the response parser, and confirm re-serializing reproduces
+    /// the original assistant message verbatim.
+    fn assert_round_trip(history: &[E]) {
+        use crate::anthropic::to_anthropic_messages;
+
+        let input = to_anthropic_messages(history, &config()).expect("valid history");
+        let assistant = serde_json::to_value(&input.messages[1]).unwrap();
+        let response = MessagesResponse::from_value(serde_json::json!({
+            "id": "msg_rt", "type": "message", "role": "assistant",
+            "model": "claude-test", "stop_reason": "end_turn",
+            "content": assistant["content"],
+        }))
+        .expect("parses");
+
+        let mut full = vec![history[0].clone()];
+        full.extend(response.to_entries());
+        // Client-side entries (tool results) replay unchanged.
+        full.extend_from_slice(&history[2..]);
+        let reinput = to_anthropic_messages(&full, &config()).expect("valid history");
+        assert_eq!(
+            serde_json::to_value(&reinput.messages[1]).unwrap(),
+            assistant
+        );
+    }
+
+    #[test]
+    fn round_trip_text_with_signed_thinking() {
+        assert_round_trip(&[
+            text_user("q"),
+            E::ResponseNormal {
+                thinking: vec![Thinking::Signed {
+                    thinking: "hmm".into(),
+                    signature: "sig==".into(),
+                }],
+                content: "answer".into(),
+            },
+        ]);
+    }
+
+    #[test]
+    fn round_trip_redacted_thinking() {
+        assert_round_trip(&[
+            text_user("q"),
+            E::ResponseNormal {
+                thinking: vec![Thinking::Redacted {
+                    thinking: "opaque".into(),
+                }],
+                content: "answer".into(),
+            },
+        ]);
+    }
+
+    #[test]
+    fn round_trip_tool_call_with_preamble_text() {
+        assert_round_trip(&[
+            text_user("q"),
+            E::ResponseToolCall {
+                thinking: vec![Thinking::Signed {
+                    thinking: "plan".into(),
+                    signature: "s1".into(),
+                }],
+                content: Some("calling now".into()),
+                tool_call: vec![
+                    ToolCall {
+                        tool_name: "get_stock_price".into(),
+                        toolcall_params: r#"{"ticker":"AAPL"}"#.into(),
+                        tool_use_id: "toolu_1".into(),
+                    },
+                    ToolCall {
+                        tool_name: "b".into(),
+                        toolcall_params: "{}".into(),
+                        tool_use_id: "toolu_2".into(),
+                    },
+                ],
+            },
+            E::ToolCallResult {
+                tool_call: vec![
+                    ToolCallResult {
+                        result: "r1".into(),
+                        is_error: false,
+                        tool_use_id: "toolu_1".into(),
+                    },
+                    ToolCallResult {
+                        result: "r2".into(),
+                        is_error: false,
+                        tool_use_id: "toolu_2".into(),
+                    },
+                ],
+            },
+        ]);
     }
 }

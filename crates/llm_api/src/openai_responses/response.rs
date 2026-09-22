@@ -445,11 +445,106 @@ mod tests {
 
         let entries = resp.to_entries();
         assert_eq!(entries.len(), 1);
-        let Entry::ResponseNormal { content, thinking } = &entries[0] else {
+        let Entry::ResponseNormal {
+            content,
+            thinking,
+        } = &entries[0]
+        else {
             panic!("expected ResponseNormal");
         };
         assert_eq!(content, "cannot comply");
         assert!(thinking.is_empty());
+    }
+
+    /// Serialize a history into the request, feed the assistant-side output
+    /// items back through the response parser, and confirm re-serializing
+    /// reproduces the original `input` items verbatim (including synthesized
+    /// reasoning ids).
+    fn assert_round_trip(history: &[Entry]) {
+        use crate::openai_responses::to_responses_input;
+
+        let input = to_responses_input(history, &config()).expect("valid history");
+        let items = serde_json::to_value(&input.input).unwrap();
+        // The wire `output` never contains the user message; assistant-side
+        // items start after the first (user) item. Output-side messages also
+        // always carry content as typed parts (never the string shorthand).
+        let assistant_items: Vec<Value> = items
+            .as_array()
+            .unwrap()[1..]
+            .to_vec()
+            .into_iter()
+            .map(|mut item| {
+                if item["type"] == "message" {
+                    if let Some(text) = item["content"].as_str().map(str::to_owned) {
+                        item["content"] =
+                            serde_json::json!([{"type": "output_text", "text": text}]);
+                    }
+                }
+                item
+            })
+            .collect();
+        let response = ResponsesResponse::from_value(serde_json::json!({
+            "id": "resp_rt", "model": "qwen3.6-35b-a3b", "status": "completed",
+            "output": assistant_items,
+        }))
+        .expect("parses");
+
+        let mut full = vec![history[0].clone()];
+        full.extend(response.to_entries());
+        let reinput = to_responses_input(&full, &config()).expect("valid history");
+        assert_eq!(serde_json::to_value(&reinput.input).unwrap(), items);
+    }
+
+    #[test]
+    fn round_trip_message_with_reasoning() {
+        assert_round_trip(&[
+            text_user("q"),
+            Entry::ResponseNormal {
+                thinking: vec![Thinking::Normal {
+                    thinking: "hmm".into(),
+                }],
+                content: "answer".into(),
+            },
+        ]);
+    }
+
+    #[test]
+    fn round_trip_tool_call_with_preamble_text() {
+        assert_round_trip(&[
+            text_user("q"),
+            Entry::ResponseToolCall {
+                thinking: vec![Thinking::Normal {
+                    thinking: "plan".into(),
+                }],
+                content: Some("working on it".into()),
+                tool_call: vec![
+                    ToolCall {
+                        tool_name: "get_weather".into(),
+                        toolcall_params: r#"{"city":"Oslo"}"#.into(),
+                        tool_use_id: "c1".into(),
+                    },
+                    ToolCall {
+                        tool_name: "b".into(),
+                        toolcall_params: "{}".into(),
+                        tool_use_id: "c2".into(),
+                    },
+                ],
+            },
+            Entry::ToolCallResult {
+                tool_call: vec![
+                    ToolCallResult {
+                        result: "r1".into(),
+                        is_error: false,
+                        tool_use_id: "c1".into(),
+                    },
+                    ToolCallResult {
+                        result: "r2".into(),
+                        is_error: false,
+                        tool_use_id: "c2".into(),
+                    },
+                ],
+            },
+        ]);
     }
 
     #[test]

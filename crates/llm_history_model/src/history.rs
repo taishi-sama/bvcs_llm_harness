@@ -1,10 +1,10 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct History {
     pub entries: Vec<Entry>,
 }
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ToolCall {
     pub tool_name: String,
     pub toolcall_params: String,
@@ -16,29 +16,29 @@ pub struct ToolCallResult {
     pub is_error: bool,
     pub tool_use_id: String,
 }
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum Thinking {
     Normal { thinking: String },
     Signed { thinking: String, signature: String },
     Redacted { thinking: String },
 }
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum ImageMIME {
     PNG,
     JPEG,
 }
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Image {
     pub mime: ImageMIME,
     pub base64: String,
 }
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct MessageContent {
     pub text: Option<String>,
     pub image: Option<Image>, //Support passing as Base64-encoded image for now
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum Entry {
     /// Should be only one in beginning of history
     SystemPrompt {

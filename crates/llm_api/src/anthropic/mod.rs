@@ -23,7 +23,8 @@
 
 use crate::model_config::ModelConfig;
 use crate::validation::{ValidationError, validate_entries};
-use llm_history_model::history::{Entry, ImageMIME, Thinking};
+use crate::wire_common::anthropic_media_type_str;
+use llm_history_model::history::{Entry, Thinking};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -105,13 +106,6 @@ pub struct ImageSource {
     pub data: String,
 }
 
-fn media_type_str(mime: &ImageMIME) -> &'static str {
-    match mime {
-        ImageMIME::PNG => "image/png",
-        ImageMIME::JPEG => "image/jpeg",
-    }
-}
-
 /// Pushes thinking blocks first in `blocks`, preserving order. `Signed` blocks
 /// go verbatim (`thinking` + `signature`); `Redacted` blocks go as
 /// `redacted_thinking` with the opaque payload carried in `Thinking::Redacted::thinking`.
@@ -155,7 +149,10 @@ pub fn to_anthropic_messages<'a>(
     validate_entries(entries, config)?;
 
     let crate::model_config::ModelKind::AnthropicCompatible { model_name } = &config.kind else {
-        return Err(vec![]);
+        return Err(vec![ValidationError::WrongProviderKind {
+            expected: "anthropic_compatible",
+            actual: config.kind.name(),
+        }]);
     };
 
     let max_tokens = config
@@ -187,7 +184,7 @@ pub fn to_anthropic_messages<'a>(
                             blocks.push(Block::Image {
                                 source: ImageSource {
                                     kind: "base64",
-                                    media_type: media_type_str(&img.mime),
+                                    media_type: anthropic_media_type_str(&img.mime),
                                     data: img.base64.clone(),
                                 },
                             });
@@ -287,6 +284,7 @@ pub fn to_anthropic_messages<'a>(
 
 #[cfg(test)]
 mod tests {
+    use llm_history_model::history::ImageMIME;
     use super::*;
     use crate::model_config::ModelKind;
     use llm_history_model::history::{
@@ -591,7 +589,13 @@ mod tests {
             tools: Default::default(),
             max_tokens: None,
         };
-        assert!(to_anthropic_messages(&[text_user("hi")], &cfg).is_err());
+        assert!(matches!(
+            to_anthropic_messages(&[text_user("hi")], &cfg),
+            Err(e) if e.contains(&ValidationError::WrongProviderKind {
+                expected: "anthropic_compatible",
+                actual: "openai_compatible",
+            })
+        ));
     }
 
     #[test]

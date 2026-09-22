@@ -14,6 +14,13 @@ pub enum ModelKind {
     },
 }
 impl ModelKind {
+    /// Stable provider name, used in error reporting.
+    pub const fn name(&self) -> &'static str {
+        match self {
+            ModelKind::OpenAICompatible { .. } => "openai_compatible",
+            ModelKind::AnthropicCompatible { .. } => "anthropic_compatible",
+        }
+    }
     pub fn get_model_name(&self) -> &str {
         match self {
             ModelKind::OpenAICompatible { model_name, .. }

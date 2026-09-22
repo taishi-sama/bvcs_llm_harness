@@ -162,6 +162,7 @@ mod tests {
     use crate::model_config::{ModelConfig, ModelKind};
     use crate::validation::validate_entries;
     use llm_history_model::history::Entry as E;
+    use llm_history_model::history::ToolCallResult;
 
     fn config() -> ModelConfig {
         ModelConfig {
@@ -272,5 +273,82 @@ mod tests {
             panic!();
         };
         assert_eq!(content, "partial\nblocked");
+    }
+
+    /// Serialize a history into the request, feed the assistant message back
+    /// through the response parser, and confirm re-serializing reproduces the
+    /// original assistant message verbatim.
+    fn assert_round_trip(history: &[E]) {
+        use crate::openai_completions::to_completions_input;
+
+        let input = to_completions_input(history, &config()).expect("valid history");
+        let assistant = serde_json::to_value(&input.messages[1]).unwrap();
+        let response = CompletionResponse::from_value(serde_json::json!({
+            "id": "x", "model": "gpt-test",
+            "choices": [{"index": 0, "finish_reason": "stop", "message": assistant}]
+        }))
+        .expect("parses");
+
+        let mut full = vec![history[0].clone()];
+        full.extend(response.to_entries());
+        // Client-side entries (tool results) replay unchanged.
+        full.extend_from_slice(&history[2..]);
+        let reinput = to_completions_input(&full, &config()).expect("valid history");
+        assert_eq!(
+            serde_json::to_value(&reinput.messages[1]).unwrap(),
+            assistant
+        );
+    }
+
+    #[test]
+    fn round_trip_text_with_reasoning() {
+        assert_round_trip(&[
+            text_user("q"),
+            E::ResponseNormal {
+                thinking: vec![Thinking::Normal {
+                    thinking: "hmm".into(),
+                }],
+                content: "answer".into(),
+            },
+        ]);
+    }
+
+    #[test]
+    fn round_trip_tool_calls_with_preamble() {
+        assert_round_trip(&[
+            text_user("q"),
+            E::ResponseToolCall {
+                thinking: vec![Thinking::Normal {
+                    thinking: "plan".into(),
+                }],
+                content: Some("calling now".into()),
+                tool_call: vec![
+                    ToolCall {
+                        tool_name: "get_weather".into(),
+                        toolcall_params: r#"{"city":"Oslo"}"#.into(),
+                        tool_use_id: "c1".into(),
+                    },
+                    ToolCall {
+                        tool_name: "b".into(),
+                        toolcall_params: "{}".into(),
+                        tool_use_id: "c2".into(),
+                    },
+                ],
+            },
+            E::ToolCallResult {
+                tool_call: vec![
+                    ToolCallResult {
+                        result: "r1".into(),
+                        is_error: false,
+                        tool_use_id: "c1".into(),
+                    },
+                    ToolCallResult {
+                        result: "r2".into(),
+                        is_error: false,
+                        tool_use_id: "c2".into(),
+                    },
+                ],
+            },
+        ]);
     }
 }
