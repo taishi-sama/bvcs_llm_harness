@@ -8,7 +8,9 @@ use http_body_util::BodyExt as _;
 use hyper::{Request, client::conn::http1};
 use hyper_util::rt::TokioIo;
 use llm_api::{
-    anthropic, generic_tool::{ParameterDescription, ParameterType, Tool}, model_config::{GlobalConfig, ModelConfig, ModelKind}, openai_completions,
+    anthropic,
+    generic_tool::{ParameterDescription, ParameterType, Tool},
+    model_config::{GlobalConfig, ModelConfig, ModelKind},
 };
 use llm_history_model::history::{Entry, MessageContent, ToolCallResult};
 use serde_json::Value;
@@ -17,14 +19,9 @@ use tokio::net::TcpStream;
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     let _client = reqwest::Client::new();
-    let kind =  ModelKind::OpenAICompatible {
-            prompt_cache_key: "llm_connector_example".into(),
-            model_name: "qwen3.6-35b-a3b".into(),
-            streaming: false,
-        };
-    let kind =  ModelKind::AnthropicCompatible {
-            model_name: "qwen3.6-35b-a3b".into(),
-        };
+    let kind = ModelKind::AnthropicCompatible {
+        model_name: "qwen3.6-35b-a3b".into(),
+    };
     let model = ModelConfig {
         kind,
         tools: vec![
@@ -77,6 +74,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 },
             },
         ],
+        max_tokens: Some(50000),
     };
     let model = GlobalConfig {
         model_config: model,
@@ -98,7 +96,7 @@ async fn main() -> Result<(), anyhow::Error> {
         println!("{:?}", i)
     }
     loop {
-        let validation = anthropic::to_anthropic_messages(&history, &model.model_config, 50000);
+        let validation = anthropic::to_anthropic_messages(&history, &model.model_config);
         if let Err(errors) = validation {
             for e in errors {
                 println!("{:?}", e)

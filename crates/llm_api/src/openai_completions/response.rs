@@ -171,6 +171,7 @@ mod tests {
                 prompt_cache_key: "key".into(),
             },
             tools: Default::default(),
+            max_tokens: None,
         }
     }
 

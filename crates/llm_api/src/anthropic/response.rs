@@ -166,6 +166,7 @@ mod tests {
                 model_name: "claude-test".into(),
             },
             tools: Default::default(),
+            max_tokens: Some(2048),
         }
     }
 

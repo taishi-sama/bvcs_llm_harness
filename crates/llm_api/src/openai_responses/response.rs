@@ -326,6 +326,7 @@ mod tests {
                 prompt_cache_key: "prompt_cache_key".into(),
             },
             tools: Default::default(),
+            max_tokens: None,
         }
     }
 

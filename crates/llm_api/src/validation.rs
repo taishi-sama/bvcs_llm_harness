@@ -237,6 +237,7 @@ mod tests {
                 prompt_cache_key: "test_key".into(),
             },
             tools: Default::default(),
+            max_tokens: None,
         }
     }
 
@@ -246,6 +247,7 @@ mod tests {
                 model_name: "claude-test".into(),
             },
             tools: Default::default(),
+            max_tokens: Some(1024),
         }
     }
 

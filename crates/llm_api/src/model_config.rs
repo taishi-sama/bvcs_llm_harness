@@ -32,6 +32,7 @@ impl ModelKind {
 pub struct ModelConfig {
     pub kind: ModelKind,
     pub tools: Vec<Tool>,
+    pub max_tokens: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

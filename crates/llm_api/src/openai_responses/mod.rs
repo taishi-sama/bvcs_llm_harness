@@ -280,6 +280,7 @@ mod tests {
                 streaming: false,
             },
             tools: Default::default(),
+            max_tokens: None,
         }
     }
 

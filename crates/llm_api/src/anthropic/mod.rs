@@ -136,21 +136,32 @@ fn push_thinking(blocks: &mut Vec<Block>, thinking: &[Thinking]) {
     }
 }
 
+/// Fallback `max_tokens` when `ModelConfig.max_tokens` is `None`. The API
+/// requires the parameter; this default fits every current Claude model.
+pub const DEFAULT_MAX_TOKENS: u32 = 262144;
+
 /// Validates `entries` against `config` and converts them into the Messages
 /// API request body.
+///
+/// `max_tokens` comes from `config.max_tokens` (`DEFAULT_MAX_TOKENS` when
+/// unset), clamped to `u32`.
 ///
 /// Returns all validation errors if the history is malformed or the config
 /// kind is not Anthropic-compatible. Serialization is total otherwise.
 pub fn to_anthropic_messages<'a>(
     entries: &'a [Entry],
     config: &ModelConfig,
-    max_tokens: u32,
 ) -> Result<MessagesInput<'a>, Vec<ValidationError>> {
     validate_entries(entries, config)?;
 
     let crate::model_config::ModelKind::AnthropicCompatible { model_name } = &config.kind else {
         return Err(vec![]);
     };
+
+    let max_tokens = config
+        .max_tokens
+        .map(|v| u32::try_from(v).unwrap_or(u32::MAX))
+        .unwrap_or(DEFAULT_MAX_TOKENS);
 
     let mut system: Option<&str> = None;
     let mut messages: Vec<Message> = Vec::new();
@@ -288,6 +299,7 @@ mod tests {
                 model_name: "claude-test".into(),
             },
             tools: Default::default(),
+            max_tokens: Some(1024),
         }
     }
 
@@ -301,10 +313,8 @@ mod tests {
     }
 
     fn serialize(entries: &[Entry]) -> serde_json::Value {
-        serde_json::to_value(
-            to_anthropic_messages(entries, &config(), 1024).expect("valid history"),
-        )
-        .unwrap()
+        serde_json::to_value(to_anthropic_messages(entries, &config()).expect("valid history"))
+            .unwrap()
     }
 
     #[test]
@@ -333,6 +343,23 @@ mod tests {
                 ]
             })
         );
+    }
+
+    #[test]
+    fn max_tokens_comes_from_config_with_fallback() {
+        // Explicit value is forwarded as-is.
+        assert_eq!(serialize(&[text_user("hi")])["max_tokens"], 1024);
+
+        // Unset falls back to DEFAULT_MAX_TOKENS.
+        let cfg = ModelConfig {
+            max_tokens: None,
+            ..config()
+        };
+        let v = serde_json::to_value(
+            to_anthropic_messages(&[text_user("hi")], &cfg).expect("valid history"),
+        )
+        .unwrap();
+        assert_eq!(v["max_tokens"], DEFAULT_MAX_TOKENS);
     }
 
     #[test]
@@ -532,7 +559,7 @@ mod tests {
         };
 
         let v = serde_json::to_value(
-            to_anthropic_messages(&[text_user("hi")], &cfg, 512).expect("valid history"),
+            to_anthropic_messages(&[text_user("hi")], &cfg).expect("valid history"),
         )
         .unwrap();
 
@@ -562,8 +589,9 @@ mod tests {
                 prompt_cache_key: String::new(),
             },
             tools: Default::default(),
+            max_tokens: None,
         };
-        assert!(to_anthropic_messages(&[text_user("hi")], &cfg, 16).is_err());
+        assert!(to_anthropic_messages(&[text_user("hi")], &cfg).is_err());
     }
 
     #[test]
@@ -579,7 +607,6 @@ mod tests {
                 },
             ],
             &config(),
-            16,
         )
         .unwrap_err();
         assert!(err.contains(&ValidationError::UnsignedThinkingRejected { index: 1 }));
