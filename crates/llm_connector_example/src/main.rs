@@ -139,13 +139,11 @@ fn eval_javascript(code: &str) -> Result<String, String> {
 
     let mut context = Context::default();
     // Protect the host from runaway loops in model-generated code.
-    context.runtime_limits_mut().set_loop_iteration_limit(10_000_000);
     context
-        .register_global_builtin_callable(
-            "print".into(),
-            1,
-            NativeFunction::from_fn_ptr(js_print),
-        )
+        .runtime_limits_mut()
+        .set_loop_iteration_limit(10_000_000);
+    context
+        .register_global_builtin_callable("print".into(), 1, NativeFunction::from_fn_ptr(js_print))
         .map_err(|err| format!("failed to initialize JavaScript runtime: {err}"))?;
 
     // Boa has no console object; expose the common logging methods so snippets
@@ -278,9 +276,8 @@ async fn main() -> Result<(), anyhow::Error> {
         endpoint: provider.endpoint().into(),
     };
 
-    let user_prompt = std::env::var("PROMPT").unwrap_or_else(|_| {
-        "Hi! List all available tools and try guess what they do.".to_string()
-    });
+    let user_prompt = std::env::var("PROMPT")
+        .unwrap_or_else(|_| "Hi! List all available tools and try guess what they do.".to_string());
     let mut history = vec![
         Entry::SystemPrompt {
             content: "You are helpful assistant. Avoid using markdown and LaTex notation.".into(),
@@ -382,8 +379,7 @@ async fn main() -> Result<(), anyhow::Error> {
         history.append(&mut entries);
 
         if let Entry::ResponseToolCall {
-            thinking: _,
-            content: _,
+            blocks: _,
             tool_call,
         } = history.last().unwrap()
         {

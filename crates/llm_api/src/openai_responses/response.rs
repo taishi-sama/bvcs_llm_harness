@@ -212,9 +212,8 @@ impl ResponsesResponse {
     ///   [`Thinking::Encrypted`], otherwise plaintext becomes
     ///   [`Thinking::Normal`]
     /// - consecutive `function_call` items merge into one
-    ///   [`Entry::ResponseToolCall`] (parallel calls live in one entry);
-    ///   adjacent reasoning/message blocks are flattened into its
-    ///   `thinking`/`content` fields
+    ///   [`Entry::ResponseToolCall`] (parallel calls live in one entry); the
+    ///   ordered reasoning/message blocks precede the calls
     /// - consecutive `function_call_output` items merge into one
     ///   [`Entry::ToolCallResult`]
     /// - empty messages and items without `call_id` are skipped
@@ -229,23 +228,10 @@ impl ResponsesResponse {
             entries: &mut Vec<Entry>,
         ) {
             if !calls.is_empty() {
-                let thinking = blocks
-                    .iter()
-                    .filter_map(ResponseBlock::thinking)
-                    .cloned()
-                    .collect();
-                let text = blocks
-                    .iter()
-                    .filter_map(ResponseBlock::text)
-                    .filter(|text| !text.is_empty())
-                    .collect::<Vec<_>>()
-                    .join("\n\n");
                 entries.push(Entry::ResponseToolCall {
-                    thinking,
-                    content: (!text.is_empty()).then_some(text),
+                    blocks: std::mem::take(blocks),
                     tool_call: std::mem::take(calls),
                 });
-                blocks.clear();
             } else if !blocks.is_empty() {
                 entries.push(Entry::Response {
                     blocks: std::mem::take(blocks),
@@ -417,16 +403,15 @@ mod tests {
         let entries = resp.to_entries();
         assert_eq!(entries.len(), 2);
 
-        let Entry::ResponseToolCall {
-            thinking,
-            content,
-            tool_call,
-        } = &entries[0]
-        else {
+        let Entry::ResponseToolCall { blocks, tool_call } = &entries[0] else {
             panic!("expected merged ResponseToolCall");
         };
-        assert!(matches!(thinking.as_slice(), [Thinking::Normal { .. }]));
-        assert_eq!(*content, None);
+        assert!(matches!(
+            entries[0].response_thinking_blocks().as_slice(),
+            [Thinking::Normal { .. }]
+        ));
+        assert!(entries[0].response_text_blocks().is_empty());
+        assert_eq!(blocks.len(), 1);
         assert_eq!(tool_call.len(), 2);
         assert_eq!(tool_call[1].toolcall_params, "{}"); // empty arguments defaulted
 
@@ -624,10 +609,12 @@ mod tests {
         assert_round_trip(&[
             text_user("q"),
             Entry::ResponseToolCall {
-                thinking: vec![Thinking::Normal {
-                    thinking: "plan".into(),
-                }],
-                content: Some("working on it".into()),
+                blocks: vec![
+                    ResponseBlock::Thinking(Thinking::Normal {
+                        thinking: "plan".into(),
+                    }),
+                    ResponseBlock::Text("working on it".into()),
+                ],
                 tool_call: vec![
                     ToolCall {
                         tool_name: "get_weather".into(),
@@ -673,16 +660,15 @@ mod tests {
 
         let entries = resp.to_entries();
         assert_eq!(entries.len(), 2);
-        let Entry::ResponseToolCall {
-            thinking,
-            content,
-            tool_call,
-        } = &entries[0]
-        else {
+        let Entry::ResponseToolCall { blocks, tool_call } = &entries[0] else {
             panic!("expected ResponseToolCall with content");
         };
-        assert!(thinking.is_empty());
-        assert_eq!(content.as_deref(), Some("working on it"));
+        assert!(entries[0].response_thinking_blocks().is_empty());
+        assert_eq!(
+            entries[0].response_joined_text().as_deref(),
+            Some("working on it")
+        );
+        assert_eq!(blocks.len(), 1);
         assert_eq!(tool_call.len(), 1);
 
         validated_history(entries);

@@ -141,9 +141,10 @@ pub enum Entry {
     Response {
         blocks: Vec<ResponseBlock>,
     },
+    /// An assistant response that ends in tool calls. The ordered
+    /// thinking/text blocks come first, followed by the tool calls.
     ResponseToolCall {
-        thinking: Vec<Thinking>,
-        content: Option<String>,
+        blocks: Vec<ResponseBlock>,
         tool_call: Vec<ToolCall>,
     },
     ToolCallResult {
@@ -181,10 +182,11 @@ impl Entry {
         }
     }
 
-    /// The ordered response blocks, if this is an [`Entry::Response`].
+    /// The ordered response blocks of a [`Entry::Response`] or
+    /// [`Entry::ResponseToolCall`].
     pub fn as_response_blocks(&self) -> Option<&[ResponseBlock]> {
         match self {
-            Entry::Response { blocks } => Some(blocks),
+            Entry::Response { blocks } | Entry::ResponseToolCall { blocks, .. } => Some(blocks),
             _ => None,
         }
     }
@@ -247,9 +249,8 @@ impl Entry {
     ///   name, and arguments that are empty or a complete JSON object. Partial
     ///   arguments drop the whole call rather than preserving unusable JSON.
     /// - if any finished tool call remains, the result is
-    ///   [`Entry::ResponseToolCall`] with the ordered thinking/text flattened
-    ///   into its fields; otherwise the ordered blocks become
-    ///   [`Entry::Response`]
+    ///   [`Entry::ResponseToolCall`] with the ordered blocks followed by the
+    ///   calls; otherwise the ordered blocks become [`Entry::Response`]
     ///
     /// The `thinking_only_message` parameter is retained for API
     /// compatibility and is no longer used.
@@ -339,27 +340,8 @@ impl Entry {
         }
 
         if !calls.is_empty() {
-            let thinking = response
-                .iter()
-                .filter_map(ResponseBlock::thinking)
-                .cloned()
-                .collect();
-            let content = {
-                let joined = response
-                    .iter()
-                    .filter_map(ResponseBlock::text)
-                    .filter(|text| !text.is_empty())
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                if joined.is_empty() {
-                    None
-                } else {
-                    Some(joined)
-                }
-            };
             return Some(Entry::ResponseToolCall {
-                thinking,
-                content,
+                blocks: response,
                 tool_call: calls,
             });
         }
@@ -478,18 +460,21 @@ mod tests {
         .try_to_rescue_draft("[thinking only]", false)
         .expect("tool calls are rescuable");
 
-        let Entry::ResponseToolCall {
-            thinking,
-            content,
-            tool_call,
-        } = rescued
-        else {
+        let Entry::ResponseToolCall { blocks, tool_call } = rescued else {
             panic!("expected ResponseToolCall");
         };
-        assert_eq!(content.as_deref(), Some("calling now"));
+        assert_eq!(
+            blocks,
+            [
+                ResponseBlock::Thinking(Thinking::Signed {
+                    thinking: "plan".into(),
+                    signature: "s1".into(),
+                }),
+                ResponseBlock::Text("calling now".into()),
+            ]
+        );
         assert_eq!(tool_call.len(), 2);
         assert_eq!(tool_call[1].toolcall_params, "{}");
-        assert_eq!(thinking.len(), 1);
     }
 
     #[test]

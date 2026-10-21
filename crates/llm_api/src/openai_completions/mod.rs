@@ -114,6 +114,24 @@ pub struct ToolCallFunction {
     pub arguments: String,
 }
 
+/// Flattens ordered response blocks into Chat Completions'
+/// `reasoning_content` + `content` pair. Block-level interleaving cannot be
+/// represented by this API.
+fn flatten_blocks(blocks: &[ResponseBlock]) -> (Option<String>, String) {
+    let thinking: Vec<Thinking> = blocks
+        .iter()
+        .filter_map(ResponseBlock::thinking)
+        .cloned()
+        .collect();
+    let text = blocks
+        .iter()
+        .filter_map(ResponseBlock::text)
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    (thinking_joined(&thinking), text)
+}
+
 fn user_content(content: &MessageContent) -> Content {
     match (&content.text, &content.image) {
         (Some(text), None) => Content::Text(text.clone()),
@@ -188,22 +206,7 @@ pub fn to_completions_input(
             }),
 
             Entry::Response { blocks } => {
-                // Chat Completions has no block-level reasoning/content
-                // interleaving. Flatten the ordered blocks into
-                // `reasoning_content` + `content`, which is the best this API
-                // can represent.
-                let thinking: Vec<Thinking> = blocks
-                    .iter()
-                    .filter_map(ResponseBlock::thinking)
-                    .cloned()
-                    .collect();
-                let text = blocks
-                    .iter()
-                    .filter_map(ResponseBlock::text)
-                    .filter(|text| !text.is_empty())
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let reasoning = thinking_joined(&thinking);
+                let (reasoning, text) = flatten_blocks(blocks);
 
                 if text.is_empty() {
                     // An opaque-only turn (for example OpenAI
@@ -237,11 +240,8 @@ pub fn to_completions_input(
                 }
             }
 
-            Entry::ResponseToolCall {
-                thinking,
-                content,
-                tool_call,
-            } => {
+            Entry::ResponseToolCall { blocks, tool_call } => {
+                let (reasoning, text) = flatten_blocks(blocks);
                 let tool_calls = tool_call
                     .iter()
                     .map(|tc| ToolCall {
@@ -255,11 +255,8 @@ pub fn to_completions_input(
                     .collect();
                 messages.push(Message {
                     role: Role::Assistant,
-                    content: content
-                        .as_ref()
-                        .filter(|t| !t.is_empty())
-                        .map(|t| Content::Text(t.clone())),
-                    reasoning_content: thinking_joined(thinking),
+                    content: (!text.is_empty()).then_some(Content::Text(text)),
+                    reasoning_content: reasoning,
                     tool_calls,
                     tool_call_id: None,
                 });
@@ -358,8 +355,7 @@ mod tests {
         let v = serialize(&[
             text_user("weather?"),
             Entry::ResponseToolCall {
-                thinking: Vec::new(),
-                content: None,
+                blocks: Vec::new(),
                 tool_call: vec![HistoryToolCall {
                     tool_name: "get_weather".into(),
                     toolcall_params: r#"{"city":"Oslo"}"#.into(),
@@ -476,10 +472,12 @@ mod tests {
         let v = serialize(&[
             text_user("q"),
             Entry::ResponseToolCall {
-                thinking: vec![llm_history_model::history::Thinking::Normal {
-                    thinking: "need to check".into(),
-                }],
-                content: Some("looking into it".into()),
+                blocks: vec![
+                    ResponseBlock::Thinking(llm_history_model::history::Thinking::Normal {
+                        thinking: "need to check".into(),
+                    }),
+                    ResponseBlock::Text("looking into it".into()),
+                ],
                 tool_call: vec![HistoryToolCall {
                     tool_name: "a".into(),
                     toolcall_params: "{}".into(),

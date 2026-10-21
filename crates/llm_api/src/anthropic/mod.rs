@@ -8,8 +8,8 @@
 //!   content blocks when an image is attached)
 //! - `Response`          -> `{role:"assistant"}` with the ordered
 //!   thinking/text blocks, preserving interleaving
-//! - `ResponseToolCall`  -> `{role:"assistant"}` with `[thinking*, text?,
-//!   tool_use*]`
+//! - `ResponseToolCall`  -> `{role:"assistant"}` with the ordered
+//!   thinking/text blocks followed by `tool_use*`
 //! - `ToolCallResult`    -> `{role:"user"}` with `[tool_result*]`; consecutive
 //!   batches merge into a single user message
 //!
@@ -162,9 +162,17 @@ fn push_thinking_block(blocks: &mut Vec<Block>, t: &Thinking, allow_unsigned: bo
     }
 }
 
-fn push_thinking(blocks: &mut Vec<Block>, thinking: &[Thinking], allow_unsigned: bool) {
-    for t in thinking {
-        push_thinking_block(blocks, t, allow_unsigned);
+fn push_response_blocks(wire: &mut Vec<Block>, blocks: &[ResponseBlock], allow_unsigned: bool) {
+    for block in blocks {
+        match block {
+            ResponseBlock::Thinking(thinking) => {
+                push_thinking_block(wire, thinking, allow_unsigned);
+            }
+            ResponseBlock::Text(text) if !text.is_empty() => {
+                wire.push(Block::Text { text: text.clone() });
+            }
+            ResponseBlock::Text(_) => {}
+        }
     }
 }
 
@@ -257,21 +265,7 @@ pub fn to_anthropic_messages<'a>(
 
             Entry::Response { blocks } => {
                 let mut wire_blocks = Vec::new();
-                for block in blocks {
-                    match block {
-                        ResponseBlock::Thinking(thinking) => {
-                            push_thinking_block(
-                                &mut wire_blocks,
-                                thinking,
-                                *allow_unsigned_thinking,
-                            );
-                        }
-                        ResponseBlock::Text(text) if !text.is_empty() => {
-                            wire_blocks.push(Block::Text { text: text.clone() });
-                        }
-                        ResponseBlock::Text(_) => {}
-                    }
-                }
+                push_response_blocks(&mut wire_blocks, blocks, *allow_unsigned_thinking);
                 if wire_blocks.is_empty() {
                     return Err(vec![ValidationError::EmptyAssistantContent { index: i }]);
                 }
@@ -281,18 +275,9 @@ pub fn to_anthropic_messages<'a>(
                 });
             }
 
-            Entry::ResponseToolCall {
-                thinking,
-                content,
-                tool_call,
-            } => {
-                let mut blocks = Vec::new();
-                push_thinking(&mut blocks, thinking, *allow_unsigned_thinking);
-                if let Some(text) = content
-                    && !text.is_empty()
-                {
-                    blocks.push(Block::Text { text: text.clone() });
-                }
+            Entry::ResponseToolCall { blocks, tool_call } => {
+                let mut wire_blocks = Vec::new();
+                push_response_blocks(&mut wire_blocks, blocks, *allow_unsigned_thinking);
                 for (ci, tc) in tool_call.iter().enumerate() {
                     // `tool_use.input` must be a JSON object (`validate_entries`
                     // checks this too; mapped here so the error carries position).
@@ -305,7 +290,7 @@ pub fn to_anthropic_messages<'a>(
                             }]);
                         }
                     };
-                    blocks.push(Block::ToolUse {
+                    wire_blocks.push(Block::ToolUse {
                         id: tc.tool_use_id.clone(),
                         name: tc.tool_name.clone(),
                         input,
@@ -313,7 +298,7 @@ pub fn to_anthropic_messages<'a>(
                 }
                 messages.push(Message {
                     role: Role::Assistant,
-                    content: Content::Blocks(blocks),
+                    content: Content::Blocks(wire_blocks),
                 });
             }
 
@@ -463,16 +448,16 @@ mod tests {
         let v = serialize(&[
             text_user("q"),
             Entry::ResponseToolCall {
-                thinking: vec![
-                    Thinking::Signed {
+                blocks: vec![
+                    ResponseBlock::Thinking(Thinking::Signed {
                         thinking: "hmm".into(),
                         signature: "sig==".into(),
-                    },
-                    Thinking::Redacted {
+                    }),
+                    ResponseBlock::Thinking(Thinking::Redacted {
                         thinking: "opaque".into(),
-                    },
+                    }),
+                    ResponseBlock::Text("calling now".into()),
                 ],
-                content: Some("calling now".into()),
                 tool_call: vec![HistoryToolCall {
                     tool_name: "a".into(),
                     toolcall_params: "{}".into(),
@@ -504,8 +489,7 @@ mod tests {
         let v = serialize(&[
             text_user("price?"),
             Entry::ResponseToolCall {
-                thinking: Vec::new(),
-                content: None,
+                blocks: Vec::new(),
                 tool_call: vec![
                     HistoryToolCall {
                         tool_name: "get_stock_price".into(),
@@ -556,8 +540,7 @@ mod tests {
         let v = serialize(&[
             text_user("q"),
             Entry::ResponseToolCall {
-                thinking: Vec::new(),
-                content: None,
+                blocks: Vec::new(),
                 tool_call: vec![
                     HistoryToolCall {
                         tool_name: "a".into(),

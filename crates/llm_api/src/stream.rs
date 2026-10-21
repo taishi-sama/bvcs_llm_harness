@@ -80,8 +80,8 @@ impl std::error::Error for StreamError {}
 ///   [`Thinking::Signed`], unsigned thinking becomes [`Thinking::Normal`]
 ///   (Anthropic validation rejects the latter, as it does for non-streamed
 ///   histories)
-/// - tool calls merge into one [`Entry::ResponseToolCall`] with adjacent text as
-///   its `content`
+/// - tool calls merge into one [`Entry::ResponseToolCall`] whose ordered
+///   thinking/text blocks precede the calls
 /// - otherwise the ordered thinking/text blocks become [`Entry::Response`]
 ///   (preserving interleaving)
 /// - empty drafts yield no entries
@@ -108,23 +108,21 @@ pub fn finish_draft_for(entry: Entry, kind: &ModelKind) -> Result<Vec<Entry>, St
                 && !crate::wire_common::thinking_is_empty(t)
         };
         for entry in &mut entries {
-            match entry {
-                Entry::Response { blocks } => {
-                    blocks.retain(|block| match block {
-                        ResponseBlock::Thinking(t) => replayable(t),
-                        ResponseBlock::Text(_) => true,
-                    });
-                }
-                Entry::ResponseToolCall { thinking, .. } => {
-                    thinking.retain(replayable);
-                }
-                _ => {}
+            if let Entry::Response { blocks } | Entry::ResponseToolCall { blocks, .. } = entry {
+                blocks.retain(|block| match block {
+                    ResponseBlock::Thinking(t) => replayable(t),
+                    ResponseBlock::Text(_) => true,
+                });
             }
         }
         // A response left with no replayable content is empty.
         entries.retain(|entry| match entry {
             Entry::Response { blocks } => {
                 !blocks.is_empty() && blocks.iter().any(|block| !block.is_empty())
+            }
+            Entry::ResponseToolCall { blocks, tool_call } => {
+                !tool_call.is_empty()
+                    || (!blocks.is_empty() && blocks.iter().any(|block| !block.is_empty()))
             }
             _ => true,
         });
@@ -200,27 +198,8 @@ fn finish_draft_unfiltered(entry: Entry) -> Result<Vec<Entry>, StreamError> {
     }
 
     if !calls.is_empty() {
-        let thinking = response
-            .iter()
-            .filter_map(ResponseBlock::thinking)
-            .cloned()
-            .collect();
-        let content = {
-            let joined = response
-                .iter()
-                .filter_map(ResponseBlock::text)
-                .filter(|text| !text.is_empty())
-                .collect::<Vec<_>>()
-                .join("\n");
-            if joined.is_empty() {
-                None
-            } else {
-                Some(joined)
-            }
-        };
         return Ok(vec![Entry::ResponseToolCall {
-            thinking,
-            content,
+            blocks: response,
             tool_call: calls,
         }]);
     }
@@ -452,18 +431,21 @@ mod tests {
         .unwrap();
 
         assert_eq!(entries.len(), 1);
-        let Entry::ResponseToolCall {
-            thinking,
-            content,
-            tool_call,
-        } = &entries[0]
-        else {
+        let Entry::ResponseToolCall { blocks, tool_call } = &entries[0] else {
             panic!("expected ResponseToolCall");
         };
-        assert_eq!(content.as_deref(), Some("calling now"));
+        assert_eq!(
+            blocks.as_slice(),
+            [
+                ResponseBlock::Thinking(Thinking::Signed {
+                    thinking: "plan".into(),
+                    signature: "s1".into(),
+                }),
+                ResponseBlock::Text("calling now".into()),
+            ]
+        );
         assert_eq!(tool_call.len(), 2);
         assert_eq!(tool_call[1].toolcall_params, "{}");
-        assert_eq!(thinking.len(), 1);
     }
 
     #[test]

@@ -129,11 +129,10 @@ fn is_json_object(s: &str) -> bool {
 }
 
 fn assistant_thinking(entry: &Entry) -> Vec<&Thinking> {
-    match entry {
-        Entry::Response { blocks } => blocks.iter().filter_map(ResponseBlock::thinking).collect(),
-        Entry::ResponseToolCall { thinking, .. } => thinking.iter().collect(),
-        _ => Vec::new(),
-    }
+    entry
+        .as_response_blocks()
+        .map(|blocks| blocks.iter().filter_map(ResponseBlock::thinking).collect())
+        .unwrap_or_default()
 }
 
 /// Provider-specific checks layered on top of the shared structural rules.
@@ -270,13 +269,10 @@ pub fn validate_entries(
                     errors.push(ValidationError::EmptyAssistantContent { index: i });
                 }
             }
-            Entry::ResponseToolCall {
-                tool_call, content, ..
-            } => {
-                if matches!(content, Some(t) if t.is_empty()) {
-                    errors.push(ValidationError::EmptyAssistantContent { index: i });
-                }
-                if tool_call.is_empty() && content.as_ref().is_none_or(|t| t.is_empty()) {
+            Entry::ResponseToolCall { blocks, tool_call } => {
+                if tool_call.is_empty()
+                    && (blocks.is_empty() || blocks.iter().all(|block| block.is_empty()))
+                {
                     errors.push(ValidationError::EmptyToolCall { index: i });
                 }
                 // A previous tool-call batch must have been answered before a
@@ -405,8 +401,7 @@ mod tests {
 
     fn tool_call(id: &str) -> Entry {
         Entry::ResponseToolCall {
-            thinking: Vec::new(),
-            content: None,
+            blocks: Vec::new(),
             tool_call: vec![ToolCall {
                 tool_name: "get_weather".into(),
                 toolcall_params: r#"{"city":"Oslo"}"#.into(),
@@ -442,11 +437,10 @@ mod tests {
         let h = vec![
             text_user("q"),
             Entry::ResponseToolCall {
-                thinking: vec![Thinking::Signed {
+                blocks: vec![ResponseBlock::Thinking(Thinking::Signed {
                     thinking: "hmm".into(),
                     signature: "sig".into(),
-                }],
-                content: None,
+                })],
                 tool_call: vec![
                     ToolCall {
                         tool_name: "a".into(),
@@ -644,8 +638,7 @@ mod tests {
         let h = vec![
             text_user("q"),
             Entry::ResponseToolCall {
-                thinking: Vec::new(),
-                content: None,
+                blocks: Vec::new(),
                 tool_call: vec![ToolCall {
                     tool_name: "t".into(),
                     toolcall_params: "[1,2]".into(),
@@ -836,15 +829,15 @@ mod tests {
         let h = vec![
             text_user("q"),
             Entry::ResponseToolCall {
-                thinking: vec![
-                    Thinking::Encrypted {
+                blocks: vec![
+                    ResponseBlock::Thinking(Thinking::Encrypted {
                         thinking: "one".into(),
-                    },
-                    Thinking::Encrypted {
+                    }),
+                    ResponseBlock::Thinking(Thinking::Encrypted {
                         thinking: "two".into(),
-                    },
+                    }),
+                    ResponseBlock::Text("answer".into()),
                 ],
-                content: Some("answer".into()),
                 tool_call: Vec::new(),
             },
         ];
@@ -862,8 +855,7 @@ mod tests {
         let h = vec![
             text_user("q"),
             Entry::ResponseToolCall {
-                thinking: Vec::new(),
-                content: None,
+                blocks: Vec::new(),
                 tool_call: Vec::new(),
             },
         ];
@@ -893,8 +885,7 @@ mod tests {
         let h = vec![
             text_user("q"),
             Entry::ResponseToolCall {
-                thinking: Vec::new(),
-                content: None,
+                blocks: Vec::new(),
                 tool_call: vec![ToolCall {
                     tool_name: String::new(),
                     toolcall_params: "{}".into(),

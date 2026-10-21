@@ -161,7 +161,15 @@ impl CompletionResponse {
             .map(MessageContent::text)
             .filter(|text| !text.is_empty());
 
+        // Chat Completions exposes reasoning as a message-level field, so the
+        // best ordering we can reconstruct is thinking followed by text.
+        let mut blocks: Vec<ResponseBlock> =
+            thinking.into_iter().map(ResponseBlock::Thinking).collect();
+
         if !msg.tool_calls.is_empty() {
+            if let Some(text) = content {
+                blocks.push(ResponseBlock::Text(text));
+            }
             let tool_call = msg
                 .tool_calls
                 .iter()
@@ -175,11 +183,7 @@ impl CompletionResponse {
                     tool_use_id: tc.id.clone(),
                 })
                 .collect();
-            return vec![Entry::ResponseToolCall {
-                thinking,
-                content,
-                tool_call,
-            }];
+            return vec![Entry::ResponseToolCall { blocks, tool_call }];
         }
 
         let mut text = content.unwrap_or_default();
@@ -191,10 +195,6 @@ impl CompletionResponse {
             }
             text.push_str(refusal);
         }
-        // Chat Completions exposes reasoning as a message-level field, so the
-        // best ordering we can reconstruct is thinking followed by text.
-        let mut blocks: Vec<ResponseBlock> =
-            thinking.into_iter().map(ResponseBlock::Thinking).collect();
         if !text.is_empty() {
             blocks.push(ResponseBlock::Text(text));
         }
@@ -278,19 +278,15 @@ mod tests {
 
         let entries = resp.to_entries();
         assert_eq!(entries.len(), 1);
-        let E::ResponseToolCall {
-            thinking,
-            content,
-            tool_call,
-        } = &entries[0]
-        else {
+        let E::ResponseToolCall { blocks, tool_call } = &entries[0] else {
             panic!("expected ResponseToolCall");
         };
         assert!(matches!(
-            thinking.as_slice(),
+            entries[0].response_thinking_blocks().as_slice(),
             [Thinking::Normal { thinking }] if thinking == "planning"
         ));
-        assert_eq!(*content, None);
+        assert!(entries[0].response_text_blocks().is_empty());
+        assert_eq!(blocks.len(), 1);
         assert_eq!(tool_call.len(), 2);
         assert_eq!(tool_call[0].tool_name, "a");
         assert_eq!(tool_call[1].toolcall_params, "{}"); // empty arguments defaulted
@@ -430,10 +426,12 @@ mod tests {
         assert_round_trip(&[
             text_user("q"),
             E::ResponseToolCall {
-                thinking: vec![Thinking::Normal {
-                    thinking: "plan".into(),
-                }],
-                content: Some("calling now".into()),
+                blocks: vec![
+                    ResponseBlock::Thinking(Thinking::Normal {
+                        thinking: "plan".into(),
+                    }),
+                    ResponseBlock::Text("calling now".into()),
+                ],
                 tool_call: vec![
                     ToolCall {
                         tool_name: "get_weather".into(),

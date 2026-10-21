@@ -88,10 +88,9 @@ impl MessagesResponse {
     /// Converts the response content back into history entries.
     ///
     /// - thinking and text blocks are preserved in their original order as
-    ///   [`Entry::Response`] blocks
+    ///   [`ResponseBlock`]s
     /// - `tool_use` blocks merge into a single [`Entry::ResponseToolCall`]
-    ///   (its thinking/text fields are flattened because tool calls still use
-    ///   the legacy split representation)
+    ///   whose ordered blocks are followed by the calls
     ///
     /// The result contains assistant-side entries only — append them to an
     /// existing user-first history before validation or re-serialization.
@@ -157,27 +156,8 @@ impl MessagesResponse {
         blocks.retain(|block| !block.is_empty());
 
         if !calls.is_empty() {
-            let thinking = blocks
-                .iter()
-                .filter_map(ResponseBlock::thinking)
-                .cloned()
-                .collect();
-            let content = {
-                let joined = blocks
-                    .iter()
-                    .filter_map(ResponseBlock::text)
-                    .filter(|text| !text.is_empty())
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                if joined.is_empty() {
-                    None
-                } else {
-                    Some(joined)
-                }
-            };
             return vec![Entry::ResponseToolCall {
-                thinking,
-                content,
+                blocks,
                 tool_call: calls,
             }];
         }
@@ -268,16 +248,15 @@ mod tests {
 
         let entries = resp.to_entries();
         assert_eq!(entries.len(), 1);
-        let E::ResponseToolCall {
-            thinking,
-            content,
-            tool_call,
-        } = &entries[0]
-        else {
+        let E::ResponseToolCall { blocks, tool_call } = &entries[0] else {
             panic!("expected ResponseToolCall");
         };
-        assert!(matches!(thinking.as_slice(), [Thinking::Signed { .. }]));
-        assert_eq!(*content, None);
+        assert!(matches!(
+            entries[0].response_thinking_blocks().as_slice(),
+            [Thinking::Signed { .. }]
+        ));
+        assert!(entries[0].response_text_blocks().is_empty());
+        assert_eq!(blocks.len(), 1);
         assert_eq!(tool_call.len(), 2);
         assert_eq!(tool_call[0].tool_name, "a");
         assert_eq!(tool_call[0].toolcall_params, r#"{"x":1}"#);
@@ -463,11 +442,13 @@ mod tests {
         assert_round_trip(&[
             text_user("q"),
             E::ResponseToolCall {
-                thinking: vec![Thinking::Signed {
-                    thinking: "plan".into(),
-                    signature: "s1".into(),
-                }],
-                content: Some("calling now".into()),
+                blocks: vec![
+                    ResponseBlock::Thinking(Thinking::Signed {
+                        thinking: "plan".into(),
+                        signature: "s1".into(),
+                    }),
+                    ResponseBlock::Text("calling now".into()),
+                ],
                 tool_call: vec![
                     ToolCall {
                         tool_name: "get_stock_price".into(),

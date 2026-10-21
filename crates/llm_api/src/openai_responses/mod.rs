@@ -7,7 +7,8 @@
 //!   typed parts when an image is attached)
 //! - `Response`          -> one `reasoning` item per thinking block and one
 //!   `{type:"message", role:"assistant"}` item per text block, in block order
-//! - `ResponseToolCall`  -> optional `reasoning` item + one `function_call` item per call
+//! - `ResponseToolCall`  -> ordered reasoning/message items followed by one
+//!   `function_call` item per call
 //! - `ToolCallResult`    -> one `function_call_output` item per result
 //!
 //! Policies:
@@ -177,10 +178,29 @@ fn push_reasoning_item(items: &mut Vec<InputItem>, t: &Thinking, counter: &mut u
     }
 }
 
-fn push_reasoning(items: &mut Vec<InputItem>, thinking: &[Thinking], counter: &mut usize) {
-    for t in thinking {
-        push_reasoning_item(items, t, counter);
+/// Emits the ordered thinking/text blocks as Responses input items. Returns
+/// whether at least one item was produced.
+fn push_response_blocks(
+    items: &mut Vec<InputItem>,
+    blocks: &[ResponseBlock],
+    counter: &mut usize,
+) -> bool {
+    let before = items.len();
+    for block in blocks {
+        match block {
+            ResponseBlock::Thinking(thinking) => {
+                push_reasoning_item(items, thinking, counter);
+            }
+            ResponseBlock::Text(text) if !text.is_empty() => {
+                items.push(InputItem::Message(MessageItem {
+                    role: Role::Assistant,
+                    content: Content::Text(text.clone()),
+                }));
+            }
+            ResponseBlock::Text(_) => {}
+        }
     }
+    items.len() > before
 }
 
 fn user_content(content: &MessageContent) -> Content {
@@ -234,22 +254,7 @@ pub fn to_responses_input<'a>(
             })),
 
             Entry::Response { blocks } => {
-                let before = items.len();
-                for block in blocks {
-                    match block {
-                        ResponseBlock::Thinking(thinking) => {
-                            push_reasoning_item(&mut items, thinking, &mut reasoning_count);
-                        }
-                        ResponseBlock::Text(text) if !text.is_empty() => {
-                            items.push(InputItem::Message(MessageItem {
-                                role: Role::Assistant,
-                                content: Content::Text(text.clone()),
-                            }));
-                        }
-                        ResponseBlock::Text(_) => {}
-                    }
-                }
-                if items.len() == before {
+                if !push_response_blocks(&mut items, blocks, &mut reasoning_count) {
                     // An opaque block (for example a signature-only Anthropic
                     // thinking block) has no OpenAI representation, so the
                     // whole assistant turn would silently disappear.
@@ -263,20 +268,8 @@ pub fn to_responses_input<'a>(
                 }
             }
 
-            Entry::ResponseToolCall {
-                thinking,
-                content,
-                tool_call,
-            } => {
-                push_reasoning(&mut items, thinking, &mut reasoning_count);
-                if let Some(text) = content
-                    && !text.is_empty()
-                {
-                    items.push(InputItem::Message(MessageItem {
-                        role: Role::Assistant,
-                        content: Content::Text(text.clone()),
-                    }));
-                }
+            Entry::ResponseToolCall { blocks, tool_call } => {
+                push_response_blocks(&mut items, blocks, &mut reasoning_count);
                 for tc in tool_call {
                     items.push(InputItem::FunctionCall(FunctionCallItem {
                         call_id: tc.tool_use_id.clone(),
@@ -439,10 +432,9 @@ mod tests {
         let v = serialize(&[
             text_user("weather in Oslo?"),
             Entry::ResponseToolCall {
-                thinking: vec![Thinking::Normal {
+                blocks: vec![ResponseBlock::Thinking(Thinking::Normal {
                     thinking: "need to check".into(),
-                }],
-                content: None,
+                })],
                 tool_call: vec![ToolCall {
                     tool_name: "get_weather".into(),
                     toolcall_params: r#"{"city":"Oslo"}"#.into(),
@@ -498,11 +490,13 @@ mod tests {
         let v = serialize(&[
             text_user("do both"),
             Entry::ResponseToolCall {
-                thinking: vec![Thinking::Signed {
-                    thinking: "second".into(),
-                    signature: "sig".into(),
-                }],
-                content: Some("working on it".into()),
+                blocks: vec![
+                    ResponseBlock::Thinking(Thinking::Signed {
+                        thinking: "second".into(),
+                        signature: "sig".into(),
+                    }),
+                    ResponseBlock::Text("working on it".into()),
+                ],
                 tool_call: vec![ToolCall {
                     tool_name: "a".into(),
                     toolcall_params: "{}".into(),
@@ -545,8 +539,7 @@ mod tests {
         let v = serialize(&[
             text_user("two things"),
             Entry::ResponseToolCall {
-                thinking: Vec::new(),
-                content: None,
+                blocks: Vec::new(),
                 tool_call: vec![
                     ToolCall {
                         tool_name: "a".into(),
