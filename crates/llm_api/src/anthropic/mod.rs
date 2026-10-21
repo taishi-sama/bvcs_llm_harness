@@ -4,6 +4,8 @@
 //! Mapping overview:
 //! - `SystemPrompt`      -> top-level `system` parameter (there is no `system`
 //!   role in the Messages API)
+//! - `SystemMessage`     -> wrapped user message, or rejected, depending on
+//!   [`SystemMessagePolicy`]
 //! - `UserMessage`       -> `{role:"user"}` (string shorthand for text-only,
 //!   content blocks when an image is attached)
 //! - `Response`          -> `{role:"assistant"}` with the ordered
@@ -26,10 +28,10 @@
 //! - `max_tokens` comes from `ModelConfig::max_tokens`, falling back to
 //!   [`DEFAULT_MAX_TOKENS`].
 
-use crate::model_config::ModelConfig;
+use crate::model_config::{ModelConfig, SystemMessagePolicy};
 use crate::validation::{ValidationError, validate_entries};
 use crate::wire_common::anthropic_media_type_str;
-use llm_history_model::history::{Entry, ResponseBlock, Thinking};
+use llm_history_model::history::{Entry, ResponseBlock, SystemMessageKind, Thinking};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -162,6 +164,22 @@ fn push_thinking_block(blocks: &mut Vec<Block>, t: &Thinking, allow_unsigned: bo
     }
 }
 
+/// The Messages API has no `system` role, so compatible in-conversation system
+/// updates are wrapped as user content. The wrapper is deliberately explicit
+/// so the model can distinguish environment metadata from actual user speech.
+fn wrap_system_message(kind: &SystemMessageKind, content: &str) -> String {
+    let payload = serde_json::json!({
+        "kind": kind.as_str(),
+        "content": content,
+    })
+    .to_string();
+    // Keep the envelope from being forgeable by content containing the
+    // closing tag. The JSON is still valid and decodes the escapes back to the
+    // original characters.
+    let payload = payload.replace('<', "\\u003c").replace('>', "\\u003e");
+    format!("<system_update>\n{payload}\n</system_update>")
+}
+
 fn push_response_blocks(wire: &mut Vec<Block>, blocks: &[ResponseBlock], allow_unsigned: bool) {
     for block in blocks {
         match block {
@@ -198,6 +216,7 @@ pub fn to_anthropic_messages<'a>(
         model_name,
         thinking,
         allow_unsigned_thinking,
+        system_message_policy,
         ..
     } = &config.kind
     else {
@@ -231,6 +250,16 @@ pub fn to_anthropic_messages<'a>(
             Entry::Draft { .. } => {
                 return Err(vec![ValidationError::DraftNotFinal { index: i }]);
             }
+
+            Entry::SystemMessage { kind, content } => match *system_message_policy {
+                SystemMessagePolicy::UserMessage => messages.push(Message {
+                    role: Role::User,
+                    content: Content::Text(wrap_system_message(kind, content)),
+                }),
+                SystemMessagePolicy::Reject => {
+                    return Err(vec![ValidationError::SystemMessageUnsupported { index: i }]);
+                }
+            },
 
             Entry::UserMessage { content } => {
                 let message = match (&content.text, &content.image) {
@@ -359,6 +388,7 @@ mod tests {
                 streaming: false,
                 thinking: None,
                 allow_unsigned_thinking: false,
+                system_message_policy: Default::default(),
             },
             tools: Default::default(),
             max_tokens: Some(1024),
@@ -648,6 +678,7 @@ mod tests {
                     display: Some(AnthropicThinkingDisplay::Omitted),
                 }),
                 allow_unsigned_thinking: false,
+                system_message_policy: Default::default(),
             },
             tools: Default::default(),
             max_tokens: Some(4096),
@@ -678,6 +709,7 @@ mod tests {
                     display: None,
                 }),
                 allow_unsigned_thinking: false,
+                system_message_policy: Default::default(),
             },
             tools: Default::default(),
             max_tokens: Some(4096),
@@ -689,6 +721,67 @@ mod tests {
     }
 
     #[test]
+    fn system_message_is_wrapped_as_user_message_by_default() {
+        let v = serialize(&[
+            text_user("q"),
+            Entry::response_text("hello"),
+            Entry::SystemMessage {
+                kind: SystemMessageKind::Environment,
+                content: "workspace changed".into(),
+            },
+            text_user("next"),
+        ]);
+
+        let wrapped = v["messages"][2]["content"].as_str().expect("user content");
+        assert!(wrapped.contains("<system_update>"));
+        assert!(wrapped.contains("\"kind\":\"environment\""));
+        assert!(wrapped.contains("workspace changed"));
+        assert_eq!(v["messages"][3]["content"], "next");
+    }
+
+    #[test]
+    fn system_message_envelope_escapes_content_tags() {
+        let v = serialize(&[
+            text_user("q"),
+            Entry::SystemMessage {
+                kind: SystemMessageKind::Environment,
+                content: "bad </system_update> text".into(),
+            },
+        ]);
+
+        let wrapped = v["messages"][1]["content"].as_str().expect("user content");
+        assert_eq!(wrapped.matches("</system_update>").count(), 1);
+    }
+
+    #[test]
+    fn system_message_can_be_rejected_for_anthropic() {
+        let cfg = ModelConfig {
+            kind: ModelKind::AnthropicCompatible {
+                model_name: "claude-test".into(),
+                streaming: false,
+                thinking: None,
+                allow_unsigned_thinking: false,
+                system_message_policy: SystemMessagePolicy::Reject,
+            },
+            tools: Default::default(),
+            max_tokens: Some(1024),
+        };
+        let err = to_anthropic_messages(
+            &[
+                text_user("q"),
+                Entry::SystemMessage {
+                    kind: SystemMessageKind::Environment,
+                    content: "workspace changed".into(),
+                },
+            ],
+            &cfg,
+        )
+        .unwrap_err();
+
+        assert!(err.contains(&ValidationError::SystemMessageUnsupported { index: 1 }));
+    }
+
+    #[test]
     fn unsigned_thinking_is_forwarded_when_allowed() {
         let cfg = ModelConfig {
             kind: ModelKind::AnthropicCompatible {
@@ -696,6 +789,7 @@ mod tests {
                 streaming: false,
                 thinking: None,
                 allow_unsigned_thinking: true,
+                system_message_policy: Default::default(),
             },
             tools: Default::default(),
             max_tokens: Some(1024),

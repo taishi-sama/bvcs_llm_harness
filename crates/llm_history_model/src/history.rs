@@ -125,10 +125,41 @@ impl ResponseBlock {
     }
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SystemMessageKind {
+    /// Provider-neutral system message (`system` role where supported).
+    System,
+    /// OpenAI `developer` role. Compatible servers may not support it; use
+    /// [`SystemMessageKind::System`] for maximum portability.
+    Developer,
+    /// Application/environment metadata (tool availability, workspace changes,
+    /// etc.).
+    Environment,
+}
+
+impl SystemMessageKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Developer => "developer",
+            Self::Environment => "environment",
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum Entry {
     /// Should be only one in beginning of history
     SystemPrompt {
+        content: String,
+    },
+    /// An in-conversation system/developer/environment message.
+    ///
+    /// Unlike [`Entry::SystemPrompt`], this is not a turn and may appear
+    /// between turns. Providers that have no native system message role need
+    /// an explicit policy (see `SystemMessagePolicy`).
+    SystemMessage {
+        kind: SystemMessageKind,
         content: String,
     },
     UserMessage {

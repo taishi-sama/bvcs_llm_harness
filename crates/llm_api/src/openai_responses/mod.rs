@@ -3,6 +3,8 @@
 //!
 //! Mapping overview:
 //! - `SystemPrompt`      -> top-level `instructions` parameter
+//! - `SystemMessage`     -> `{type:"message", role:"system"|"developer"}` at
+//!   its position in `input`
 //! - `UserMessage`       -> `{type:"message", role:"user"}` (string content, or
 //!   typed parts when an image is attached)
 //! - `Response`          -> one `reasoning` item per thinking block and one
@@ -30,7 +32,9 @@ pub mod tools;
 use crate::model_config::ModelConfig;
 use crate::validation::validate_entries;
 use crate::wire_common::{mime_str, thinking_text};
-use llm_history_model::history::{Entry, MessageContent, ResponseBlock, Thinking};
+use llm_history_model::history::{
+    Entry, MessageContent, ResponseBlock, SystemMessageKind, Thinking,
+};
 use serde::Serialize;
 
 pub use tools::{OpenAiFunction, OpenAiTool, tools_to_openai};
@@ -75,6 +79,8 @@ pub struct MessageItem {
 #[derive(Debug, Serialize, Clone, Copy, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
+    System,
+    Developer,
     User,
     Assistant,
 }
@@ -246,6 +252,17 @@ pub fn to_responses_input<'a>(
                 return Err(vec![crate::validation::ValidationError::DraftNotFinal {
                     index: i,
                 }]);
+            }
+
+            Entry::SystemMessage { kind, content } => {
+                items.push(InputItem::Message(MessageItem {
+                    role: if matches!(kind, SystemMessageKind::Developer) {
+                        Role::Developer
+                    } else {
+                        Role::System
+                    },
+                    content: Content::Text(content.clone()),
+                }));
             }
 
             Entry::UserMessage { content } => items.push(InputItem::Message(MessageItem {
@@ -616,6 +633,42 @@ mod tests {
     }
 
     #[test]
+    fn system_and_environment_messages_are_input_items() {
+        let v = serialize(&[
+            Entry::SystemPrompt {
+                content: "sys".into(),
+            },
+            text_user("hi"),
+            Entry::response_text("hello"),
+            Entry::SystemMessage {
+                kind: SystemMessageKind::Environment,
+                content: "workspace changed".into(),
+            },
+            Entry::SystemMessage {
+                kind: SystemMessageKind::Developer,
+                content: "use tabs".into(),
+            },
+        ]);
+
+        assert_eq!(
+            v["input"][2],
+            json!({
+                "type": "message",
+                "role": "system",
+                "content": "workspace changed"
+            })
+        );
+        assert_eq!(
+            v["input"][3],
+            json!({
+                "type": "message",
+                "role": "developer",
+                "content": "use tabs"
+            })
+        );
+    }
+
+    #[test]
     fn interleaved_response_keeps_item_order() {
         let v = serialize(&[
             text_user("q"),
@@ -699,6 +752,7 @@ mod tests {
                 streaming: false,
                 thinking: None,
                 allow_unsigned_thinking: false,
+                system_message_policy: Default::default(),
             },
             tools: Default::default(),
             max_tokens: None,

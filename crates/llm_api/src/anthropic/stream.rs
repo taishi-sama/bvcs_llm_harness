@@ -396,6 +396,7 @@ mod tests {
                 streaming: true,
                 thinking: None,
                 allow_unsigned_thinking: false,
+                system_message_policy: Default::default(),
             },
             tools: Default::default(),
             max_tokens: Some(1024),

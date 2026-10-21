@@ -1,4 +1,4 @@
-use crate::model_config::{ModelConfig, ModelKind};
+use crate::model_config::{ModelConfig, ModelKind, SystemMessagePolicy};
 use llm_history_model::history::{Entry, ResponseBlock, Thinking};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -56,6 +56,14 @@ pub enum ValidationError {
     /// OpenAI exposes reasoning per assistant message, not as multiple
     /// independent thinking blocks in one message.
     MultipleThinkingBlocks { index: usize, count: usize },
+    /// A system/environment message has no content.
+    EmptySystemMessage { index: usize },
+    /// A system/environment message cannot be inserted while tool calls are
+    /// still waiting for results.
+    SystemMessageDuringToolCall { index: usize },
+    /// The configured provider cannot represent an in-conversation system
+    /// message (Anthropic with `SystemMessagePolicy::Reject`).
+    SystemMessageUnsupported { index: usize },
     /// Anthropic extended thinking requires `1024 <= budget_tokens < max_tokens`.
     InvalidThinkingBudget { budget_tokens: u32, max_tokens: u32 },
     /// Config kind does not match the serializer used (e.g. calling an
@@ -72,6 +80,7 @@ pub enum ValidationError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
     System,
+    SystemMessage,
     UserMsg,
     Assistant,
     Results,
@@ -82,6 +91,7 @@ enum Kind {
 const fn kind_of(e: &Entry) -> Kind {
     match e {
         Entry::SystemPrompt { .. } => Kind::System,
+        Entry::SystemMessage { .. } => Kind::SystemMessage,
         Entry::UserMessage { .. } => Kind::UserMsg,
         Entry::Response { .. } | Entry::ResponseToolCall { .. } => Kind::Assistant,
         Entry::ToolCallResult { .. } => Kind::Results,
@@ -92,6 +102,7 @@ const fn kind_of(e: &Entry) -> Kind {
 const fn kind_name(k: Kind) -> &'static str {
     match k {
         Kind::System => "system",
+        Kind::SystemMessage => "system_message",
         Kind::UserMsg => "user",
         Kind::Assistant => "assistant",
         Kind::Results => "results",
@@ -112,6 +123,7 @@ fn transition_ok(from: Option<Kind>, to: Kind) -> bool {
         // into unrelated transition errors.
         Some(Kind::Draft) => true,
         Some(Kind::System) => true,
+        Some(Kind::SystemMessage) => true,
     }
 }
 
@@ -121,7 +133,7 @@ fn last_kind(entries: &[Entry], upto: usize) -> Option<Kind> {
         .iter()
         .rev()
         .map(kind_of)
-        .find(|k| !matches!(k, Kind::System | Kind::Draft))
+        .find(|k| !matches!(k, Kind::System | Kind::SystemMessage | Kind::Draft))
 }
 
 fn is_json_object(s: &str) -> bool {
@@ -144,8 +156,16 @@ fn check_provider_rules(
     match &config.kind {
         ModelKind::AnthropicCompatible {
             allow_unsigned_thinking,
+            system_message_policy,
             ..
         } => {
+            if matches!(system_message_policy, SystemMessagePolicy::Reject) {
+                for (i, entry) in entries.iter().enumerate() {
+                    if matches!(entry, Entry::SystemMessage { .. }) {
+                        errors.push(ValidationError::SystemMessageUnsupported { index: i });
+                    }
+                }
+            }
             for (i, entry) in entries.iter().enumerate() {
                 let thinking = assistant_thinking(entry);
                 // Real Anthropic requires a signature to replay thinking.
@@ -206,6 +226,8 @@ fn check_provider_rules(
 /// Enforced rules:
 /// - at most one [`Entry::SystemPrompt`], at index 0
 /// - strict alternation `User -> Assistant -> Results* -> Assistant ...`, starting with user
+/// - [`Entry::SystemMessage`] is a non-turn entry: it may appear between turns
+///   but not while tool calls are waiting for results
 /// - non-empty user messages (text or image) and non-empty assistant responses
 ///   ([`Entry::Response`] must have at least one non-empty block)
 /// - every `toolcall_params` parses as a JSON object
@@ -216,8 +238,9 @@ fn check_provider_rules(
 ///
 /// Provider-specific (`config.kind`):
 /// - `AnthropicCompatible`: rejects unsigned [`Thinking::Normal`] blocks
-///   unless `allow_unsigned_thinking` is set, and always rejects OpenAI
-///   [`Thinking::Encrypted`] blocks
+///   unless `allow_unsigned_thinking` is set, always rejects OpenAI
+///   [`Thinking::Encrypted`] blocks, and rejects [`Entry::SystemMessage`]
+///   when `system_message_policy` is `Reject`
 /// - `OpenAICompatible`: rejects Anthropic [`Thinking::Redacted`] blocks and
 ///   more than one thinking block in a single assistant message
 pub fn validate_entries(
@@ -245,6 +268,18 @@ pub fn validate_entries(
             continue;
         }
 
+        // System/environment messages are non-turn entries: they may appear
+        // between turns but must not break tool-call/result pairing.
+        if let Entry::SystemMessage { content, .. } = entry {
+            if content.is_empty() {
+                errors.push(ValidationError::EmptySystemMessage { index: i });
+            }
+            if !pending.is_empty() {
+                errors.push(ValidationError::SystemMessageDuringToolCall { index: i });
+            }
+            continue;
+        }
+
         let prev = last_kind(entries, i);
         let k = kind_of(entry);
         if !transition_ok(prev, k) {
@@ -257,6 +292,7 @@ pub fn validate_entries(
 
         match entry {
             Entry::SystemPrompt { .. } => unreachable!("handled above"),
+            Entry::SystemMessage { .. } => unreachable!("handled above"),
             Entry::Draft { .. } => unreachable!("handled above"),
             Entry::UserMessage { content } => {
                 let has_text = content.text.as_ref().is_some_and(|t| !t.is_empty());
@@ -358,7 +394,7 @@ pub fn validate_entries(
 mod tests {
     use super::*;
     use llm_history_model::history::{
-        DraftBlock, Image, ImageMIME, MessageContent, ToolCall, ToolCallResult,
+        DraftBlock, Image, ImageMIME, MessageContent, SystemMessageKind, ToolCall, ToolCallResult,
     };
 
     fn openai_config() -> ModelConfig {
@@ -382,6 +418,7 @@ mod tests {
                 streaming: false,
                 thinking: None,
                 allow_unsigned_thinking: false,
+                system_message_policy: Default::default(),
             },
             tools: Default::default(),
             max_tokens: Some(1024),
@@ -399,6 +436,13 @@ mod tests {
 
     fn assistant_text(t: &str) -> Entry {
         Entry::response_text(t)
+    }
+
+    fn system_message(content: &str) -> Entry {
+        Entry::SystemMessage {
+            kind: SystemMessageKind::Environment,
+            content: content.into(),
+        }
     }
 
     fn tool_call(id: &str) -> Entry {
@@ -508,6 +552,7 @@ mod tests {
                 streaming: false,
                 thinking: None,
                 allow_unsigned_thinking: true,
+                system_message_policy: Default::default(),
             },
             tools: Default::default(),
             max_tokens: Some(1024),
@@ -716,6 +761,60 @@ mod tests {
             .expect("text is rescuable");
         let h = vec![text_user("q"), rescued];
         assert_eq!(validate_entries(&h, &openai_config()), Ok(()));
+    }
+
+    #[test]
+    fn accepts_system_message_between_turns() {
+        let h = vec![
+            text_user("q"),
+            assistant_text("answer"),
+            system_message("workspace changed"),
+            text_user("next"),
+        ];
+        assert_eq!(validate_entries(&h, &openai_config()), Ok(()));
+        assert_eq!(validate_entries(&h, &anthropic_config()), Ok(()));
+    }
+
+    #[test]
+    fn rejects_system_message_while_tool_call_is_pending() {
+        let h = vec![
+            text_user("q"),
+            tool_call("c1"),
+            system_message("workspace changed"),
+        ];
+        assert!(matches!(
+            validate_entries(&h, &openai_config()),
+            Err(e) if e.contains(&ValidationError::SystemMessageDuringToolCall { index: 2 })
+        ));
+    }
+
+    #[test]
+    fn rejects_empty_system_message() {
+        let h = vec![text_user("q"), system_message("")];
+        assert!(matches!(
+            validate_entries(&h, &openai_config()),
+            Err(e) if e.contains(&ValidationError::EmptySystemMessage { index: 1 })
+        ));
+    }
+
+    #[test]
+    fn anthropic_rejects_system_message_when_policy_is_reject() {
+        let cfg = ModelConfig {
+            kind: ModelKind::AnthropicCompatible {
+                model_name: "claude-test".into(),
+                streaming: false,
+                thinking: None,
+                allow_unsigned_thinking: false,
+                system_message_policy: SystemMessagePolicy::Reject,
+            },
+            tools: Default::default(),
+            max_tokens: Some(1024),
+        };
+        let h = vec![text_user("q"), system_message("workspace changed")];
+        assert!(matches!(
+            validate_entries(&h, &cfg),
+            Err(e) if e.contains(&ValidationError::SystemMessageUnsupported { index: 1 })
+        ));
     }
 
     #[test]

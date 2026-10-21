@@ -410,6 +410,7 @@ mod tests {
             streaming: true,
             thinking: None,
             allow_unsigned_thinking: false,
+            system_message_policy: Default::default(),
         };
         let entries = finish_draft_for(
             Entry::Draft {
@@ -437,6 +438,7 @@ mod tests {
             streaming: true,
             thinking: None,
             allow_unsigned_thinking: true,
+            system_message_policy: Default::default(),
         };
         let entries = finish_draft_for(
             Entry::Draft {

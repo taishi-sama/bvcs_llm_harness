@@ -4,6 +4,7 @@
 //!
 //! Mapping overview:
 //! - `SystemPrompt`      -> `{role:"system", content}` message
+//! - `SystemMessage`     -> `{role:"system"|"developer", content}` at its position
 //! - `UserMessage`       -> `{role:"user"}` (string content, or content parts
 //!   when an image is attached)
 //! - `Response`          -> `{role:"assistant", reasoning_content?, content}`
@@ -29,7 +30,9 @@
 use crate::model_config::ModelConfig;
 use crate::validation::validate_entries;
 use crate::wire_common::{mime_str, thinking_joined};
-use llm_history_model::history::{Entry, MessageContent, ResponseBlock, Thinking};
+use llm_history_model::history::{
+    Entry, MessageContent, ResponseBlock, SystemMessageKind, Thinking,
+};
 use serde::Serialize;
 
 pub mod response;
@@ -81,6 +84,7 @@ pub struct Message {
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     System,
+    Developer,
     User,
     Assistant,
     Tool,
@@ -209,6 +213,18 @@ pub fn to_completions_input(
                     index: i,
                 }]);
             }
+
+            Entry::SystemMessage { kind, content } => messages.push(Message {
+                role: if matches!(kind, SystemMessageKind::Developer) {
+                    Role::Developer
+                } else {
+                    Role::System
+                },
+                content: Some(Content::Text(content.clone())),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+            }),
 
             Entry::UserMessage { content } => messages.push(Message {
                 role: Role::User,
@@ -515,6 +531,34 @@ mod tests {
     }
 
     #[test]
+    fn system_and_environment_messages_are_forwarded() {
+        let v = serialize(&[
+            Entry::SystemPrompt {
+                content: "sys".into(),
+            },
+            text_user("hi"),
+            Entry::response_text("hello"),
+            Entry::SystemMessage {
+                kind: SystemMessageKind::Environment,
+                content: "workspace changed".into(),
+            },
+            Entry::SystemMessage {
+                kind: SystemMessageKind::Developer,
+                content: "use tabs".into(),
+            },
+        ]);
+
+        assert_eq!(
+            v["messages"][3],
+            serde_json::json!({"role": "system", "content": "workspace changed"})
+        );
+        assert_eq!(
+            v["messages"][4],
+            serde_json::json!({"role": "developer", "content": "use tabs"})
+        );
+    }
+
+    #[test]
     fn thinking_only_entry_uses_reasoning_content() {
         let v = serialize(&[
             text_user("q"),
@@ -604,6 +648,7 @@ mod tests {
                 streaming: false,
                 thinking: None,
                 allow_unsigned_thinking: false,
+                system_message_policy: Default::default(),
             },
             tools: Default::default(),
             max_tokens: None,

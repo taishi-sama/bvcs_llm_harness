@@ -64,6 +64,7 @@ impl Provider {
                 thinking: None,
                 // llama.cpp returns thinking blocks with `signature: ""`.
                 allow_unsigned_thinking: true,
+                system_message_policy: Default::default(),
             },
             Provider::Completions | Provider::Responses => ModelKind::OpenAICompatible {
                 model_name: model_name.into(),

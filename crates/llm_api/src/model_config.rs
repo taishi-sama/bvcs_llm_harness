@@ -39,7 +39,24 @@ pub enum ModelKind {
         /// `false` and should only be enabled for compatible servers.
         #[serde(default)]
         allow_unsigned_thinking: bool,
+        /// How to serialize in-conversation system/environment messages.
+        /// The Messages API has no native system role.
+        #[serde(default)]
+        system_message_policy: SystemMessagePolicy,
     },
+}
+
+/// Anthropic policy for [`llm_history_model::history::Entry::SystemMessage`].
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SystemMessagePolicy {
+    /// Serialize as a user message wrapped in a `<system_update>` envelope.
+    /// Preserves position and does not invalidate the cached system prefix.
+    #[default]
+    UserMessage,
+
+    /// Reject the history because Anthropic cannot represent it natively.
+    Reject,
 }
 
 /// Anthropic extended-thinking request configuration.
