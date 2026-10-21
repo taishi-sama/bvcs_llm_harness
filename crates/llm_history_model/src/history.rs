@@ -16,11 +16,24 @@ pub struct ToolCallResult {
     pub is_error: bool,
     pub tool_use_id: String,
 }
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum Thinking {
-    Normal { thinking: String },
-    Signed { thinking: String, signature: String },
-    Redacted { thinking: String },
+    Normal {
+        thinking: String,
+    },
+    /// OpenAI-style encrypted thinking
+    Encrypted {
+        thinking: String,
+    },
+    /// Anthropic-style signed thinking
+    Signed {
+        thinking: String,
+        signature: String,
+    },
+    /// Anthropic-style redacted thinking
+    Redacted {
+        thinking: String,
+    },
 }
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum ImageMIME {
@@ -46,6 +59,10 @@ pub enum DraftBlock {
         /// Anthropic sends the signature as a separate delta after the
         /// thinking text. `None` means it has not arrived yet.
         signature: Option<String>,
+        /// OpenAI sends the complete reasoning item as an opaque
+        /// `encrypted_content` blob when stateless replay is requested.
+        /// `None` for providers that only expose plaintext thinking.
+        encrypted_content: Option<String>,
     },
     RedactedThinking {
         /// Opaque provider payload (Anthropic `redacted_thinking.data`).
@@ -66,6 +83,48 @@ pub enum DraftBlock {
     },
 }
 
+/// One ordered block of an assistant response.
+///
+/// Keeping thinking and visible text in the same vector preserves the wire
+/// order (for example `[thinking, text, thinking, text]`) instead of forcing
+/// all thinking to the front.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum ResponseBlock {
+    Thinking(Thinking),
+    Text(String),
+}
+
+impl ResponseBlock {
+    pub fn thinking(&self) -> Option<&Thinking> {
+        match self {
+            Self::Thinking(thinking) => Some(thinking),
+            Self::Text(_) => None,
+        }
+    }
+
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            Self::Text(text) => Some(text),
+            Self::Thinking(_) => None,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::Thinking(thinking) => match thinking {
+                Thinking::Normal { thinking }
+                | Thinking::Encrypted { thinking }
+                | Thinking::Redacted { thinking } => thinking.is_empty(),
+                Thinking::Signed {
+                    thinking,
+                    signature,
+                } => thinking.is_empty() && signature.is_empty(),
+            },
+            Self::Text(text) => text.is_empty(),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum Entry {
     /// Should be only one in beginning of history
@@ -75,9 +134,12 @@ pub enum Entry {
     UserMessage {
         content: MessageContent,
     },
-    ResponseNormal {
-        thinking: Vec<Thinking>,
-        content: String,
+    /// A completed assistant response, stored as ordered thinking/text blocks.
+    ///
+    /// A response may be thinking-only, text-only, or interleaved. The vector
+    /// must contain at least one non-empty block.
+    Response {
+        blocks: Vec<ResponseBlock>,
     },
     ResponseToolCall {
         thinking: Vec<Thinking>,
@@ -100,6 +162,59 @@ impl Entry {
         Entry::Draft { blocks: Vec::new() }
     }
 
+    /// An ordered assistant response.
+    pub fn response(blocks: Vec<ResponseBlock>) -> Self {
+        Entry::Response { blocks }
+    }
+
+    /// A text-only assistant response.
+    pub fn response_text(text: impl Into<String>) -> Self {
+        Entry::Response {
+            blocks: vec![ResponseBlock::Text(text.into())],
+        }
+    }
+
+    /// A thinking-only assistant response.
+    pub fn response_thinking(thinking: Vec<Thinking>) -> Self {
+        Entry::Response {
+            blocks: thinking.into_iter().map(ResponseBlock::Thinking).collect(),
+        }
+    }
+
+    /// The ordered response blocks, if this is an [`Entry::Response`].
+    pub fn as_response_blocks(&self) -> Option<&[ResponseBlock]> {
+        match self {
+            Entry::Response { blocks } => Some(blocks),
+            _ => None,
+        }
+    }
+
+    /// Thinking blocks of an [`Entry::Response`], in order.
+    pub fn response_thinking_blocks(&self) -> Vec<&Thinking> {
+        self.as_response_blocks()
+            .map(|blocks| blocks.iter().filter_map(ResponseBlock::thinking).collect())
+            .unwrap_or_default()
+    }
+
+    /// Non-empty text blocks of an [`Entry::Response`], in order.
+    pub fn response_text_blocks(&self) -> Vec<&str> {
+        self.as_response_blocks()
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .filter_map(ResponseBlock::text)
+                    .filter(|text| !text.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Visible text of an [`Entry::Response`], joining text blocks with `\n`.
+    pub fn response_joined_text(&self) -> Option<String> {
+        let joined = self.response_text_blocks().join("\n");
+        (!joined.is_empty()).then_some(joined)
+    }
+
     pub fn is_draft(&self) -> bool {
         matches!(self, Entry::Draft { .. })
     }
@@ -118,60 +233,85 @@ impl Entry {
     /// Unlike the strict commit path, this drops unusable pieces instead of
     /// failing:
     ///
-    /// - non-empty text blocks are joined with `\n`
-    /// - thinking is kept (signed when a signature arrived, otherwise
-    ///   [`Thinking::Normal`]); empty blocks are skipped
+    /// - thinking and text are kept in their original block order as
+    ///   [`ResponseBlock`]s
+    /// - OpenAI encrypted thinking is kept as [`Thinking::Encrypted`]
+    /// - otherwise thinking is kept (signed when a signature arrived,
+    ///   [`Thinking::Normal`] when unsigned); empty blocks are skipped
     /// - when `drop_unsigned_thinking` is `true`, thinking blocks that never
     ///   received a signature are omitted instead of becoming
     ///   [`Thinking::Normal`] (useful for providers like Anthropic that reject
-    ///   unsigned thinking on replay)
+    ///   unsigned thinking on replay); OpenAI [`Thinking::Encrypted`] payloads
+    ///   are omitted as well because they are not replayable to Anthropic
     /// - tool calls are kept only when they are finished: non-empty id and
     ///   name, and arguments that are empty or a complete JSON object. Partial
     ///   arguments drop the whole call rather than preserving unusable JSON.
     /// - if any finished tool call remains, the result is
-    ///   [`Entry::ResponseToolCall`] with the text as `content`; otherwise
-    ///   non-empty text becomes [`Entry::ResponseNormal`]
-    /// - if the draft contains only thinking, `thinking_only_message` becomes
-    ///   the message content, so the turn can still be appended to history
+    ///   [`Entry::ResponseToolCall`] with the ordered thinking/text flattened
+    ///   into its fields; otherwise the ordered blocks become
+    ///   [`Entry::Response`]
     ///
-    /// Returns `None` when `self` is not a draft, when nothing usable remains,
-    /// or when the draft is thinking-only and `thinking_only_message` is empty.
+    /// The `thinking_only_message` parameter is retained for API
+    /// compatibility and is no longer used.
+    ///
+    /// Returns `None` when `self` is not a draft or when nothing usable
+    /// remains.
     ///
     /// The result is structurally valid, but provider rules still apply (for
     /// example, Anthropic cannot replay unsigned thinking).
     pub fn try_to_rescue_draft(
         &self,
-        thinking_only_message: &str,
+        _thinking_only_message: &str,
         drop_unsigned_thinking: bool,
     ) -> Option<Entry> {
         let Entry::Draft { blocks } = self else {
             return None;
         };
 
-        let mut thinking: Vec<Thinking> = Vec::new();
-        let mut texts: Vec<String> = Vec::new();
+        let mut response: Vec<ResponseBlock> = Vec::new();
         let mut calls: Vec<ToolCall> = Vec::new();
 
         for block in blocks {
             match block {
-                DraftBlock::Thinking { text, signature } if !text.is_empty() => {
-                    match signature.as_deref().filter(|s| !s.is_empty()) {
-                        Some(signature) => thinking.push(Thinking::Signed {
+                DraftBlock::Thinking {
+                    text,
+                    signature,
+                    encrypted_content,
+                } => {
+                    let thinking = if let Some(data) =
+                        encrypted_content.as_deref().filter(|s| !s.is_empty())
+                    {
+                        // OpenAI encrypted reasoning is opaque; it supersedes
+                        // the plaintext copy for replay. When the caller asked
+                        // to drop non-Anthropic thinking, it is omitted too.
+                        (!drop_unsigned_thinking).then(|| Thinking::Encrypted {
+                            thinking: data.to_owned(),
+                        })
+                    } else if let Some(signature) = signature.as_deref().filter(|s| !s.is_empty()) {
+                        // Keep signature-only blocks (`display: "omitted"`).
+                        Some(Thinking::Signed {
                             thinking: text.clone(),
                             signature: signature.to_owned(),
-                        }),
-                        None if !drop_unsigned_thinking => thinking.push(Thinking::Normal {
+                        })
+                    } else if !text.is_empty() && !drop_unsigned_thinking {
+                        Some(Thinking::Normal {
                             thinking: text.clone(),
-                        }),
-                        None => {}
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some(thinking) = thinking {
+                        response.push(ResponseBlock::Thinking(thinking));
                     }
                 }
                 DraftBlock::RedactedThinking { data } if !data.is_empty() => {
-                    thinking.push(Thinking::Redacted {
+                    response.push(ResponseBlock::Thinking(Thinking::Redacted {
                         thinking: data.clone(),
-                    });
+                    }));
                 }
-                DraftBlock::Text { text } if !text.is_empty() => texts.push(text.clone()),
+                DraftBlock::Text { text } if !text.is_empty() => {
+                    response.push(ResponseBlock::Text(text.clone()));
+                }
                 DraftBlock::ToolCall {
                     tool_use_id: Some(tool_use_id),
                     tool_name: Some(tool_name),
@@ -198,16 +338,25 @@ impl Entry {
             }
         }
 
-        let content = {
-            let joined = texts.join("\n");
-            if joined.is_empty() {
-                None
-            } else {
-                Some(joined)
-            }
-        };
-
         if !calls.is_empty() {
+            let thinking = response
+                .iter()
+                .filter_map(ResponseBlock::thinking)
+                .cloned()
+                .collect();
+            let content = {
+                let joined = response
+                    .iter()
+                    .filter_map(ResponseBlock::text)
+                    .filter(|text| !text.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if joined.is_empty() {
+                    None
+                } else {
+                    Some(joined)
+                }
+            };
             return Some(Entry::ResponseToolCall {
                 thinking,
                 content,
@@ -215,17 +364,11 @@ impl Entry {
             });
         }
 
-        if let Some(content) = content {
-            return Some(Entry::ResponseNormal { thinking, content });
+        if response.is_empty() {
+            None
+        } else {
+            Some(Entry::Response { blocks: response })
         }
-
-        if thinking.is_empty() || thinking_only_message.is_empty() {
-            return None;
-        }
-        Some(Entry::ResponseNormal {
-            thinking,
-            content: thinking_only_message.to_owned(),
-        })
     }
 }
 
@@ -252,6 +395,15 @@ mod tests {
         DraftBlock::Thinking {
             text: text.into(),
             signature: signature.map(str::to_owned),
+            encrypted_content: None,
+        }
+    }
+
+    fn encrypted_thinking(data: &str) -> DraftBlock {
+        DraftBlock::Thinking {
+            text: String::new(),
+            signature: None,
+            encrypted_content: Some(data.into()),
         }
     }
 
@@ -272,14 +424,16 @@ mod tests {
         .try_to_rescue_draft("[thinking only]", false)
         .expect("text is rescuable");
 
-        let Entry::ResponseNormal { thinking, content } = rescued else {
-            panic!("expected ResponseNormal");
-        };
-        assert_eq!(content, "Hello\nworld");
-        assert!(matches!(
-            thinking.as_slice(),
-            [Thinking::Normal { thinking }] if thinking == "hmm"
-        ));
+        assert_eq!(
+            rescued.as_response_blocks().expect("expected Response"),
+            [
+                ResponseBlock::Thinking(Thinking::Normal {
+                    thinking: "hmm".into()
+                }),
+                ResponseBlock::Text("Hello".into()),
+                ResponseBlock::Text("world".into()),
+            ]
+        );
     }
 
     #[test]
@@ -296,16 +450,19 @@ mod tests {
         .try_to_rescue_draft("[thinking only]", false)
         .expect("text is rescuable");
 
-        let Entry::ResponseNormal { thinking, .. } = rescued else {
-            panic!("expected ResponseNormal");
-        };
-        assert!(matches!(
-            thinking.as_slice(),
+        assert_eq!(
+            rescued.as_response_blocks().expect("expected Response"),
             [
-                Thinking::Signed { thinking, signature },
-                Thinking::Redacted { thinking: redacted }
-            ] if thinking == "signed" && signature == "sig==" && redacted == "opaque"
-        ));
+                ResponseBlock::Thinking(Thinking::Signed {
+                    thinking: "signed".into(),
+                    signature: "sig==".into(),
+                }),
+                ResponseBlock::Thinking(Thinking::Redacted {
+                    thinking: "opaque".into(),
+                }),
+                ResponseBlock::Text("answer".into()),
+            ]
+        );
     }
 
     #[test]
@@ -351,10 +508,10 @@ mod tests {
         .try_to_rescue_draft("[thinking only]", false)
         .expect("text is rescuable");
 
-        assert!(matches!(
-            rescued,
-            Entry::ResponseNormal { content, .. } if content == "partial answer"
-        ));
+        assert_eq!(
+            rescued.as_response_blocks().expect("expected Response"),
+            [ResponseBlock::Text("partial answer".into())]
+        );
 
         // Nothing else usable -> no entry.
         let rescued = Entry::Draft {
@@ -366,10 +523,7 @@ mod tests {
 
     #[test]
     fn returns_none_for_non_draft_and_empty_drafts() {
-        let final_entry = Entry::ResponseNormal {
-            thinking: Vec::new(),
-            content: "done".into(),
-        };
+        let final_entry = Entry::response_text("done");
         assert!(
             final_entry
                 .try_to_rescue_draft("[thinking only]", false)
@@ -391,15 +545,10 @@ mod tests {
         let rescued = draft
             .try_to_rescue_draft("[thinking only]", true)
             .expect("text is rescuable");
-        let Entry::ResponseNormal {
-            thinking: rescued_thinking,
-            content,
-        } = rescued
-        else {
-            panic!("expected ResponseNormal");
-        };
-        assert_eq!(content, "answer");
-        assert!(rescued_thinking.is_empty());
+        assert_eq!(
+            rescued.as_response_blocks().expect("expected Response"),
+            [ResponseBlock::Text("answer".into())]
+        );
 
         // Signed thinking is unaffected by the toggle.
         let draft = Entry::Draft {
@@ -408,18 +557,16 @@ mod tests {
         let rescued = draft
             .try_to_rescue_draft("", true)
             .expect("text is rescuable");
-        let Entry::ResponseNormal {
-            thinking: rescued_thinking,
-            ..
-        } = rescued
-        else {
-            panic!("expected ResponseNormal");
-        };
-        assert!(matches!(
-            rescued_thinking.as_slice(),
-            [Thinking::Signed { thinking, signature }]
-                if thinking == "hmm" && signature == "sig"
-        ));
+        assert_eq!(
+            rescued.as_response_blocks().expect("expected Response"),
+            [
+                ResponseBlock::Thinking(Thinking::Signed {
+                    thinking: "hmm".into(),
+                    signature: "sig".into(),
+                }),
+                ResponseBlock::Text("answer".into()),
+            ]
+        );
 
         // If unsigned thinking was the only content, dropping it leaves
         // nothing and the fallback cannot manufacture a message.
@@ -430,25 +577,39 @@ mod tests {
     }
 
     #[test]
-    fn thinking_only_draft_uses_fallback_message() {
+    fn thinking_only_draft_becomes_response_thinking_only() {
         let draft = Entry::Draft {
             blocks: vec![thinking("only thoughts", Some("sig"))],
         };
 
         let rescued = draft
             .try_to_rescue_draft("[thinking only]", false)
-            .expect("fallback text creates a message");
-        let Entry::ResponseNormal { thinking, content } = rescued else {
-            panic!("expected ResponseNormal");
-        };
-        assert_eq!(content, "[thinking only]");
-        assert!(matches!(
-            thinking.as_slice(),
-            [Thinking::Signed { thinking, signature }]
-                if thinking == "only thoughts" && signature == "sig"
-        ));
+            .expect("thinking is rescuable");
+        assert_eq!(
+            rescued.as_response_blocks().expect("expected Response"),
+            [ResponseBlock::Thinking(Thinking::Signed {
+                thinking: "only thoughts".into(),
+                signature: "sig".into(),
+            })]
+        );
 
-        // An empty fallback cannot produce valid assistant content.
-        assert!(draft.try_to_rescue_draft("", false).is_none());
+        // The legacy fallback text is ignored.
+        assert!(draft.try_to_rescue_draft("", false).is_some());
+    }
+
+    #[test]
+    fn rescues_encrypted_thinking() {
+        let rescued = Entry::Draft {
+            blocks: vec![encrypted_thinking("opaque-openai-blob")],
+        }
+        .try_to_rescue_draft("", false)
+        .expect("encrypted thinking is rescuable");
+
+        assert_eq!(
+            rescued.as_response_blocks().expect("expected Response"),
+            [ResponseBlock::Thinking(Thinking::Encrypted {
+                thinking: "opaque-openai-blob".into(),
+            })]
+        );
     }
 }

@@ -5,15 +5,19 @@
 //! - `SystemPrompt`      -> top-level `instructions` parameter
 //! - `UserMessage`       -> `{type:"message", role:"user"}` (string content, or
 //!   typed parts when an image is attached)
-//! - `ResponseNormal`    -> optional `reasoning` item + `{type:"message", role:"assistant"}`
+//! - `Response`          -> one `reasoning` item per thinking block and one
+//!   `{type:"message", role:"assistant"}` item per text block, in block order
 //! - `ResponseToolCall`  -> optional `reasoning` item + one `function_call` item per call
 //! - `ToolCallResult`    -> one `function_call_output` item per result
 //!
 //! Policies:
-//! - `Thinking::Normal` and `Thinking::Secret` are both emitted as plaintext
-//!   `reasoning_text`; OpenAI round-trips its own reasoning via opaque
-//!   `encrypted_content`, which this model does not store, so reasoning context
-//!   is best-effort for o-series models.
+//! - Requests opt into `include: ["reasoning.encrypted_content"]`, so OpenAI
+//!   returns an opaque payload for stateless replay.
+//! - [`Thinking::Encrypted`] is emitted as `encrypted_content` (preferred when
+//!   present); [`Thinking::Normal`] and [`Thinking::Signed`] fall back to
+//!   plaintext `reasoning_text` for compatible endpoints.
+//! - Anthropic [`Thinking::Redacted`] has no OpenAI representation and is
+//!   rejected by validation.
 //! - `is_error` has no native flag in Responses; errors are prefixed `"ERROR: "`.
 //! - Reasoning items get synthesized ids (`rs_NNNNNN`) since the model does not
 //!   track provider item ids.
@@ -25,7 +29,7 @@ pub mod tools;
 use crate::model_config::ModelConfig;
 use crate::validation::validate_entries;
 use crate::wire_common::{mime_str, thinking_text};
-use llm_history_model::history::{Entry, MessageContent, Thinking};
+use llm_history_model::history::{Entry, MessageContent, ResponseBlock, Thinking};
 use serde::Serialize;
 
 pub use tools::{OpenAiFunction, OpenAiTool, tools_to_openai};
@@ -42,6 +46,10 @@ pub struct ResponsesInput<'a> {
     /// System prompt, hoisted out of the item list (top-level request parameter).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instructions: Option<&'a str>,
+    /// Ask OpenAI to return stateless reasoning payloads. Without this,
+    /// reasoning items cannot be replayed when `store` is `false`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub include: Vec<&'static str>,
     /// Function tools forwarded from `ModelConfig.tools`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<OpenAiTool>,
@@ -112,6 +120,11 @@ pub struct ReasoningItem {
     pub summary: Vec<SummaryText>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub content: Vec<ReasoningText>,
+    /// OpenAI opaque reasoning payload (`reasoning.encrypted_content`). When
+    /// present, `content` is empty because the encrypted blob is the
+    /// authoritative stateless replay form.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encrypted_content: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -128,18 +141,45 @@ pub struct ReasoningText {
     pub text: String,
 }
 
+/// Emits one OpenAI reasoning item, returning whether a block was produced.
+fn push_reasoning_item(items: &mut Vec<InputItem>, t: &Thinking, counter: &mut usize) -> bool {
+    let id = format!("rs_{counter:06}");
+    match t {
+        Thinking::Encrypted { thinking } if !thinking.is_empty() => {
+            *counter += 1;
+            items.push(InputItem::Reasoning(ReasoningItem {
+                id,
+                summary: vec![],
+                content: Vec::new(),
+                encrypted_content: Some(thinking.clone()),
+            }));
+            true
+        }
+        // Normal/Signed carry plaintext. Anthropic redacted thinking has no
+        // OpenAI representation (validation rejects it); skip defensively.
+        Thinking::Normal { .. } | Thinking::Signed { .. } => {
+            let Some(text) = thinking_text(t).filter(|text| !text.is_empty()) else {
+                return false;
+            };
+            *counter += 1;
+            items.push(InputItem::Reasoning(ReasoningItem {
+                id,
+                summary: vec![],
+                content: vec![ReasoningText {
+                    r#type: "reasoning_text",
+                    text: text.to_owned(),
+                }],
+                encrypted_content: None,
+            }));
+            true
+        }
+        Thinking::Encrypted { .. } | Thinking::Redacted { .. } => false,
+    }
+}
+
 fn push_reasoning(items: &mut Vec<InputItem>, thinking: &[Thinking], counter: &mut usize) {
     for t in thinking {
-        let id = format!("rs_{counter:06}");
-        *counter += 1;
-        items.push(InputItem::Reasoning(ReasoningItem {
-            id,
-            summary: vec![],
-            content: vec![ReasoningText {
-                r#type: "reasoning_text",
-                text: thinking_text(t).to_owned(),
-            }],
-        }));
+        push_reasoning_item(items, t, counter);
     }
 }
 
@@ -193,12 +233,34 @@ pub fn to_responses_input<'a>(
                 content: user_content(content),
             })),
 
-            Entry::ResponseNormal { thinking, content } => {
-                push_reasoning(&mut items, thinking, &mut reasoning_count);
-                items.push(InputItem::Message(MessageItem {
-                    role: Role::Assistant,
-                    content: Content::Text(content.clone()),
-                }));
+            Entry::Response { blocks } => {
+                let before = items.len();
+                for block in blocks {
+                    match block {
+                        ResponseBlock::Thinking(thinking) => {
+                            push_reasoning_item(&mut items, thinking, &mut reasoning_count);
+                        }
+                        ResponseBlock::Text(text) if !text.is_empty() => {
+                            items.push(InputItem::Message(MessageItem {
+                                role: Role::Assistant,
+                                content: Content::Text(text.clone()),
+                            }));
+                        }
+                        ResponseBlock::Text(_) => {}
+                    }
+                }
+                if items.len() == before {
+                    // An opaque block (for example a signature-only Anthropic
+                    // thinking block) has no OpenAI representation, so the
+                    // whole assistant turn would silently disappear.
+                    return Err(vec![
+                        crate::validation::ValidationError::IncompatibleThinking {
+                            index: i,
+                            provider: "openai_responses",
+                            kind: "opaque",
+                        },
+                    ]);
+                }
             }
 
             Entry::ResponseToolCall {
@@ -256,6 +318,7 @@ pub fn to_responses_input<'a>(
         store: false,
         model: model_name.to_string(),
         instructions,
+        include: vec!["reasoning.encrypted_content"],
         tools: tools_to_openai(&config.tools),
         input: items,
         stream: *streaming,
@@ -303,10 +366,7 @@ mod tests {
                 content: "Be terse.".into(),
             },
             text_user("hi"),
-            Entry::ResponseNormal {
-                thinking: Vec::new(),
-                content: "Hello!".into(),
-            },
+            Entry::response_text("Hello!"),
         ]);
 
         assert_eq!(
@@ -316,6 +376,7 @@ mod tests {
                 "model": "gpt-test",
                 "stream": false,
                 "prompt_cache_key": "prompt_cache_key",
+                "include": ["reasoning.encrypted_content"],
                 "instructions": "Be terse.",
                 "input": [
                     {"type": "message", "role": "user", "content": "hi"},
@@ -395,13 +456,13 @@ mod tests {
                     tool_use_id: "call_1".into(),
                 }],
             },
-            Entry::ResponseNormal {
-                thinking: vec![Thinking::Signed {
+            Entry::response(vec![
+                ResponseBlock::Thinking(Thinking::Signed {
                     thinking: "it said sunny".into(),
                     signature: "sig==".into(),
-                }],
-                content: "Sunny!".into(),
-            },
+                }),
+                ResponseBlock::Text("Sunny!".into()),
+            ]),
         ]);
 
         assert_eq!(
@@ -433,19 +494,14 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_with_content_and_multiple_thinking() {
+    fn tool_call_with_content_and_thinking() {
         let v = serialize(&[
             text_user("do both"),
             Entry::ResponseToolCall {
-                thinking: vec![
-                    Thinking::Normal {
-                        thinking: "first".into(),
-                    },
-                    Thinking::Signed {
-                        thinking: "second".into(),
-                        signature: "sig".into(),
-                    },
-                ],
+                thinking: vec![Thinking::Signed {
+                    thinking: "second".into(),
+                    signature: "sig".into(),
+                }],
                 content: Some("working on it".into()),
                 tool_call: vec![ToolCall {
                     tool_name: "a".into(),
@@ -469,12 +525,6 @@ mod tests {
                 {
                     "type": "reasoning",
                     "id": "rs_000000",
-                    "summary": [],
-                    "content": [{"type": "reasoning_text", "text": "first"}]
-                },
-                {
-                    "type": "reasoning",
-                    "id": "rs_000001",
                     "summary": [],
                     "content": [{"type": "reasoning_text", "text": "second"}]
                 },
@@ -542,10 +592,73 @@ mod tests {
     }
 
     fn assistant_done() -> Entry {
-        Entry::ResponseNormal {
-            thinking: Vec::new(),
-            content: "done".into(),
-        }
+        Entry::response_text("done")
+    }
+
+    #[test]
+    fn encrypted_thinking_is_forwarded_as_encrypted_content() {
+        let v = serialize(&[
+            text_user("q"),
+            Entry::response(vec![
+                ResponseBlock::Thinking(Thinking::Encrypted {
+                    thinking: "opaque-openai-blob".into(),
+                }),
+                ResponseBlock::Text("answer".into()),
+            ]),
+        ]);
+
+        assert_eq!(
+            v["input"][1],
+            json!({
+                "type": "reasoning",
+                "id": "rs_000000",
+                "summary": [],
+                "encrypted_content": "opaque-openai-blob"
+            })
+        );
+        assert_eq!(v["input"][2]["content"], "answer");
+    }
+
+    #[test]
+    fn interleaved_response_keeps_item_order() {
+        let v = serialize(&[
+            text_user("q"),
+            Entry::response(vec![
+                ResponseBlock::Text("first".into()),
+                ResponseBlock::Thinking(Thinking::Normal {
+                    thinking: "hmm".into(),
+                }),
+                ResponseBlock::Text("second".into()),
+            ]),
+        ]);
+
+        assert_eq!(v["input"][1]["type"], "message");
+        assert_eq!(v["input"][1]["content"], "first");
+        assert_eq!(v["input"][2]["type"], "reasoning");
+        assert_eq!(v["input"][2]["content"][0]["text"], "hmm");
+        assert_eq!(v["input"][3]["type"], "message");
+        assert_eq!(v["input"][3]["content"], "second");
+    }
+
+    #[test]
+    fn thinking_only_entry_emits_reasoning_without_message() {
+        let v = serialize(&[
+            text_user("q"),
+            Entry::response_thinking(vec![Thinking::Encrypted {
+                thinking: "opaque".into(),
+            }]),
+        ]);
+
+        assert_eq!(
+            v["input"][1],
+            json!({
+                "type": "reasoning",
+                "id": "rs_000000",
+                "summary": [],
+                "encrypted_content": "opaque"
+            })
+        );
+        assert_eq!(v["input"].as_array().unwrap().len(), 2);
     }
 
     #[test]
@@ -588,6 +701,8 @@ mod tests {
             kind: ModelKind::AnthropicCompatible {
                 model_name: "claude".into(),
                 streaming: false,
+                thinking: None,
+                allow_unsigned_thinking: false,
             },
             tools: Default::default(),
             max_tokens: None,

@@ -1,5 +1,5 @@
 use crate::model_config::{ModelConfig, ModelKind};
-use llm_history_model::history::{Entry, Thinking};
+use llm_history_model::history::{Entry, ResponseBlock, Thinking};
 use serde_json::Value;
 use std::collections::HashSet;
 
@@ -34,6 +34,30 @@ pub enum ValidationError {
     /// Anthropic requires a signature to resend thinking blocks;
     /// `Thinking::Normal` cannot be round-tripped and would be silently dropped.
     UnsignedThinkingRejected { index: usize },
+    /// A thinking block belongs to a different provider's opaque format and
+    /// cannot be replayed to the configured one (for example Anthropic
+    /// `redacted_thinking` sent to OpenAI, or OpenAI `encrypted_content` sent
+    /// to Anthropic).
+    IncompatibleThinking {
+        index: usize,
+        provider: &'static str,
+        kind: &'static str,
+    },
+    /// A tool call entry has no calls and no visible content.
+    EmptyToolCall { index: usize },
+    /// A tool result entry contains no results.
+    EmptyToolResult { index: usize },
+    /// A tool call/result identifier is empty.
+    EmptyToolIdentifier {
+        entry: usize,
+        call: usize,
+        field: &'static str,
+    },
+    /// OpenAI exposes reasoning per assistant message, not as multiple
+    /// independent thinking blocks in one message.
+    MultipleThinkingBlocks { index: usize, count: usize },
+    /// Anthropic extended thinking requires `1024 <= budget_tokens < max_tokens`.
+    InvalidThinkingBudget { budget_tokens: u32, max_tokens: u32 },
     /// Config kind does not match the serializer used (e.g. calling an
     /// Anthropic serializer with an `OpenAICompatible` config).
     WrongProviderKind {
@@ -59,7 +83,7 @@ const fn kind_of(e: &Entry) -> Kind {
     match e {
         Entry::SystemPrompt { .. } => Kind::System,
         Entry::UserMessage { .. } => Kind::UserMsg,
-        Entry::ResponseNormal { .. } | Entry::ResponseToolCall { .. } => Kind::Assistant,
+        Entry::Response { .. } | Entry::ResponseToolCall { .. } => Kind::Assistant,
         Entry::ToolCallResult { .. } => Kind::Results,
         Entry::Draft { .. } => Kind::Draft,
     }
@@ -104,6 +128,14 @@ fn is_json_object(s: &str) -> bool {
     matches!(serde_json::from_str::<Value>(s), Ok(Value::Object(_)))
 }
 
+fn assistant_thinking(entry: &Entry) -> Vec<&Thinking> {
+    match entry {
+        Entry::Response { blocks } => blocks.iter().filter_map(ResponseBlock::thinking).collect(),
+        Entry::ResponseToolCall { thinking, .. } => thinking.iter().collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// Provider-specific checks layered on top of the shared structural rules.
 fn check_provider_rules(
     entries: &[Entry],
@@ -111,25 +143,60 @@ fn check_provider_rules(
     errors: &mut Vec<ValidationError>,
 ) {
     match &config.kind {
-        ModelKind::AnthropicCompatible { .. } => {
-            // Unsigned thinking cannot be resent to Anthropic (signature required).
+        ModelKind::AnthropicCompatible {
+            allow_unsigned_thinking,
+            ..
+        } => {
             for (i, entry) in entries.iter().enumerate() {
-                let thinking: &[Thinking] = match entry {
-                    Entry::ResponseNormal { thinking, .. }
-                    | Entry::ResponseToolCall { thinking, .. } => thinking,
-                    _ => continue,
-                };
-                if thinking
-                    .iter()
-                    .any(|t| matches!(t, Thinking::Normal { .. }))
+                let thinking = assistant_thinking(entry);
+                // Real Anthropic requires a signature to replay thinking.
+                // Compatible servers (llama.cpp) send an empty signature.
+                if !*allow_unsigned_thinking
+                    && thinking
+                        .iter()
+                        .any(|t| matches!(t, Thinking::Normal { .. }))
                 {
                     errors.push(ValidationError::UnsignedThinkingRejected { index: i });
+                }
+                // OpenAI encrypted reasoning is opaque in a different format.
+                if thinking
+                    .iter()
+                    .any(|t| matches!(t, Thinking::Encrypted { .. }))
+                {
+                    errors.push(ValidationError::IncompatibleThinking {
+                        index: i,
+                        provider: "anthropic_compatible",
+                        kind: "encrypted",
+                    });
                 }
             }
         }
         ModelKind::OpenAICompatible { .. } => {
-            // No additional constraints yet; both signed and unsigned thinking
-            // serialize fine as reasoning items.
+            for (i, entry) in entries.iter().enumerate() {
+                let thinking = assistant_thinking(entry);
+                // OpenAI reasoning is attached per assistant message. Multiple
+                // thinking blocks in one `Response` (or one `ResponseToolCall`)
+                // would be emitted as multiple reasoning items for the same
+                // message, which is not a valid OpenAI history.
+                if thinking.len() > 1 {
+                    errors.push(ValidationError::MultipleThinkingBlocks {
+                        index: i,
+                        count: thinking.len(),
+                    });
+                }
+                // Anthropic redacted thinking is an opaque payload that cannot
+                // be converted to OpenAI reasoning text.
+                if thinking
+                    .iter()
+                    .any(|t| matches!(t, Thinking::Redacted { .. }))
+                {
+                    errors.push(ValidationError::IncompatibleThinking {
+                        index: i,
+                        provider: "openai_compatible",
+                        kind: "redacted",
+                    });
+                }
+            }
         }
     }
 }
@@ -140,15 +207,20 @@ fn check_provider_rules(
 /// Enforced rules:
 /// - at most one [`Entry::SystemPrompt`], at index 0
 /// - strict alternation `User -> Assistant -> Results* -> Assistant ...`, starting with user
-/// - non-empty user messages (text or image) and non-empty assistant text
+/// - non-empty user messages (text or image) and non-empty assistant responses
+///   ([`Entry::Response`] must have at least one non-empty block)
 /// - every `toolcall_params` parses as a JSON object
+/// - non-empty tool-call/tool-result batches and non-empty identifiers
 /// - every result references a call from the immediately preceding batch
 /// - no duplicate tool_use_ids, no unanswered calls at the end of history
 /// - no [`Entry::Draft`] (finish the stream and commit it first)
 ///
 /// Provider-specific (`config.kind`):
 /// - `AnthropicCompatible`: rejects unsigned [`Thinking::Normal`] blocks
-/// - `OpenAICompatible`: no extra rules yet
+///   unless `allow_unsigned_thinking` is set, and always rejects OpenAI
+///   [`Thinking::Encrypted`] blocks
+/// - `OpenAICompatible`: rejects Anthropic [`Thinking::Redacted`] blocks and
+///   more than one thinking block in a single assistant message
 pub fn validate_entries(
     entries: &[Entry],
     config: &ModelConfig,
@@ -193,8 +265,8 @@ pub fn validate_entries(
                     errors.push(ValidationError::EmptyUserMessage { index: i });
                 }
             }
-            Entry::ResponseNormal { content, .. } => {
-                if content.is_empty() {
+            Entry::Response { blocks } => {
+                if blocks.is_empty() || blocks.iter().all(|block| block.is_empty()) {
                     errors.push(ValidationError::EmptyAssistantContent { index: i });
                 }
             }
@@ -204,8 +276,33 @@ pub fn validate_entries(
                 if matches!(content, Some(t) if t.is_empty()) {
                     errors.push(ValidationError::EmptyAssistantContent { index: i });
                 }
-                pending.clear();
+                if tool_call.is_empty() && content.as_ref().is_none_or(|t| t.is_empty()) {
+                    errors.push(ValidationError::EmptyToolCall { index: i });
+                }
+                // A previous tool-call batch must have been answered before a
+                // new one starts. Without this, an empty ToolCallResult entry
+                // between two batches would silently clear the pending set.
+                if !pending.is_empty() {
+                    errors.push(ValidationError::UnansweredToolCalls {
+                        tool_use_ids: pending.iter().map(|s| (*s).to_string()).collect(),
+                    });
+                    pending.clear();
+                }
                 for (ci, tc) in tool_call.iter().enumerate() {
+                    if tc.tool_use_id.trim().is_empty() {
+                        errors.push(ValidationError::EmptyToolIdentifier {
+                            entry: i,
+                            call: ci,
+                            field: "tool_use_id",
+                        });
+                    }
+                    if tc.tool_name.trim().is_empty() {
+                        errors.push(ValidationError::EmptyToolIdentifier {
+                            entry: i,
+                            call: ci,
+                            field: "tool_name",
+                        });
+                    }
                     if !call_ids.insert(tc.tool_use_id.as_str()) {
                         errors.push(ValidationError::DuplicateToolCallId {
                             tool_use_id: tc.tool_use_id.clone(),
@@ -218,7 +315,17 @@ pub fn validate_entries(
                 }
             }
             Entry::ToolCallResult { tool_call } => {
+                if tool_call.is_empty() {
+                    errors.push(ValidationError::EmptyToolResult { index: i });
+                }
                 for (ri, r) in tool_call.iter().enumerate() {
+                    if r.tool_use_id.trim().is_empty() {
+                        errors.push(ValidationError::EmptyToolIdentifier {
+                            entry: i,
+                            call: ri,
+                            field: "tool_use_id",
+                        });
+                    }
                     if !result_ids.insert(r.tool_use_id.as_str()) {
                         errors.push(ValidationError::DuplicateToolCallId {
                             tool_use_id: r.tool_use_id.clone(),
@@ -275,6 +382,8 @@ mod tests {
             kind: ModelKind::AnthropicCompatible {
                 model_name: "claude-test".into(),
                 streaming: false,
+                thinking: None,
+                allow_unsigned_thinking: false,
             },
             tools: Default::default(),
             max_tokens: Some(1024),
@@ -291,10 +400,7 @@ mod tests {
     }
 
     fn assistant_text(t: &str) -> Entry {
-        Entry::ResponseNormal {
-            thinking: Vec::new(),
-            content: t.into(),
-        }
+        Entry::response_text(t)
     }
 
     fn tool_call(id: &str) -> Entry {
@@ -368,13 +474,13 @@ mod tests {
                     tool_use_id: "c2".into(),
                 }],
             },
-            Entry::ResponseNormal {
-                thinking: vec![Thinking::Signed {
+            Entry::response(vec![
+                ResponseBlock::Thinking(Thinking::Signed {
                     thinking: "t".into(),
                     signature: "sig".into(),
-                }],
-                content: "done".into(),
-            },
+                }),
+                ResponseBlock::Text("done".into()),
+            ]),
         ];
         assert_eq!(validate_entries(&h, &openai_config()), Ok(()));
         assert_eq!(validate_entries(&h, &anthropic_config()), Ok(()));
@@ -384,12 +490,12 @@ mod tests {
     fn anthropic_rejects_unsigned_thinking_but_openai_accepts() {
         let h = vec![
             text_user("q"),
-            Entry::ResponseNormal {
-                thinking: vec![Thinking::Normal {
+            Entry::response(vec![
+                ResponseBlock::Thinking(Thinking::Normal {
                     thinking: "hmm".into(),
-                }],
-                content: "answer".into(),
-            },
+                }),
+                ResponseBlock::Text("answer".into()),
+            ]),
         ];
         assert_eq!(validate_entries(&h, &openai_config()), Ok(()));
         assert_eq!(
@@ -399,16 +505,40 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_accepts_unsigned_thinking_when_allowed() {
+        let cfg = ModelConfig {
+            kind: ModelKind::AnthropicCompatible {
+                model_name: "llama.cpp".into(),
+                streaming: false,
+                thinking: None,
+                allow_unsigned_thinking: true,
+            },
+            tools: Default::default(),
+            max_tokens: Some(1024),
+        };
+        let h = vec![
+            text_user("q"),
+            Entry::response(vec![
+                ResponseBlock::Thinking(Thinking::Normal {
+                    thinking: "hmm".into(),
+                }),
+                ResponseBlock::Text("answer".into()),
+            ]),
+        ];
+        assert_eq!(validate_entries(&h, &cfg), Ok(()));
+    }
+
+    #[test]
     fn anthropic_accepts_signed_thinking() {
         let h = vec![
             text_user("q"),
-            Entry::ResponseNormal {
-                thinking: vec![Thinking::Signed {
+            Entry::response(vec![
+                ResponseBlock::Thinking(Thinking::Signed {
                     thinking: "hmm".into(),
                     signature: "sig==".into(),
-                }],
-                content: "answer".into(),
-            },
+                }),
+                ResponseBlock::Text("answer".into()),
+            ]),
         ];
         assert_eq!(validate_entries(&h, &anthropic_config()), Ok(()));
     }
@@ -573,6 +703,7 @@ mod tests {
                 DraftBlock::Thinking {
                     text: "hmm".into(),
                     signature: None,
+                    encrypted_content: None,
                 },
                 DraftBlock::Text {
                     text: "partial answer".into(),
@@ -596,5 +727,208 @@ mod tests {
     fn collects_multiple_errors() {
         let h = vec![tool_call("x"), tool_result("y")];
         assert!(matches!(validate_entries(&h, &openai_config()), Err(e) if e.len() >= 3));
+    }
+
+    #[test]
+    fn rejects_redacted_thinking_for_openai() {
+        let h = vec![
+            text_user("q"),
+            Entry::response(vec![
+                ResponseBlock::Thinking(Thinking::Redacted {
+                    thinking: "opaque".into(),
+                }),
+                ResponseBlock::Text("answer".into()),
+            ]),
+        ];
+        assert!(matches!(
+            validate_entries(&h, &openai_config()),
+            Err(e) if e.contains(&ValidationError::IncompatibleThinking {
+                index: 1,
+                provider: "openai_compatible",
+                kind: "redacted",
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_encrypted_thinking_for_anthropic() {
+        let h = vec![
+            text_user("q"),
+            Entry::response(vec![
+                ResponseBlock::Thinking(Thinking::Encrypted {
+                    thinking: "opaque".into(),
+                }),
+                ResponseBlock::Text("answer".into()),
+            ]),
+        ];
+        assert!(matches!(
+            validate_entries(&h, &anthropic_config()),
+            Err(e) if e.contains(&ValidationError::IncompatibleThinking {
+                index: 1,
+                provider: "anthropic_compatible",
+                kind: "encrypted",
+            })
+        ));
+        // OpenAI accepts its own encrypted payload.
+        assert_eq!(validate_entries(&h, &openai_config()), Ok(()));
+    }
+
+    #[test]
+    fn thinking_only_requires_non_empty_thinking() {
+        let valid = vec![
+            text_user("q"),
+            Entry::response_thinking(vec![Thinking::Encrypted {
+                thinking: "opaque".into(),
+            }]),
+        ];
+        assert_eq!(validate_entries(&valid, &openai_config()), Ok(()));
+
+        let empty = vec![text_user("q"), Entry::response(Vec::new())];
+        assert!(matches!(
+            validate_entries(&empty, &openai_config()),
+            Err(e) if e.contains(&ValidationError::EmptyAssistantContent { index: 1 })
+        ));
+    }
+
+    #[test]
+    fn openai_rejects_multiple_thinking_blocks_in_one_response() {
+        let h = vec![
+            text_user("q"),
+            Entry::response(vec![
+                ResponseBlock::Thinking(Thinking::Encrypted {
+                    thinking: "one".into(),
+                }),
+                ResponseBlock::Text("answer".into()),
+                ResponseBlock::Thinking(Thinking::Encrypted {
+                    thinking: "two".into(),
+                }),
+            ]),
+        ];
+        assert!(matches!(
+            validate_entries(&h, &openai_config()),
+            Err(e) if e.contains(&ValidationError::MultipleThinkingBlocks {
+                index: 1,
+                count: 2,
+            })
+        ));
+
+        // Anthropic allows multiple signed thinking blocks (each keeps its own
+        // signature), so the same shape is valid there.
+        let h = vec![
+            text_user("q"),
+            Entry::response(vec![
+                ResponseBlock::Thinking(Thinking::Signed {
+                    thinking: "one".into(),
+                    signature: "s1".into(),
+                }),
+                ResponseBlock::Text("answer".into()),
+                ResponseBlock::Thinking(Thinking::Signed {
+                    thinking: "two".into(),
+                    signature: "s2".into(),
+                }),
+            ]),
+        ];
+        assert_eq!(validate_entries(&h, &anthropic_config()), Ok(()));
+    }
+
+    #[test]
+    fn openai_rejects_multiple_thinking_blocks_in_tool_call_message() {
+        let h = vec![
+            text_user("q"),
+            Entry::ResponseToolCall {
+                thinking: vec![
+                    Thinking::Encrypted {
+                        thinking: "one".into(),
+                    },
+                    Thinking::Encrypted {
+                        thinking: "two".into(),
+                    },
+                ],
+                content: Some("answer".into()),
+                tool_call: Vec::new(),
+            },
+        ];
+        assert!(matches!(
+            validate_entries(&h, &openai_config()),
+            Err(e) if e.contains(&ValidationError::MultipleThinkingBlocks {
+                index: 1,
+                count: 2,
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_empty_tool_call_batch() {
+        let h = vec![
+            text_user("q"),
+            Entry::ResponseToolCall {
+                thinking: Vec::new(),
+                content: None,
+                tool_call: Vec::new(),
+            },
+        ];
+        assert!(matches!(
+            validate_entries(&h, &openai_config()),
+            Err(e) if e.contains(&ValidationError::EmptyToolCall { index: 1 })
+        ));
+    }
+
+    #[test]
+    fn rejects_empty_tool_result_batch() {
+        let h = vec![
+            text_user("q"),
+            tool_call("c1"),
+            Entry::ToolCallResult {
+                tool_call: Vec::new(),
+            },
+        ];
+        assert!(matches!(
+            validate_entries(&h, &openai_config()),
+            Err(e) if e.contains(&ValidationError::EmptyToolResult { index: 2 })
+        ));
+    }
+
+    #[test]
+    fn rejects_empty_tool_identifiers() {
+        let h = vec![
+            text_user("q"),
+            Entry::ResponseToolCall {
+                thinking: Vec::new(),
+                content: None,
+                tool_call: vec![ToolCall {
+                    tool_name: String::new(),
+                    toolcall_params: "{}".into(),
+                    tool_use_id: String::new(),
+                }],
+            },
+        ];
+        let err = validate_entries(&h, &openai_config()).unwrap_err();
+        assert!(err.contains(&ValidationError::EmptyToolIdentifier {
+            entry: 1,
+            call: 0,
+            field: "tool_use_id",
+        }));
+        assert!(err.contains(&ValidationError::EmptyToolIdentifier {
+            entry: 1,
+            call: 0,
+            field: "tool_name",
+        }));
+    }
+
+    #[test]
+    fn empty_result_batch_cannot_hide_unanswered_calls() {
+        let h = vec![
+            text_user("q"),
+            tool_call("c1"),
+            Entry::ToolCallResult {
+                tool_call: Vec::new(),
+            },
+            tool_call("c2"),
+        ];
+        let err = validate_entries(&h, &openai_config()).unwrap_err();
+        assert!(err.contains(&ValidationError::UnansweredToolCalls {
+            tool_use_ids: vec!["c1".into()],
+        }));
+        assert!(err.contains(&ValidationError::EmptyToolResult { index: 2 }));
     }
 }

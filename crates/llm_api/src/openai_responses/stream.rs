@@ -95,9 +95,13 @@ impl StreamDecoder {
             "response.output_item.added" => {
                 if let Some(item) = event.item {
                     let index = event.output_index.unwrap_or(blocks.len() as u32);
-                    let pos = push_item(blocks, index, &item);
-                    self.positions.insert(index, pos);
-                    self.last_position = Some(pos);
+                    // Unknown item types are not part of the history model and
+                    // must not create a phantom block that later deltas could
+                    // attach to.
+                    if let Some(pos) = push_item(blocks, index, &item) {
+                        self.positions.insert(index, pos);
+                        self.last_position = Some(pos);
+                    }
                 }
             }
 
@@ -115,7 +119,10 @@ impl StreamDecoder {
                 }
             }
 
-            "response.output_text.delta" => {
+            // Refusals are visible assistant text and are buffered like
+            // `output_text`; without this a streamed refusal is lost when the
+            // terminal `response.completed` payload carries no output.
+            "response.output_text.delta" | "response.refusal.delta" => {
                 if let Some(delta) = event.delta
                     && !delta.is_empty()
                 {
@@ -138,6 +145,28 @@ impl StreamDecoder {
                     }
                     self.last_position = Some(pos);
                     out.push(StreamEvent::ThinkingDelta(delta));
+                }
+            }
+
+            // Terminal text events carry the authoritative full text. Re-sync
+            // in case a delta was dropped by a proxy.
+            "response.output_text.done" | "response.refusal.done" => {
+                if let Some(text) = event.text.or(event.refusal).filter(|text| !text.is_empty()) {
+                    let pos = self.position_for_text(event.output_index, blocks);
+                    if let Some(DraftBlock::Text { text: existing }) = blocks.get_mut(pos) {
+                        *existing = text;
+                    }
+                    self.last_position = Some(pos);
+                }
+            }
+
+            "response.reasoning_text.done" | "response.reasoning_summary_text.done" => {
+                if let Some(text) = event.text.filter(|text| !text.is_empty()) {
+                    let pos = self.position_for_thinking(event.output_index, blocks);
+                    if let Some(DraftBlock::Thinking { text: existing, .. }) = blocks.get_mut(pos) {
+                        *existing = text;
+                    }
+                    self.last_position = Some(pos);
                 }
             }
 
@@ -169,12 +198,14 @@ impl StreamDecoder {
                 if let Some(item) = event.item {
                     let index = event.output_index.unwrap_or(blocks.len() as u32);
                     let pos = match self.positions.get(&index).copied() {
-                        Some(pos) if pos < blocks.len() => pos,
+                        Some(pos) if pos < blocks.len() => Some(pos),
                         _ => push_item(blocks, index, &item),
                     };
-                    sync_item(&mut blocks[pos], &item);
-                    self.positions.insert(index, pos);
-                    self.last_position = Some(pos);
+                    if let Some(pos) = pos {
+                        sync_item(&mut blocks[pos], &item);
+                        self.positions.insert(index, pos);
+                        self.last_position = Some(pos);
+                    }
                 }
             }
 
@@ -228,10 +259,19 @@ impl StreamDecoder {
         output_index: Option<u32>,
         blocks: &mut Vec<DraftBlock>,
     ) -> usize {
-        let index = output_index.unwrap_or(blocks.len() as u32);
-        if let Some(pos) = output_index.and_then(|i| self.positions.get(&i).copied())
-            && matches!(blocks.get(pos), Some(DraftBlock::Text { .. }))
-        {
+        if let Some(index) = output_index {
+            if let Some(pos) = self.positions.get(&index).copied()
+                && matches!(blocks.get(pos), Some(DraftBlock::Text { .. }))
+            {
+                return pos;
+            }
+            // An explicitly indexed block that we have not seen yet must not
+            // borrow the previous text block.
+            blocks.push(DraftBlock::Text {
+                text: String::new(),
+            });
+            let pos = blocks.len() - 1;
+            self.positions.insert(index, pos);
             return pos;
         }
         if let Some(pos) = self
@@ -243,9 +283,7 @@ impl StreamDecoder {
         blocks.push(DraftBlock::Text {
             text: String::new(),
         });
-        let pos = blocks.len() - 1;
-        self.positions.insert(index, pos);
-        pos
+        blocks.len() - 1
     }
 
     fn position_for_thinking(
@@ -253,10 +291,19 @@ impl StreamDecoder {
         output_index: Option<u32>,
         blocks: &mut Vec<DraftBlock>,
     ) -> usize {
-        let index = output_index.unwrap_or(blocks.len() as u32);
-        if let Some(pos) = output_index.and_then(|i| self.positions.get(&i).copied())
-            && matches!(blocks.get(pos), Some(DraftBlock::Thinking { .. }))
-        {
+        if let Some(index) = output_index {
+            if let Some(pos) = self.positions.get(&index).copied()
+                && matches!(blocks.get(pos), Some(DraftBlock::Thinking { .. }))
+            {
+                return pos;
+            }
+            blocks.push(DraftBlock::Thinking {
+                text: String::new(),
+                signature: None,
+                encrypted_content: None,
+            });
+            let pos = blocks.len() - 1;
+            self.positions.insert(index, pos);
             return pos;
         }
         if let Some(pos) = self
@@ -268,10 +315,9 @@ impl StreamDecoder {
         blocks.push(DraftBlock::Thinking {
             text: String::new(),
             signature: None,
+            encrypted_content: None,
         });
-        let pos = blocks.len() - 1;
-        self.positions.insert(index, pos);
-        pos
+        blocks.len() - 1
     }
 
     fn position_for_tool_call(&mut self, index: u32, blocks: &mut Vec<DraftBlock>) -> usize {
@@ -298,14 +344,22 @@ impl StreamDecoder {
     }
 }
 
-fn push_item(blocks: &mut Vec<DraftBlock>, index: u32, item: &Item) -> usize {
+fn push_item(blocks: &mut Vec<DraftBlock>, index: u32, item: &Item) -> Option<usize> {
     let block = match item {
         Item::Message { content } => DraftBlock::Text {
             text: join_parts(content),
         },
-        Item::Reasoning { summary, content } => DraftBlock::Thinking {
+        Item::Reasoning {
+            summary,
+            content,
+            encrypted_content,
+        } => DraftBlock::Thinking {
             text: reasoning_text(summary, content),
             signature: None,
+            encrypted_content: encrypted_content
+                .as_ref()
+                .filter(|data| !data.is_empty())
+                .cloned(),
         },
         Item::FunctionCall {
             call_id,
@@ -317,12 +371,11 @@ fn push_item(blocks: &mut Vec<DraftBlock>, index: u32, item: &Item) -> usize {
             tool_name: Some(name.clone()),
             arguments: arguments.clone(),
         },
-        Item::Other => DraftBlock::Text {
-            text: String::new(),
-        },
+        // Unknown items have no history representation.
+        Item::Other => return None,
     };
     blocks.push(block);
-    blocks.len() - 1
+    Some(blocks.len() - 1)
 }
 
 fn sync_item(block: &mut DraftBlock, item: &Item) {
@@ -333,7 +386,21 @@ fn sync_item(block: &mut DraftBlock, item: &Item) {
                 *text = final_text;
             }
         }
-        (DraftBlock::Thinking { text, .. }, Item::Reasoning { summary, content }) => {
+        (
+            DraftBlock::Thinking {
+                text,
+                encrypted_content,
+                ..
+            },
+            Item::Reasoning {
+                summary,
+                content,
+                encrypted_content: final_encrypted,
+            },
+        ) => {
+            if let Some(data) = final_encrypted.as_ref().filter(|data| !data.is_empty()) {
+                *encrypted_content = Some(data.clone());
+            }
             let final_text = reasoning_text(summary, content);
             if !final_text.is_empty() {
                 *text = final_text;
@@ -371,6 +438,11 @@ fn rebuild_from_response(response: &ResponsesResponse, blocks: &mut Vec<DraftBlo
                 blocks.push(DraftBlock::Thinking {
                     text: r.text(),
                     signature: None,
+                    encrypted_content: r
+                        .encrypted_content
+                        .as_ref()
+                        .filter(|data| !data.is_empty())
+                        .cloned(),
                 });
                 index += 1;
             }
@@ -431,6 +503,12 @@ struct RawEvent {
     output_index: Option<u32>,
     #[serde(default)]
     delta: Option<String>,
+    /// Full text carried by terminal `*.done` events.
+    #[serde(default)]
+    text: Option<String>,
+    /// Full refusal text carried by `response.refusal.done`.
+    #[serde(default)]
+    refusal: Option<String>,
     #[serde(default)]
     item: Option<Item>,
     #[serde(default)]
@@ -453,6 +531,8 @@ enum Item {
         summary: Vec<TextPart>,
         #[serde(default)]
         content: Option<Vec<TextPart>>,
+        #[serde(default)]
+        encrypted_content: Option<String>,
     },
     FunctionCall {
         call_id: String,
@@ -532,6 +612,7 @@ mod tests {
                 DraftBlock::Thinking {
                     text: "hmm".into(),
                     signature: None,
+                    encrypted_content: None,
                 },
                 DraftBlock::Text {
                     text: "Hello".into(),
@@ -540,12 +621,9 @@ mod tests {
         );
 
         let entries = finish_draft(Entry::Draft { blocks }).unwrap();
-        let Entry::ResponseNormal { thinking, content } = &entries[0] else {
-            panic!("expected ResponseNormal");
-        };
-        assert_eq!(content, "Hello");
+        assert_eq!(entries[0].response_joined_text().as_deref(), Some("Hello"));
         assert!(matches!(
-            thinking.as_slice(),
+            entries[0].response_thinking_blocks().as_slice(),
             [Thinking::Normal { thinking }] if thinking == "hmm"
         ));
     }
@@ -563,14 +641,63 @@ mod tests {
         let mut decoder = StreamDecoder::new();
         let blocks = feed(&mut decoder, raw);
         let entries = finish_draft(Entry::Draft { blocks }).unwrap();
-        let Entry::ResponseNormal { thinking, content } = &entries[0] else {
-            panic!("expected ResponseNormal");
-        };
-        assert_eq!(content, "Hello!");
+        assert_eq!(entries[0].response_joined_text().as_deref(), Some("Hello!"));
         assert!(matches!(
-            thinking.as_slice(),
+            entries[0].response_thinking_blocks().as_slice(),
             [Thinking::Normal { thinking }] if thinking == "plan"
         ));
+    }
+
+    #[test]
+    fn encrypted_reasoning_survives_terminal_item() {
+        let raw = concat!(
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[]}}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[],\"encrypted_content\":\"opaque\"}}\n\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"content\":[]}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":1,\"delta\":\"Hi\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"model\":\"m\",\"status\":\"completed\",\"output\":[]}}\n\n",
+        );
+
+        let mut decoder = StreamDecoder::new();
+        let blocks = feed(&mut decoder, raw);
+        let entries = finish_draft(Entry::Draft { blocks }).unwrap();
+        assert_eq!(entries[0].response_joined_text().as_deref(), Some("Hi"));
+        assert!(matches!(
+            entries[0].response_thinking_blocks().as_slice(),
+            [Thinking::Encrypted { thinking }] if thinking == "opaque"
+        ));
+    }
+
+    #[test]
+    fn unknown_items_do_not_create_text_blocks() {
+        let raw = concat!(
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"web_search_call\",\"id\":\"ws_1\"}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":1,\"delta\":\"Hi\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"model\":\"m\",\"status\":\"completed\",\"output\":[]}}\n\n",
+        );
+
+        let mut decoder = StreamDecoder::new();
+        let blocks = feed(&mut decoder, raw);
+        assert_eq!(blocks, vec![DraftBlock::Text { text: "Hi".into() }]);
+    }
+
+    #[test]
+    fn refusal_deltas_are_kept() {
+        let raw = concat!(
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"content\":[]}}\n\n",
+            "data: {\"type\":\"response.refusal.delta\",\"output_index\":0,\"delta\":\"cannot \"}\n\n",
+            "data: {\"type\":\"response.refusal.delta\",\"output_index\":0,\"delta\":\"comply\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"model\":\"m\",\"status\":\"completed\",\"output\":[]}}\n\n",
+        );
+
+        let mut decoder = StreamDecoder::new();
+        let blocks = feed(&mut decoder, raw);
+        assert_eq!(
+            blocks,
+            vec![DraftBlock::Text {
+                text: "cannot comply".into()
+            }]
+        );
     }
 
     #[test]

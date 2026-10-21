@@ -8,7 +8,7 @@
 //! them, so a draft can never leak into a provider request.
 
 use crate::model_config::ModelKind;
-use llm_history_model::history::{DraftBlock, Entry, Thinking, ToolCall};
+use llm_history_model::history::{DraftBlock, Entry, ResponseBlock, Thinking, ToolCall};
 use std::fmt;
 
 /// A provider-neutral notification about stream progress.
@@ -75,13 +75,16 @@ impl std::error::Error for StreamError {}
 ///
 /// Mirrors the mapping used by the non-streaming response parsers:
 /// - blocks keep their order
-/// - thinking with a signature becomes [`Thinking::Signed`], unsigned thinking
-///   becomes [`Thinking::Normal`] (Anthropic validation rejects the latter, as
-///   it does for non-streamed histories)
+/// - thinking with OpenAI `encrypted_content` becomes
+///   [`Thinking::Encrypted`]; otherwise thinking with a signature becomes
+///   [`Thinking::Signed`], unsigned thinking becomes [`Thinking::Normal`]
+///   (Anthropic validation rejects the latter, as it does for non-streamed
+///   histories)
 /// - tool calls merge into one [`Entry::ResponseToolCall`] with adjacent text as
 ///   its `content`
-/// - otherwise non-empty text becomes [`Entry::ResponseNormal`]
-/// - empty/thinking-only drafts yield no entries
+/// - otherwise the ordered thinking/text blocks become [`Entry::Response`]
+///   (preserving interleaving)
+/// - empty drafts yield no entries
 pub fn finish_draft(entry: Entry) -> Result<Vec<Entry>, StreamError> {
     finish_draft_unfiltered(entry)
 }
@@ -94,14 +97,37 @@ pub fn finish_draft(entry: Entry) -> Result<Vec<Entry>, StreamError> {
 /// providers keep unsigned thinking as normal reasoning.
 pub fn finish_draft_for(entry: Entry, kind: &ModelKind) -> Result<Vec<Entry>, StreamError> {
     let mut entries = finish_draft_unfiltered(entry)?;
-    if matches!(kind, ModelKind::AnthropicCompatible { .. }) {
+    if let ModelKind::AnthropicCompatible {
+        allow_unsigned_thinking,
+        ..
+    } = kind
+    {
+        let replayable = |t: &Thinking| {
+            (matches!(t, Thinking::Signed { .. } | Thinking::Redacted { .. })
+                || (*allow_unsigned_thinking && matches!(t, Thinking::Normal { .. })))
+                && !crate::wire_common::thinking_is_empty(t)
+        };
         for entry in &mut entries {
-            if let Entry::ResponseNormal { thinking, .. }
-            | Entry::ResponseToolCall { thinking, .. } = entry
-            {
-                thinking.retain(|t| !matches!(t, Thinking::Normal { .. }));
+            match entry {
+                Entry::Response { blocks } => {
+                    blocks.retain(|block| match block {
+                        ResponseBlock::Thinking(t) => replayable(t),
+                        ResponseBlock::Text(_) => true,
+                    });
+                }
+                Entry::ResponseToolCall { thinking, .. } => {
+                    thinking.retain(replayable);
+                }
+                _ => {}
             }
         }
+        // A response left with no replayable content is empty.
+        entries.retain(|entry| match entry {
+            Entry::Response { blocks } => {
+                !blocks.is_empty() && blocks.iter().any(|block| !block.is_empty())
+            }
+            _ => true,
+        });
     }
     Ok(entries)
 }
@@ -111,33 +137,44 @@ fn finish_draft_unfiltered(entry: Entry) -> Result<Vec<Entry>, StreamError> {
         return Err(StreamError::NotADraft);
     };
 
-    let mut thinking: Vec<Thinking> = Vec::new();
-    let mut texts: Vec<String> = Vec::new();
+    let mut response: Vec<ResponseBlock> = Vec::new();
     let mut calls: Vec<ToolCall> = Vec::new();
 
     for block in blocks {
         match block {
             DraftBlock::Thinking {
                 text,
-                signature: Some(signature),
-            } => thinking.push(Thinking::Signed {
-                thinking: text,
                 signature,
-            }),
-            DraftBlock::Thinking {
-                text,
-                signature: None,
+                encrypted_content,
             } => {
-                if !text.is_empty() {
-                    thinking.push(Thinking::Normal { thinking: text });
+                let thinking = if let Some(data) = encrypted_content.filter(|data| !data.is_empty())
+                {
+                    // The opaque payload is the authoritative replay form.
+                    Some(Thinking::Encrypted { thinking: data })
+                } else if let Some(signature) = signature {
+                    Some(Thinking::Signed {
+                        thinking: text,
+                        signature,
+                    })
+                } else if !text.is_empty() {
+                    Some(Thinking::Normal { thinking: text })
+                } else {
+                    None
+                };
+                if let Some(thinking) = thinking {
+                    response.push(ResponseBlock::Thinking(thinking));
                 }
             }
             DraftBlock::RedactedThinking { data } => {
-                thinking.push(Thinking::Redacted { thinking: data });
+                if !data.is_empty() {
+                    response.push(ResponseBlock::Thinking(Thinking::Redacted {
+                        thinking: data,
+                    }));
+                }
             }
             DraftBlock::Text { text } => {
                 if !text.is_empty() {
-                    texts.push(text);
+                    response.push(ResponseBlock::Text(text));
                 }
             }
             DraftBlock::ToolCall {
@@ -162,16 +199,25 @@ fn finish_draft_unfiltered(entry: Entry) -> Result<Vec<Entry>, StreamError> {
         }
     }
 
-    let content = {
-        let joined = texts.join("\n");
-        if joined.is_empty() {
-            None
-        } else {
-            Some(joined)
-        }
-    };
-
     if !calls.is_empty() {
+        let thinking = response
+            .iter()
+            .filter_map(ResponseBlock::thinking)
+            .cloned()
+            .collect();
+        let content = {
+            let joined = response
+                .iter()
+                .filter_map(ResponseBlock::text)
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if joined.is_empty() {
+                None
+            } else {
+                Some(joined)
+            }
+        };
         return Ok(vec![Entry::ResponseToolCall {
             thinking,
             content,
@@ -179,10 +225,11 @@ fn finish_draft_unfiltered(entry: Entry) -> Result<Vec<Entry>, StreamError> {
         }]);
     }
 
-    let Some(content) = content else {
-        return Ok(Vec::new());
-    };
-    Ok(vec![Entry::ResponseNormal { thinking, content }])
+    if response.is_empty() {
+        Ok(Vec::new())
+    } else {
+        Ok(vec![Entry::Response { blocks: response }])
+    }
 }
 
 /// Finds the position of an existing tool-call block by provider index.
@@ -212,6 +259,7 @@ pub(crate) fn append_text(
                 DraftBlock::Thinking {
                     text: String::new(),
                     signature: None,
+                    encrypted_content: None,
                 }
             } else {
                 DraftBlock::Text {
@@ -248,6 +296,7 @@ mod tests {
                 DraftBlock::Thinking {
                     text: "hmm".into(),
                     signature: Some("sig".into()),
+                    encrypted_content: None,
                 },
                 text_block("Hello"),
                 text_block("world"),
@@ -256,12 +305,12 @@ mod tests {
         .unwrap();
 
         assert_eq!(entries.len(), 1);
-        let Entry::ResponseNormal { thinking, content } = &entries[0] else {
-            panic!("expected ResponseNormal");
-        };
-        assert_eq!(content, "Hello\nworld");
+        assert_eq!(
+            entries[0].response_joined_text().as_deref(),
+            Some("Hello\nworld")
+        );
         assert!(matches!(
-            thinking.as_slice(),
+            entries[0].response_thinking_blocks().as_slice(),
             [Thinking::Signed { thinking, signature }]
                 if thinking == "hmm" && signature == "sig"
         ));
@@ -274,17 +323,15 @@ mod tests {
                 DraftBlock::Thinking {
                     text: "hmm".into(),
                     signature: None,
+                    encrypted_content: None,
                 },
                 text_block("answer"),
             ],
         })
         .unwrap();
 
-        let Entry::ResponseNormal { thinking, .. } = &entries[0] else {
-            panic!("expected ResponseNormal");
-        };
         assert!(matches!(
-            thinking.as_slice(),
+            entries[0].response_thinking_blocks().as_slice(),
             [Thinking::Normal { thinking }] if thinking == "hmm"
         ));
     }
@@ -294,6 +341,8 @@ mod tests {
         let kind = ModelKind::AnthropicCompatible {
             model_name: "claude".into(),
             streaming: true,
+            thinking: None,
+            allow_unsigned_thinking: false,
         };
         let entries = finish_draft_for(
             Entry::Draft {
@@ -301,6 +350,7 @@ mod tests {
                     DraftBlock::Thinking {
                         text: "hmm".into(),
                         signature: None,
+                        encrypted_content: None,
                     },
                     text_block("answer"),
                 ],
@@ -309,11 +359,42 @@ mod tests {
         )
         .unwrap();
 
-        let Entry::ResponseNormal { thinking, content } = &entries[0] else {
-            panic!("expected ResponseNormal");
+        assert_eq!(entries[0].response_joined_text().as_deref(), Some("answer"));
+        assert!(entries[0].response_thinking_blocks().is_empty());
+    }
+
+    #[test]
+    fn anthropic_commit_keeps_unsigned_thinking_when_allowed() {
+        let kind = ModelKind::AnthropicCompatible {
+            model_name: "llama.cpp".into(),
+            streaming: true,
+            thinking: None,
+            allow_unsigned_thinking: true,
         };
-        assert_eq!(content, "answer");
-        assert!(thinking.is_empty());
+        let entries = finish_draft_for(
+            Entry::Draft {
+                blocks: vec![
+                    DraftBlock::Thinking {
+                        text: "hmm".into(),
+                        signature: None,
+                        encrypted_content: None,
+                    },
+                    text_block("answer"),
+                ],
+            },
+            &kind,
+        )
+        .unwrap();
+
+        assert_eq!(
+            entries[0].as_response_blocks().expect("expected Response"),
+            [
+                ResponseBlock::Thinking(Thinking::Normal {
+                    thinking: "hmm".into()
+                }),
+                ResponseBlock::Text("answer".into()),
+            ]
+        );
     }
 
     #[test]
@@ -329,6 +410,7 @@ mod tests {
                     DraftBlock::Thinking {
                         text: "hmm".into(),
                         signature: None,
+                        encrypted_content: None,
                     },
                     text_block("answer"),
                 ],
@@ -337,11 +419,8 @@ mod tests {
         )
         .unwrap();
 
-        let Entry::ResponseNormal { thinking, .. } = &entries[0] else {
-            panic!("expected ResponseNormal");
-        };
         assert!(matches!(
-            thinking.as_slice(),
+            entries[0].response_thinking_blocks().as_slice(),
             [Thinking::Normal { thinking }] if thinking == "hmm"
         ));
     }
@@ -353,6 +432,7 @@ mod tests {
                 DraftBlock::Thinking {
                     text: "plan".into(),
                     signature: Some("s1".into()),
+                    encrypted_content: None,
                 },
                 text_block("calling now"),
                 DraftBlock::ToolCall {
@@ -387,18 +467,41 @@ mod tests {
     }
 
     #[test]
-    fn empty_and_thinking_only_drafts_yield_nothing() {
+    fn empty_drafts_yield_nothing_and_thinking_only_drafts_are_kept() {
         assert!(finish_draft(Entry::draft()).unwrap().is_empty());
-        assert!(
-            finish_draft(Entry::Draft {
-                blocks: vec![DraftBlock::Thinking {
-                    text: "hmm".into(),
-                    signature: Some("s".into()),
-                }],
-            })
-            .unwrap()
-            .is_empty()
+
+        let entries = finish_draft(Entry::Draft {
+            blocks: vec![DraftBlock::Thinking {
+                text: "hmm".into(),
+                signature: Some("s".into()),
+                encrypted_content: None,
+            }],
+        })
+        .unwrap();
+        assert_eq!(
+            entries[0].as_response_blocks().expect("expected Response"),
+            [ResponseBlock::Thinking(Thinking::Signed {
+                thinking: "hmm".into(),
+                signature: "s".into(),
+            })]
         );
+    }
+
+    #[test]
+    fn encrypted_thinking_prefers_opaque_payload() {
+        let entries = finish_draft(Entry::Draft {
+            blocks: vec![DraftBlock::Thinking {
+                text: "plaintext preview".into(),
+                signature: None,
+                encrypted_content: Some("opaque".into()),
+            }],
+        })
+        .unwrap();
+
+        assert!(matches!(
+            entries[0].response_thinking_blocks().as_slice(),
+            [Thinking::Encrypted { thinking }] if thinking == "opaque"
+        ));
     }
 
     #[test]
@@ -425,7 +528,8 @@ mod tests {
             blocks,
             vec![DraftBlock::Thinking {
                 text: "ab".into(),
-                signature: None
+                signature: None,
+                encrypted_content: None,
             }]
         );
     }

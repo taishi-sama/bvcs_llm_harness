@@ -4,24 +4,28 @@
 //!
 //! Mapping overview (inverse of [`super`]'s serialization):
 //! - assistant message with `tool_calls[]` -> `Entry::ResponseToolCall`
-//! - assistant message with `content`      -> `Entry::ResponseNormal`
+//! - assistant message with `content`      -> `Entry::Response` (thinking first,
+//!   then text; Chat Completions cannot represent finer interleaving)
 //! - `n` > 1 produces multiple choices; only `index` 0 is honored
 //!
 //! Tool results arrive as later `role:"tool"` messages produced client-side, so
 //! this parser yields assistant-side entries only. `reasoning_content` is
 //! attached as [`Thinking::Normal`] to the produced assistant entry.
 
-use llm_history_model::history::{Entry, Thinking, ToolCall};
+use llm_history_model::history::{Entry, ResponseBlock, Thinking, ToolCall};
 use serde::Deserialize;
 
 /// Top-level `POST /chat/completions` response body.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CompletionResponse {
-    pub id: String,
+    /// Optional for compatibility with lightweight compatible servers.
+    #[serde(default)]
+    pub id: Option<String>,
     #[serde(default)]
     pub choices: Vec<Choice>,
     pub created: Option<i64>,
-    pub model: String,
+    #[serde(default)]
+    pub model: Option<String>,
     #[serde(default)]
     pub object: Option<String>,
     #[serde(default)]
@@ -45,7 +49,7 @@ pub struct Choice {
 #[derive(Debug, Clone, Deserialize)]
 pub struct AssistantMessage {
     #[serde(default)]
-    pub content: Option<String>,
+    pub content: Option<MessageContent>,
     #[serde(default)]
     pub refusal: Option<String>,
     /// Reasoning text produced by the model (`reasoning_content`).
@@ -55,6 +59,44 @@ pub struct AssistantMessage {
     pub role: Option<String>,
     #[serde(default)]
     pub tool_calls: Vec<MessageToolCall>,
+}
+
+/// Chat Completions normally returns a string, but some compatible servers
+/// return typed content parts. Accept both.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum MessageContent {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type")]
+pub enum ContentPart {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "refusal")]
+    Refusal { refusal: String },
+    #[serde(other)]
+    Other,
+}
+
+impl MessageContent {
+    /// Flattens the content into plain text (`text` and `refusal` parts).
+    pub fn text(&self) -> String {
+        match self {
+            Self::Text(text) => text.clone(),
+            Self::Parts(parts) => parts
+                .iter()
+                .filter_map(|part| match part {
+                    ContentPart::Text { text } => Some(text.as_str()),
+                    ContentPart::Refusal { refusal } => Some(refusal.as_str()),
+                    ContentPart::Other => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -85,13 +127,19 @@ impl CompletionResponse {
     /// Converts the response's first choice back into history entries.
     ///
     /// - `tool_calls[]` merge into a single [`Entry::ResponseToolCall`]
-    /// - otherwise the message text becomes an [`Entry::ResponseNormal`]
+    /// - otherwise the message becomes an [`Entry::Response`]
     ///   (`content` and `refusal` are concatenated; empty text is skipped)
     ///
     /// The result contains assistant-side entries only — append them to an
     /// existing user-first history before validation or re-serialization.
     pub fn to_entries(&self) -> Vec<Entry> {
-        let Some(choice) = self.choices.first() else {
+        // Honor choice index 0 even when the server orders choices differently.
+        let Some(choice) = self
+            .choices
+            .iter()
+            .find(|choice| choice.index.unwrap_or(0) == 0)
+            .or_else(|| self.choices.first())
+        else {
             return Vec::new();
         };
         let msg = &choice.message;
@@ -107,11 +155,11 @@ impl CompletionResponse {
             .collect();
 
         // Assistant text is valid alongside `tool_calls` in this API.
-        let content: Option<String> = msg
+        let content = msg
             .content
-            .as_deref()
-            .filter(|t| !t.is_empty())
-            .map(str::to_owned);
+            .as_ref()
+            .map(MessageContent::text)
+            .filter(|text| !text.is_empty());
 
         if !msg.tool_calls.is_empty() {
             let tool_call = msg
@@ -134,25 +182,27 @@ impl CompletionResponse {
             }];
         }
 
-        let mut text_parts: Vec<&str> = Vec::new();
-        if let Some(content) = msg.content.as_deref()
-            && !content.is_empty()
-        {
-            text_parts.push(content);
-        }
+        let mut text = content.unwrap_or_default();
         if let Some(refusal) = msg.refusal.as_deref()
             && !refusal.is_empty()
         {
-            text_parts.push(refusal);
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(refusal);
         }
-        if text_parts.is_empty() {
-            return Vec::new();
+        // Chat Completions exposes reasoning as a message-level field, so the
+        // best ordering we can reconstruct is thinking followed by text.
+        let mut blocks: Vec<ResponseBlock> =
+            thinking.into_iter().map(ResponseBlock::Thinking).collect();
+        if !text.is_empty() {
+            blocks.push(ResponseBlock::Text(text));
         }
-
-        vec![Entry::ResponseNormal {
-            thinking,
-            content: text_parts.join("\n"),
-        }]
+        if blocks.is_empty() {
+            Vec::new()
+        } else {
+            vec![Entry::Response { blocks }]
+        }
     }
 }
 
@@ -162,7 +212,7 @@ mod tests {
     use crate::model_config::{ModelConfig, ModelKind};
     use crate::validation::validate_entries;
     use llm_history_model::history::Entry as E;
-    use llm_history_model::history::ToolCallResult;
+    use llm_history_model::history::{ResponseBlock, ToolCallResult};
 
     fn config() -> ModelConfig {
         ModelConfig {
@@ -204,12 +254,9 @@ mod tests {
 
         let entries = resp.to_entries();
         assert_eq!(entries.len(), 1);
-        let E::ResponseNormal { content, thinking } = &entries[0] else {
-            panic!("expected ResponseNormal");
-        };
-        assert_eq!(content, "Hello!");
+        assert_eq!(entries[0].response_joined_text().as_deref(), Some("Hello!"));
         assert!(matches!(
-            thinking.as_slice(),
+            entries[0].response_thinking_blocks().as_slice(),
             [Thinking::Normal { thinking }] if thinking == "thinking here"
         ));
         validated_history(entries);
@@ -251,6 +298,71 @@ mod tests {
     }
 
     #[test]
+    fn parses_reasoning_only_message() {
+        let resp = CompletionResponse::from_value(serde_json::json!({
+            "id": "x", "model": "m",
+            "choices": [{"index": 0, "finish_reason": "length",
+                "message": {"role": "assistant", "content": "",
+                            "reasoning_content": "still thinking"}}]
+        }))
+        .expect("parses");
+
+        let entries = resp.to_entries();
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(
+            entries[0].response_thinking_blocks().as_slice(),
+            [Thinking::Normal { thinking }] if thinking == "still thinking"
+        ));
+        assert!(entries[0].response_text_blocks().is_empty());
+    }
+
+    #[test]
+    fn parses_content_parts() {
+        let resp = CompletionResponse::from_value(serde_json::json!({
+            "id": "x", "model": "m",
+            "choices": [{"index": 0, "finish_reason": "stop",
+                "message": {"role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "Hello"},
+                        {"type": "text", "text": "world"}
+                    ]}}]
+        }))
+        .expect("parses");
+
+        let entries = resp.to_entries();
+        assert_eq!(
+            entries[0].response_joined_text().as_deref(),
+            Some("Hello\nworld")
+        );
+    }
+
+    #[test]
+    fn picks_choice_zero_regardless_of_array_order() {
+        let resp = CompletionResponse::from_value(serde_json::json!({
+            "choices": [
+                {"index": 1, "message": {"role": "assistant", "content": "wrong"}},
+                {"index": 0, "message": {"role": "assistant", "content": "right"}}
+            ]
+        }))
+        .expect("parses");
+
+        let entries = resp.to_entries();
+        assert_eq!(entries[0].response_joined_text().as_deref(), Some("right"));
+    }
+
+    #[test]
+    fn missing_metadata_is_tolerated() {
+        let resp = CompletionResponse::from_value(serde_json::json!({
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hi"}}]
+        }))
+        .expect("parses without id/model/created");
+
+        assert!(resp.id.is_none());
+        assert!(resp.model.is_none());
+        assert_eq!(resp.to_entries().len(), 1);
+    }
+
+    #[test]
     fn empty_response_yields_no_entries() {
         let resp = CompletionResponse::from_value(serde_json::json!({
             "id": "x", "model": "m", "choices": []
@@ -269,10 +381,10 @@ mod tests {
         .expect("parses");
         let entries = resp.to_entries();
         assert_eq!(entries.len(), 1);
-        let E::ResponseNormal { content, .. } = &entries[0] else {
-            panic!();
-        };
-        assert_eq!(content, "partial\nblocked");
+        assert_eq!(
+            entries[0].response_joined_text().as_deref(),
+            Some("partial\nblocked")
+        );
     }
 
     /// Serialize a history into the request, feed the assistant message back
@@ -304,12 +416,12 @@ mod tests {
     fn round_trip_text_with_reasoning() {
         assert_round_trip(&[
             text_user("q"),
-            E::ResponseNormal {
-                thinking: vec![Thinking::Normal {
+            E::response(vec![
+                ResponseBlock::Thinking(Thinking::Normal {
                     thinking: "hmm".into(),
-                }],
-                content: "answer".into(),
-            },
+                }),
+                ResponseBlock::Text("answer".into()),
+            ]),
         ]);
     }
 

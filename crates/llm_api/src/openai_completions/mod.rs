@@ -6,20 +6,27 @@
 //! - `SystemPrompt`      -> `{role:"system", content}` message
 //! - `UserMessage`       -> `{role:"user"}` (string content, or content parts
 //!   when an image is attached)
-//! - `ResponseNormal`    -> `{role:"assistant", content}` message
+//! - `Response`          -> `{role:"assistant", reasoning_content?, content}`
+//!   message (ordered blocks are flattened because the API has no thinking
+//!   blocks; text-only and thinking-only responses use `content:""` and
+//!   `reasoning_content` respectively)
 //! - `ResponseToolCall`  -> ONE `{role:"assistant", tool_calls:[...]}` message
 //!   (parallel calls grouped via `tool_calls`)
 //! - `ToolCallResult`    -> one `{role:"tool", tool_call_id, content}` per result
 //!
 //! Notes:
-//! - `Thinking` is preserved as `reasoning_content` on assistant messages
-//!   (both plain and tool-call ones); only the plaintext is kept.
+//! - Plaintext `Thinking` is preserved as `reasoning_content` on assistant
+//!   messages (both plain and tool-call ones). `Reasoning` content is a
+//!   compatible-server extension, not part of the OpenAI schema.
+//! - OpenAI `Thinking::Encrypted` has no Chat Completions field. It is skipped
+//!   when plaintext reasoning is also available and rejected by
+//!   [`to_completions_input`] when it is the only content of a turn.
 //! - `is_error` has no native flag; errors are prefixed `"ERROR: "`.
 
 use crate::model_config::ModelConfig;
 use crate::validation::validate_entries;
 use crate::wire_common::{mime_str, thinking_joined};
-use llm_history_model::history::{Entry, MessageContent};
+use llm_history_model::history::{Entry, MessageContent, ResponseBlock, Thinking};
 use serde::Serialize;
 
 pub mod response;
@@ -180,13 +187,55 @@ pub fn to_completions_input(
                 tool_call_id: None,
             }),
 
-            Entry::ResponseNormal { thinking, content } => messages.push(Message {
-                role: Role::Assistant,
-                content: Some(Content::Text(content.clone())),
-                reasoning_content: thinking_joined(thinking),
-                tool_calls: Vec::new(),
-                tool_call_id: None,
-            }),
+            Entry::Response { blocks } => {
+                // Chat Completions has no block-level reasoning/content
+                // interleaving. Flatten the ordered blocks into
+                // `reasoning_content` + `content`, which is the best this API
+                // can represent.
+                let thinking: Vec<Thinking> = blocks
+                    .iter()
+                    .filter_map(ResponseBlock::thinking)
+                    .cloned()
+                    .collect();
+                let text = blocks
+                    .iter()
+                    .filter_map(ResponseBlock::text)
+                    .filter(|text| !text.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let reasoning = thinking_joined(&thinking);
+
+                if text.is_empty() {
+                    // An opaque-only turn (for example OpenAI
+                    // `encrypted_content`) has no Chat Completions field.
+                    let Some(reasoning) = reasoning else {
+                        return Err(vec![
+                            crate::validation::ValidationError::IncompatibleThinking {
+                                index: i,
+                                provider: "openai_chat_completions",
+                                kind: "opaque",
+                            },
+                        ]);
+                    };
+                    messages.push(Message {
+                        role: Role::Assistant,
+                        // Chat Completions requires `content` unless tool calls
+                        // are present; an empty string keeps it schema-valid.
+                        content: Some(Content::Text(String::new())),
+                        reasoning_content: Some(reasoning),
+                        tool_calls: Vec::new(),
+                        tool_call_id: None,
+                    });
+                } else {
+                    messages.push(Message {
+                        role: Role::Assistant,
+                        content: Some(Content::Text(text)),
+                        reasoning_content: reasoning,
+                        tool_calls: Vec::new(),
+                        tool_call_id: None,
+                    });
+                }
+            }
 
             Entry::ResponseToolCall {
                 thinking,
@@ -248,7 +297,9 @@ mod tests {
     use super::*;
     use crate::model_config::ModelKind;
     use llm_history_model::history::ImageMIME;
-    use llm_history_model::history::{Image, ToolCall as HistoryToolCall, ToolCallResult};
+    use llm_history_model::history::{
+        Image, ResponseBlock, ToolCall as HistoryToolCall, ToolCallResult,
+    };
 
     fn config() -> ModelConfig {
         ModelConfig {
@@ -283,10 +334,7 @@ mod tests {
                 content: "Be terse.".into(),
             },
             text_user("hi"),
-            Entry::ResponseNormal {
-                thinking: Vec::new(),
-                content: "Hello!".into(),
-            },
+            Entry::response_text("Hello!"),
         ]);
 
         assert_eq!(
@@ -413,13 +461,13 @@ mod tests {
     fn thinking_is_preserved_as_reasoning_content() {
         let v = serialize(&[
             text_user("q"),
-            Entry::ResponseNormal {
-                thinking: vec![llm_history_model::history::Thinking::Signed {
+            Entry::response(vec![
+                ResponseBlock::Thinking(llm_history_model::history::Thinking::Signed {
                     thinking: "secret".into(),
                     signature: "sig".into(),
-                }],
-                content: "answer".into(),
-            },
+                }),
+                ResponseBlock::Text("answer".into()),
+            ]),
         ]);
         assert_eq!(v["messages"][1]["content"], "answer");
         assert_eq!(v["messages"][1]["reasoning_content"], "secret");
@@ -451,11 +499,49 @@ mod tests {
     }
 
     #[test]
+    fn thinking_only_entry_uses_reasoning_content() {
+        let v = serialize(&[
+            text_user("q"),
+            Entry::response_thinking(vec![llm_history_model::history::Thinking::Normal {
+                thinking: "still thinking".into(),
+            }]),
+        ]);
+
+        assert_eq!(v["messages"][1]["role"], "assistant");
+        assert_eq!(v["messages"][1]["reasoning_content"], "still thinking");
+        assert_eq!(v["messages"][1]["content"], "");
+    }
+
+    #[test]
+    fn encrypted_only_thinking_is_rejected_for_chat_completions() {
+        let err = to_completions_input(
+            &[
+                text_user("q"),
+                Entry::response_thinking(vec![llm_history_model::history::Thinking::Encrypted {
+                    thinking: "opaque".into(),
+                }]),
+            ],
+            &config(),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.contains(&crate::validation::ValidationError::IncompatibleThinking {
+                index: 1,
+                provider: "openai_chat_completions",
+                kind: "opaque",
+            })
+        );
+    }
+
+    #[test]
     fn non_openai_kind_is_rejected() {
         let cfg = ModelConfig {
             kind: ModelKind::AnthropicCompatible {
                 model_name: "claude".into(),
                 streaming: false,
+                thinking: None,
+                allow_unsigned_thinking: false,
             },
             tools: Default::default(),
             max_tokens: None,

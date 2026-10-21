@@ -60,25 +60,40 @@ pub const fn anthropic_media_type_str(mime: &ImageMIME) -> &'static str {
     }
 }
 
-/// Plaintext of a thinking block. Every provider adapter that cannot represent
-/// signatures or redaction natively falls back to this.
-pub fn thinking_text(t: &Thinking) -> &str {
+/// Plaintext of a thinking block, when it has one.
+///
+/// `Thinking::Encrypted` and `Thinking::Redacted` are opaque provider payloads;
+/// they must be replayed through their native wire form (`encrypted_content`
+/// or `redacted_thinking`) rather than converted to visible text.
+pub fn thinking_text(t: &Thinking) -> Option<&str> {
     match t {
-        Thinking::Normal { thinking } => thinking,
-        Thinking::Signed { thinking, .. } => thinking,
-        Thinking::Redacted { thinking } => thinking,
+        Thinking::Normal { thinking } | Thinking::Signed { thinking, .. } => Some(thinking),
+        Thinking::Encrypted { .. } | Thinking::Redacted { .. } => None,
     }
 }
 
-/// Joins multiple thinking blocks into a single plaintext string, dropping
-/// empty results to `None`.
-pub fn thinking_joined(thinking: &[Thinking]) -> Option<String> {
-    if thinking.is_empty() {
-        return None;
+/// Whether a thinking block carries no payload at all.
+pub fn thinking_is_empty(t: &Thinking) -> bool {
+    match t {
+        Thinking::Normal { thinking }
+        | Thinking::Encrypted { thinking }
+        | Thinking::Redacted { thinking } => thinking.is_empty(),
+        // `display: "omitted"` can return a signature without visible text;
+        // such a block is still replayable and must not be treated as empty.
+        Thinking::Signed {
+            thinking,
+            signature,
+        } => thinking.is_empty() && signature.is_empty(),
     }
+}
+
+/// Joins the plaintext thinking blocks into a single string, dropping opaque
+/// payloads and empty results to `None`.
+pub fn thinking_joined(thinking: &[Thinking]) -> Option<String> {
     let joined = thinking
         .iter()
-        .map(thinking_text)
+        .filter_map(thinking_text)
+        .filter(|text| !text.is_empty())
         .collect::<Vec<_>>()
         .join("\n\n");
     if joined.is_empty() {
@@ -128,7 +143,7 @@ mod tests {
     }
 
     #[test]
-    fn thinking_joined_concatenates_all_variants() {
+    fn thinking_joined_only_includes_plaintext_variants() {
         let thinking = vec![
             Thinking::Normal {
                 thinking: "a".into(),
@@ -137,11 +152,33 @@ mod tests {
                 thinking: "b".into(),
                 signature: "sig".into(),
             },
+            Thinking::Encrypted {
+                thinking: "opaque-openai".into(),
+            },
             Thinking::Redacted {
-                thinking: "c".into(),
+                thinking: "opaque-anthropic".into(),
             },
         ];
-        assert_eq!(thinking_joined(&thinking).as_deref(), Some("a\n\nb\n\nc"));
+        assert_eq!(thinking_joined(&thinking).as_deref(), Some("a\n\nb"));
         assert_eq!(thinking_joined(&[]), None);
+        assert_eq!(
+            thinking_joined(&[Thinking::Encrypted {
+                thinking: "opaque".into()
+            }]),
+            None
+        );
+    }
+
+    #[test]
+    fn thinking_is_empty_checks_the_payload() {
+        assert!(thinking_is_empty(&Thinking::Normal {
+            thinking: String::new()
+        }));
+        assert!(!thinking_is_empty(&Thinking::Encrypted {
+            thinking: "opaque".into()
+        }));
+        assert!(!thinking_is_empty(&Thinking::Redacted {
+            thinking: "opaque".into()
+        }));
     }
 }

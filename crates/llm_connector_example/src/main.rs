@@ -58,6 +58,9 @@ impl Provider {
             Provider::Anthropic => ModelKind::AnthropicCompatible {
                 model_name: model_name.into(),
                 streaming: true,
+                thinking: None,
+                // llama.cpp returns thinking blocks with `signature: ""`.
+                allow_unsigned_thinking: true,
             },
             Provider::Completions | Provider::Responses => ModelKind::OpenAICompatible {
                 model_name: model_name.into(),

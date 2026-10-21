@@ -59,6 +59,16 @@ impl StreamDecoder {
         for sse in self.sse.finish() {
             self.handle_data(&sse.data, blocks, &mut out)?;
         }
+        // Some compatible servers close the body without sending `[DONE]`.
+        // The end of the HTTP stream is still the end of the completion.
+        if !self.completed {
+            self.completed = true;
+            if self.stop_reason.is_some() || !blocks.is_empty() {
+                out.push(StreamEvent::Completed {
+                    stop_reason: self.stop_reason.clone(),
+                });
+            }
+        }
         Ok(out)
     }
 
@@ -235,12 +245,9 @@ mod tests {
         assert!(decoder.is_completed());
 
         let entries = finish_draft(Entry::Draft { blocks }).unwrap();
-        let Entry::ResponseNormal { thinking, content } = &entries[0] else {
-            panic!("expected ResponseNormal");
-        };
-        assert_eq!(content, "Hello");
+        assert_eq!(entries[0].response_joined_text().as_deref(), Some("Hello"));
         assert!(matches!(
-            thinking.as_slice(),
+            entries[0].response_thinking_blocks().as_slice(),
             [Thinking::Normal { thinking }] if thinking == "hmm"
         ));
     }
@@ -293,6 +300,29 @@ mod tests {
         let mut decoder = StreamDecoder::new();
         let blocks = feed(&mut decoder, raw);
         assert_eq!(blocks, vec![DraftBlock::Text { text: "yes".into() }]);
+    }
+
+    #[test]
+    fn finishes_when_server_closes_without_done_marker() {
+        let raw = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        );
+
+        let mut decoder = StreamDecoder::new();
+        let mut blocks = Vec::new();
+        let mut events = decoder
+            .push_bytes(raw.as_bytes(), &mut blocks)
+            .expect("decodes");
+        events.extend(decoder.finish(&mut blocks).expect("flushes"));
+
+        assert!(decoder.is_completed());
+        assert!(matches!(
+            events.last(),
+            Some(StreamEvent::Completed {
+                stop_reason: Some(reason)
+            }) if reason == "stop"
+        ));
     }
 
     #[test]

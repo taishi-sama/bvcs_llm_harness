@@ -23,13 +23,21 @@ use crate::stream::{StreamError, StreamEvent};
 use llm_history_model::history::DraftBlock;
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::HashMap;
 
 /// Incremental Anthropic Messages stream decoder.
 #[derive(Debug, Default)]
 pub struct StreamDecoder {
     sse: SseDecoder,
-    /// Position in `blocks` of the currently open content block.
+    /// Content-block `index` -> position in `blocks`.
+    positions: HashMap<u32, usize>,
+    /// Position in `blocks` of the currently open content block, used as a
+    /// fallback when a compatible provider omits/rewrites indices.
     current: Option<usize>,
+    /// Whether the current tool block was seeded with complete `input` in
+    /// `content_block_start`; the first `input_json_delta` replaces it instead
+    /// of appending to it.
+    input_seeded: bool,
     stop_reason: Option<String>,
     completed: bool,
 }
@@ -101,12 +109,13 @@ impl StreamDecoder {
         out: &mut Vec<StreamEvent>,
     ) -> Result<(), StreamError> {
         match event {
-            Event::MessageStart | Event::Ping => {}
+            Event::MessageStart | Event::Ping | Event::Other => {}
 
             Event::ContentBlockStart {
                 index,
                 content_block,
             } => {
+                self.input_seeded = false;
                 let pos = match content_block {
                     StartBlock::Text { text } => {
                         blocks.push(DraftBlock::Text { text });
@@ -119,6 +128,7 @@ impl StreamDecoder {
                         blocks.push(DraftBlock::Thinking {
                             text: thinking,
                             signature: (!signature.is_empty()).then_some(signature),
+                            encrypted_content: None,
                         });
                         Some(blocks.len() - 1)
                     }
@@ -128,12 +138,15 @@ impl StreamDecoder {
                     }
                     StartBlock::ToolUse { id, name, input } => {
                         // `input` is normally `{}`; some compatible endpoints
-                        // send the complete arguments upfront.
+                        // send the complete arguments upfront. If they then
+                        // also stream `input_json_delta` fragments, the first
+                        // fragment replaces the seeded value (see below).
                         let arguments = match &input {
                             Value::Object(map) if map.is_empty() => String::new(),
                             Value::Null => String::new(),
                             other => other.to_string(),
                         };
+                        self.input_seeded = !arguments.is_empty();
                         blocks.push(DraftBlock::ToolCall {
                             index,
                             tool_use_id: Some(id),
@@ -144,11 +157,16 @@ impl StreamDecoder {
                     }
                     StartBlock::Other => None,
                 };
+                if let Some(pos) = pos {
+                    self.positions.insert(index, pos);
+                }
                 self.current = pos;
             }
 
             Event::ContentBlockDelta { index, delta } => {
-                let Some(pos) = self.current else {
+                // Prefer the provider's block index; fall back to the last open
+                // block for compatible servers that omit it.
+                let Some(pos) = self.positions.get(&index).copied().or(self.current) else {
                     return Ok(());
                 };
                 let Some(block) = blocks.get_mut(pos) else {
@@ -180,6 +198,12 @@ impl StreamDecoder {
                             ..
                         },
                     ) => {
+                        if self.input_seeded {
+                            // The start block already carried the complete
+                            // JSON; do not concatenate a second copy.
+                            arguments.clear();
+                            self.input_seeded = false;
+                        }
                         arguments.push_str(&partial_json);
                         out.push(StreamEvent::ToolCallDelta {
                             index: *call_index,
@@ -191,11 +215,12 @@ impl StreamDecoder {
                     // Citations and unknown deltas do not affect history.
                     _ => {}
                 }
-                let _ = index;
             }
 
-            Event::ContentBlockStop { .. } => {
+            Event::ContentBlockStop { index } => {
+                self.positions.remove(&index);
                 self.current = None;
+                self.input_seeded = false;
             }
 
             Event::MessageDelta { delta } => {
@@ -248,6 +273,9 @@ enum Event {
     Error {
         error: ApiError,
     },
+    /// Forward compatibility: ignore event types we do not model.
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Debug, Deserialize)]
@@ -315,6 +343,8 @@ mod tests {
             kind: ModelKind::AnthropicCompatible {
                 model_name: "claude-test".into(),
                 streaming: true,
+                thinking: None,
+                allow_unsigned_thinking: false,
             },
             tools: Default::default(),
             max_tokens: Some(1024),
@@ -370,10 +400,7 @@ mod tests {
         );
 
         let entries = finish_draft(Entry::Draft { blocks }).unwrap();
-        let Entry::ResponseNormal { content, .. } = &entries[0] else {
-            panic!("expected ResponseNormal");
-        };
-        assert_eq!(content, "Hello!");
+        assert_eq!(entries[0].response_joined_text().as_deref(), Some("Hello!"));
     }
 
     #[test]
@@ -393,12 +420,9 @@ mod tests {
         let mut decoder = StreamDecoder::new();
         let blocks = feed(&mut decoder, raw);
         let entries = finish_draft(Entry::Draft { blocks }).unwrap();
-        let Entry::ResponseNormal { thinking, content } = &entries[0] else {
-            panic!("expected ResponseNormal");
-        };
-        assert_eq!(content, "answer");
+        assert_eq!(entries[0].response_joined_text().as_deref(), Some("answer"));
         assert!(matches!(
-            thinking.as_slice(),
+            entries[0].response_thinking_blocks().as_slice(),
             [Thinking::Signed { thinking, signature }]
                 if thinking == "Let me check" && signature == "sig=="
         ));
@@ -479,6 +503,65 @@ mod tests {
     }
 
     #[test]
+    fn deltas_are_routed_by_content_block_index() {
+        let raw = concat!(
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"zero\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"one\"}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+
+        let mut decoder = StreamDecoder::new();
+        let blocks = feed(&mut decoder, raw);
+        assert_eq!(
+            blocks,
+            vec![
+                DraftBlock::Text {
+                    text: "zero".into()
+                },
+                DraftBlock::Text { text: "one".into() },
+            ]
+        );
+    }
+
+    #[test]
+    fn input_seeded_at_block_start_is_not_doubled_by_deltas() {
+        let raw = concat!(
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"a\",\"input\":{\"x\":1}}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"x\\\":1}\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+
+        let mut decoder = StreamDecoder::new();
+        let blocks = feed(&mut decoder, raw);
+        assert_eq!(
+            blocks,
+            vec![DraftBlock::ToolCall {
+                index: 0,
+                tool_use_id: Some("toolu_1".into()),
+                tool_name: Some("a".into()),
+                arguments: r#"{"x":1}"#.into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn unknown_events_are_ignored() {
+        let raw = concat!(
+            "data: {\"type\":\"future_event\",\"foo\":1}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+
+        let mut decoder = StreamDecoder::new();
+        let blocks = feed(&mut decoder, raw);
+        assert_eq!(blocks, vec![DraftBlock::Text { text: "ok".into() }]);
+    }
+
+    #[test]
     fn redacted_thinking_is_preserved() {
         let raw = concat!(
             "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"opaque\"}}\n\n",
@@ -491,11 +574,8 @@ mod tests {
         let mut decoder = StreamDecoder::new();
         let blocks = feed(&mut decoder, raw);
         let entries = finish_draft(Entry::Draft { blocks }).unwrap();
-        let Entry::ResponseNormal { thinking, .. } = &entries[0] else {
-            panic!("expected ResponseNormal");
-        };
         assert!(matches!(
-            thinking.as_slice(),
+            entries[0].response_thinking_blocks().as_slice(),
             [Thinking::Redacted { thinking }] if thinking == "opaque"
         ));
     }

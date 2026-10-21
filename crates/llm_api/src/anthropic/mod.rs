@@ -6,7 +6,8 @@
 //!   role in the Messages API)
 //! - `UserMessage`       -> `{role:"user"}` (string shorthand for text-only,
 //!   content blocks when an image is attached)
-//! - `ResponseNormal`    -> `{role:"assistant"}` with `[thinking*, text]`
+//! - `Response`          -> `{role:"assistant"}` with the ordered
+//!   thinking/text blocks, preserving interleaving
 //! - `ResponseToolCall`  -> `{role:"assistant"}` with `[thinking*, text?,
 //!   tool_use*]`
 //! - `ToolCallResult`    -> `{role:"user"}` with `[tool_result*]`; consecutive
@@ -17,14 +18,18 @@
 //!   `signature`) and always come first in assistant content, as the API
 //!   requires. `Thinking::Redacted` goes as `redacted_thinking` with the
 //!   opaque payload in its `thinking` field. Unsigned `Thinking::Normal` is
-//!   rejected by validation for the Anthropic kind.
-//! - `max_tokens` is required by the API but lives outside `ModelConfig`, so
-//!   it is a parameter of [`to_anthropic_messages`].
+//!   rejected unless `allow_unsigned_thinking` is enabled (for llama.cpp-style
+//!   compatible servers); OpenAI `Thinking::Encrypted` is always rejected.
+//! - Extended thinking is enabled through
+//!   [`crate::model_config::AnthropicThinking`], which is serialized as the
+//!   top-level `thinking` parameter.
+//! - `max_tokens` comes from `ModelConfig::max_tokens`, falling back to
+//!   [`DEFAULT_MAX_TOKENS`].
 
 use crate::model_config::ModelConfig;
 use crate::validation::{ValidationError, validate_entries};
 use crate::wire_common::anthropic_media_type_str;
-use llm_history_model::history::{Entry, Thinking};
+use llm_history_model::history::{Entry, ResponseBlock, Thinking};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -42,11 +47,24 @@ pub struct MessagesInput<'a> {
     /// System prompt, hoisted out of the message list (top-level parameter).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system: Option<&'a str>,
+    /// Extended thinking configuration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ThinkingParam>,
     /// Tool definitions forwarded from `ModelConfig.tools`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<AnthropicTool>,
     pub messages: Vec<Message>,
     pub stream: bool,
+}
+
+/// Wire form of Anthropic's `thinking` request parameter.
+#[derive(Debug, Serialize)]
+pub struct ThinkingParam {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub budget_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -113,21 +131,40 @@ pub struct ImageSource {
 /// Unsigned `Normal` thinking cannot be resent to the API; validation rejects
 /// it for the Anthropic kind, so reaching this branch with `Normal` only
 /// happens if validation was bypassed (it is then skipped).
-fn push_thinking(blocks: &mut Vec<Block>, thinking: &[Thinking]) {
-    for t in thinking {
-        match t {
-            Thinking::Signed {
-                thinking,
-                signature,
-            } => blocks.push(Block::Thinking {
-                thinking: thinking.clone(),
-                signature: signature.clone(),
-            }),
-            Thinking::Redacted { thinking } => blocks.push(Block::RedactedThinking {
+fn push_thinking_block(blocks: &mut Vec<Block>, t: &Thinking, allow_unsigned: bool) {
+    match t {
+        // An empty text is valid when `display: "omitted"` returns only a
+        // signature; the signature is what makes the block replayable.
+        Thinking::Signed {
+            thinking,
+            signature,
+        } if !thinking.is_empty() || !signature.is_empty() => blocks.push(Block::Thinking {
+            thinking: thinking.clone(),
+            signature: signature.clone(),
+        }),
+        Thinking::Redacted { thinking } if !thinking.is_empty() => {
+            blocks.push(Block::RedactedThinking {
                 data: thinking.clone(),
-            }),
-            Thinking::Normal { .. } => {}
+            })
         }
+        // Compatible servers (llama.cpp) stream thinking with an empty
+        // signature. Only emit it when the config explicitly allows it.
+        Thinking::Normal { thinking } if allow_unsigned && !thinking.is_empty() => {
+            blocks.push(Block::Thinking {
+                thinking: thinking.clone(),
+                signature: String::new(),
+            })
+        }
+        // OpenAI encrypted reasoning cannot be represented by the Messages
+        // API. Validation rejects it for this provider; skip defensively.
+        // Empty blocks are skipped as well.
+        _ => {}
+    }
+}
+
+fn push_thinking(blocks: &mut Vec<Block>, thinking: &[Thinking], allow_unsigned: bool) {
+    for t in thinking {
+        push_thinking_block(blocks, t, allow_unsigned);
     }
 }
 
@@ -149,7 +186,12 @@ pub fn to_anthropic_messages<'a>(
 ) -> Result<MessagesInput<'a>, Vec<ValidationError>> {
     validate_entries(entries, config)?;
 
-    let crate::model_config::ModelKind::AnthropicCompatible { model_name, .. } = &config.kind
+    let crate::model_config::ModelKind::AnthropicCompatible {
+        model_name,
+        thinking,
+        allow_unsigned_thinking,
+        ..
+    } = &config.kind
     else {
         return Err(vec![ValidationError::WrongProviderKind {
             expected: "anthropic_compatible",
@@ -161,6 +203,15 @@ pub fn to_anthropic_messages<'a>(
         .max_tokens
         .map(|v| u32::try_from(v).unwrap_or(u32::MAX))
         .unwrap_or(DEFAULT_MAX_TOKENS);
+
+    if let Some(thinking) = thinking
+        && (thinking.budget_tokens < 1024 || thinking.budget_tokens >= max_tokens)
+    {
+        return Err(vec![ValidationError::InvalidThinkingBudget {
+            budget_tokens: thinking.budget_tokens,
+            max_tokens,
+        }]);
+    }
 
     let mut system: Option<&str> = None;
     let mut messages: Vec<Message> = Vec::new();
@@ -204,15 +255,29 @@ pub fn to_anthropic_messages<'a>(
                 messages.push(message);
             }
 
-            Entry::ResponseNormal { thinking, content } => {
-                let mut blocks = Vec::new();
-                push_thinking(&mut blocks, thinking);
-                blocks.push(Block::Text {
-                    text: content.clone(),
-                });
+            Entry::Response { blocks } => {
+                let mut wire_blocks = Vec::new();
+                for block in blocks {
+                    match block {
+                        ResponseBlock::Thinking(thinking) => {
+                            push_thinking_block(
+                                &mut wire_blocks,
+                                thinking,
+                                *allow_unsigned_thinking,
+                            );
+                        }
+                        ResponseBlock::Text(text) if !text.is_empty() => {
+                            wire_blocks.push(Block::Text { text: text.clone() });
+                        }
+                        ResponseBlock::Text(_) => {}
+                    }
+                }
+                if wire_blocks.is_empty() {
+                    return Err(vec![ValidationError::EmptyAssistantContent { index: i }]);
+                }
                 messages.push(Message {
                     role: Role::Assistant,
-                    content: Content::Blocks(blocks),
+                    content: Content::Blocks(wire_blocks),
                 });
             }
 
@@ -222,7 +287,7 @@ pub fn to_anthropic_messages<'a>(
                 tool_call,
             } => {
                 let mut blocks = Vec::new();
-                push_thinking(&mut blocks, thinking);
+                push_thinking(&mut blocks, thinking, *allow_unsigned_thinking);
                 if let Some(text) = content
                     && !text.is_empty()
                 {
@@ -282,6 +347,11 @@ pub fn to_anthropic_messages<'a>(
         model: model_name.to_string(),
         max_tokens,
         system,
+        thinking: thinking.as_ref().map(|t| ThinkingParam {
+            kind: "enabled",
+            budget_tokens: t.budget_tokens,
+            display: t.display.map(|display| display.as_str()),
+        }),
         tools: tools_to_anthropic(&config.tools),
         messages,
         stream: config.kind.get_streamable(),
@@ -291,10 +361,10 @@ pub fn to_anthropic_messages<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model_config::ModelKind;
+    use crate::model_config::{AnthropicThinking, AnthropicThinkingDisplay, ModelKind};
     use llm_history_model::history::ImageMIME;
     use llm_history_model::history::{
-        Image, MessageContent, ToolCall as HistoryToolCall, ToolCallResult,
+        Image, MessageContent, ResponseBlock, ToolCall as HistoryToolCall, ToolCallResult,
     };
 
     fn config() -> ModelConfig {
@@ -302,6 +372,8 @@ mod tests {
             kind: ModelKind::AnthropicCompatible {
                 model_name: "claude-test".into(),
                 streaming: false,
+                thinking: None,
+                allow_unsigned_thinking: false,
             },
             tools: Default::default(),
             max_tokens: Some(1024),
@@ -329,10 +401,7 @@ mod tests {
                 content: "Be terse.".into(),
             },
             text_user("hi"),
-            Entry::ResponseNormal {
-                thinking: Vec::new(),
-                content: "Hello!".into(),
-            },
+            Entry::response_text("Hello!"),
         ]);
 
         assert_eq!(
@@ -371,13 +440,13 @@ mod tests {
     fn signed_thinking_comes_first() {
         let v = serialize(&[
             text_user("q"),
-            Entry::ResponseNormal {
-                thinking: vec![Thinking::Signed {
+            Entry::response(vec![
+                ResponseBlock::Thinking(Thinking::Signed {
                     thinking: "hmm".into(),
                     signature: "sig==".into(),
-                }],
-                content: "answer".into(),
-            },
+                }),
+                ResponseBlock::Text("answer".into()),
+            ]),
         ]);
 
         assert_eq!(
@@ -586,6 +655,114 @@ mod tests {
     }
 
     #[test]
+    fn thinking_config_is_forwarded() {
+        let cfg = ModelConfig {
+            kind: ModelKind::AnthropicCompatible {
+                model_name: "claude-test".into(),
+                streaming: false,
+                thinking: Some(AnthropicThinking {
+                    budget_tokens: 2048,
+                    display: Some(AnthropicThinkingDisplay::Omitted),
+                }),
+                allow_unsigned_thinking: false,
+            },
+            tools: Default::default(),
+            max_tokens: Some(4096),
+        };
+        let v = serde_json::to_value(
+            to_anthropic_messages(&[text_user("hi")], &cfg).expect("valid history"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            v["thinking"],
+            serde_json::json!({
+                "type": "enabled",
+                "budget_tokens": 2048,
+                "display": "omitted"
+            })
+        );
+    }
+
+    #[test]
+    fn thinking_budget_must_fit_under_max_tokens() {
+        let cfg = |budget_tokens| ModelConfig {
+            kind: ModelKind::AnthropicCompatible {
+                model_name: "claude-test".into(),
+                streaming: false,
+                thinking: Some(AnthropicThinking {
+                    budget_tokens,
+                    display: None,
+                }),
+                allow_unsigned_thinking: false,
+            },
+            tools: Default::default(),
+            max_tokens: Some(4096),
+        };
+
+        assert!(to_anthropic_messages(&[text_user("hi")], &cfg(1023)).is_err());
+        assert!(to_anthropic_messages(&[text_user("hi")], &cfg(4096)).is_err());
+        assert!(to_anthropic_messages(&[text_user("hi")], &cfg(2048)).is_ok());
+    }
+
+    #[test]
+    fn unsigned_thinking_is_forwarded_when_allowed() {
+        let cfg = ModelConfig {
+            kind: ModelKind::AnthropicCompatible {
+                model_name: "llama.cpp".into(),
+                streaming: false,
+                thinking: None,
+                allow_unsigned_thinking: true,
+            },
+            tools: Default::default(),
+            max_tokens: Some(1024),
+        };
+        let v = serde_json::to_value(
+            to_anthropic_messages(
+                &[
+                    text_user("q"),
+                    Entry::response(vec![
+                        ResponseBlock::Thinking(Thinking::Normal {
+                            thinking: "hmm".into(),
+                        }),
+                        ResponseBlock::Text("answer".into()),
+                    ]),
+                ],
+                &cfg,
+            )
+            .expect("valid history"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            v["messages"][1]["content"],
+            serde_json::json!([
+                {"type": "thinking", "thinking": "hmm", "signature": ""},
+                {"type": "text", "text": "answer"}
+            ])
+        );
+    }
+
+    #[test]
+    fn thinking_only_entry_is_a_thinking_blocks_message() {
+        let v = serialize(&[
+            text_user("q"),
+            Entry::response_thinking(vec![Thinking::Signed {
+                thinking: "hmm".into(),
+                signature: "sig".into(),
+            }]),
+        ]);
+
+        assert_eq!(
+            v["messages"][1],
+            serde_json::json!({
+                "role": "assistant",
+                "content": [{"type": "thinking", "thinking": "hmm", "signature": "sig"}]
+            })
+        );
+    }
+
+    #[test]
     fn non_anthropic_kind_is_rejected() {
         let cfg = ModelConfig {
             kind: ModelKind::OpenAICompatible {
@@ -610,12 +787,12 @@ mod tests {
         let err = to_anthropic_messages(
             &[
                 text_user("q"),
-                Entry::ResponseNormal {
-                    thinking: vec![Thinking::Normal {
+                Entry::response(vec![
+                    ResponseBlock::Thinking(Thinking::Normal {
                         thinking: "hmm".into(),
-                    }],
-                    content: "answer".into(),
-                },
+                    }),
+                    ResponseBlock::Text("answer".into()),
+                ]),
             ],
             &config(),
         )

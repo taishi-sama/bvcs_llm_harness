@@ -3,7 +3,7 @@
 //!
 //! Mapping overview (inverse of [`super`]'s serialization):
 //! - `reasoning` item          -> `Thinking::Normal` attached to the next assistant entry
-//! - `message` item            -> `Entry::ResponseNormal` (`output_text`/`refusal` parts joined)
+//! - `message` item            -> `ResponseBlock::Text` in `Entry::Response`
 //! - `function_call` items     -> consecutive items merge into one `Entry::ResponseToolCall`
 //! - `function_call_output`s   -> consecutive items merge into one `Entry::ToolCallResult`
 //! - unknown item types        -> skipped (forward compatibility)
@@ -12,20 +12,23 @@
 //! stores plaintext thinking only. `function_call_output.is_error` has no wire
 //! representation, so results always deserialize as `is_error: false`.
 
-use llm_history_model::history::{Entry, Thinking, ToolCall, ToolCallResult};
+use llm_history_model::history::{Entry, ResponseBlock, Thinking, ToolCall, ToolCallResult};
 use serde::Deserialize;
 use serde_json::Value;
 
 /// Top-level `POST /responses` response body.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ResponsesResponse {
-    pub id: String,
+    /// Optional for compatibility with lightweight OpenAI-compatible servers.
+    #[serde(default)]
+    pub id: Option<String>,
     /// Always `"response"`; optional for lenient parsing.
     #[serde(default)]
     pub object: Option<String>,
     pub created_at: Option<i64>,
     pub completed_at: Option<i64>,
-    pub model: String,
+    #[serde(default)]
+    pub model: Option<String>,
     /// `"queued" | "in_progress" | "completed" | "incomplete" | "failed"`
     #[serde(default)]
     pub status: Option<String>,
@@ -144,6 +147,29 @@ impl Reasoning {
         }
         join_texts(self.summary.iter().map(|p| p.text.as_str()))
     }
+
+    /// History representation of this item.
+    ///
+    /// `encrypted_content` is preferred when present: it is the only form
+    /// OpenAI accepts for stateless replay. Plaintext is retained for
+    /// compatible endpoints that do not return encrypted payloads.
+    pub(crate) fn thinking(&self) -> Option<Thinking> {
+        if let Some(encrypted) = self
+            .encrypted_content
+            .as_deref()
+            .filter(|content| !content.is_empty())
+        {
+            return Some(Thinking::Encrypted {
+                thinking: encrypted.to_owned(),
+            });
+        }
+        let text = self.text();
+        if text.is_empty() {
+            None
+        } else {
+            Some(Thinking::Normal { thinking: text })
+        }
+    }
 }
 
 impl OutputMessage {
@@ -181,30 +207,48 @@ impl ResponsesResponse {
 
     /// Converts the response output back into history entries.
     ///
-    /// - each `reasoning` item becomes one [`Thinking::Normal`] block attached
-    ///   to the following assistant entry
+    /// - reasoning and message items become ordered [`ResponseBlock`]s inside
+    ///   one [`Entry::Response`]; `encrypted_content` becomes
+    ///   [`Thinking::Encrypted`], otherwise plaintext becomes
+    ///   [`Thinking::Normal`]
     /// - consecutive `function_call` items merge into one
     ///   [`Entry::ResponseToolCall`] (parallel calls live in one entry);
-    ///   an adjacent assistant message becomes its `content`
+    ///   adjacent reasoning/message blocks are flattened into its
+    ///   `thinking`/`content` fields
     /// - consecutive `function_call_output` items merge into one
     ///   [`Entry::ToolCallResult`]
     /// - empty messages and items without `call_id` are skipped
     ///
-    /// The result contains assistant-side entries only (`ResponseNormal`,
+    /// The result contains assistant-side entries only (`Response`,
     /// `ResponseToolCall`, `ToolCallResult`) — append them to an existing
     /// user-first history before validation or re-serialization.
     pub fn to_entries(&self) -> Vec<Entry> {
-        fn flush_tool_entry(
-            thinking: &mut Vec<Thinking>,
-            text: &mut Option<String>,
+        fn flush_assistant(
+            blocks: &mut Vec<ResponseBlock>,
             calls: &mut Vec<ToolCall>,
             entries: &mut Vec<Entry>,
         ) {
             if !calls.is_empty() {
+                let thinking = blocks
+                    .iter()
+                    .filter_map(ResponseBlock::thinking)
+                    .cloned()
+                    .collect();
+                let text = blocks
+                    .iter()
+                    .filter_map(ResponseBlock::text)
+                    .filter(|text| !text.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
                 entries.push(Entry::ResponseToolCall {
-                    thinking: std::mem::take(thinking),
-                    content: text.take().filter(|t| !t.is_empty()),
+                    thinking,
+                    content: (!text.is_empty()).then_some(text),
                     tool_call: std::mem::take(calls),
+                });
+                blocks.clear();
+            } else if !blocks.is_empty() {
+                entries.push(Entry::Response {
+                    blocks: std::mem::take(blocks),
                 });
             }
         }
@@ -217,34 +261,21 @@ impl ResponsesResponse {
             }
         }
 
-        fn merge_text(into: &mut Option<String>, text: &str) {
-            match into {
-                Some(prev) => {
-                    prev.push_str("\n\n");
-                    prev.push_str(text);
-                }
-                None => *into = Some(text.to_owned()),
-            }
-        }
-
         let mut entries = Vec::with_capacity(self.output.len());
-        let mut pending_thinking: Vec<Thinking> = Vec::new();
-        let mut pending_text: Option<String> = None;
+        let mut blocks: Vec<ResponseBlock> = Vec::new();
         let mut calls: Vec<ToolCall> = Vec::new();
         let mut results: Vec<ToolCallResult> = Vec::new();
 
-        let mut items = self.output.iter().peekable();
-        while let Some(item) = items.next() {
+        for item in &self.output {
             match item {
                 OutputItem::Other => {}
 
                 OutputItem::Reasoning(r) => {
-                    let text = r.text();
-                    if text.is_empty() {
+                    let Some(thinking) = r.thinking() else {
                         continue;
-                    }
+                    };
                     flush_results(&mut results, &mut entries);
-                    pending_thinking.push(Thinking::Normal { thinking: text });
+                    blocks.push(ResponseBlock::Thinking(thinking));
                 }
 
                 OutputItem::Message(m) => {
@@ -253,19 +284,7 @@ impl ResponsesResponse {
                         continue;
                     }
                     flush_results(&mut results, &mut entries);
-                    let next_is_call = matches!(items.peek(), Some(OutputItem::FunctionCall(_)));
-                    if !calls.is_empty() || next_is_call {
-                        // Text belongs to the in-progress tool-call entry.
-                        merge_text(&mut pending_text, &text);
-                    } else {
-                        // Defensive merge: pending_text should be None here.
-                        let mut full = pending_text.take();
-                        merge_text(&mut full, &text);
-                        entries.push(Entry::ResponseNormal {
-                            thinking: std::mem::take(&mut pending_thinking),
-                            content: full.unwrap_or_default(),
-                        });
-                    }
+                    blocks.push(ResponseBlock::Text(text));
                 }
 
                 OutputItem::FunctionCall(fc) => {
@@ -283,12 +302,7 @@ impl ResponsesResponse {
                 }
 
                 OutputItem::FunctionCallOutput(out) => {
-                    flush_tool_entry(
-                        &mut pending_thinking,
-                        &mut pending_text,
-                        &mut calls,
-                        &mut entries,
-                    );
+                    flush_assistant(&mut blocks, &mut calls, &mut entries);
                     let Some(tool_use_id) = &out.call_id else {
                         continue;
                     };
@@ -301,12 +315,7 @@ impl ResponsesResponse {
             }
         }
 
-        flush_tool_entry(
-            &mut pending_thinking,
-            &mut pending_text,
-            &mut calls,
-            &mut entries,
-        );
+        flush_assistant(&mut blocks, &mut calls, &mut entries);
         flush_results(&mut results, &mut entries);
         entries
     }
@@ -366,7 +375,7 @@ mod tests {
     #[test]
     fn parses_real_endpoint_payload() {
         let resp = ResponsesResponse::from_json(REAL_PAYLOAD).expect("parses");
-        assert_eq!(resp.model, "qwen3.6-35b-a3b");
+        assert_eq!(resp.model.as_deref(), Some("qwen3.6-35b-a3b"));
         assert_eq!(resp.status.as_deref(), Some("completed"));
         let usage = resp.usage.as_ref().expect("usage");
         assert_eq!(usage.input_tokens, Some(21));
@@ -377,11 +386,12 @@ mod tests {
 
         let entries = resp.to_entries();
         assert_eq!(entries.len(), 1);
-        let Entry::ResponseNormal { thinking, content } = &entries[0] else {
-            panic!("expected ResponseNormal");
-        };
-        assert_eq!(content, "Hello! How can I assist you today?");
-        let [Thinking::Normal { thinking }] = thinking.as_slice() else {
+        assert_eq!(
+            entries[0].response_joined_text().as_deref(),
+            Some("Hello! How can I assist you today?")
+        );
+        let [Thinking::Normal { thinking }] = entries[0].response_thinking_blocks().as_slice()
+        else {
             panic!("expected one attached thinking block");
         };
         assert!(thinking.contains("Analyze User Input"));
@@ -431,6 +441,100 @@ mod tests {
     }
 
     #[test]
+    fn missing_metadata_is_tolerated() {
+        let resp = ResponsesResponse::from_value(serde_json::json!({
+            "output": [{
+                "type": "message", "role": "assistant",
+                "content": [{"type": "output_text", "text": "Hi"}]
+            }]
+        }))
+        .expect("parses without id/model");
+
+        assert!(resp.id.is_none());
+        assert!(resp.model.is_none());
+        assert_eq!(resp.to_entries().len(), 1);
+    }
+
+    #[test]
+    fn preserves_interleaved_reasoning_and_messages() {
+        let resp = ResponsesResponse::from_value(serde_json::json!({
+            "id": "resp_i", "model": "m",
+            "output": [
+                {"type": "reasoning", "id": "rs_1", "summary": [],
+                 "content": [{"type": "reasoning_text", "text": "first"}]},
+                {"type": "message", "role": "assistant",
+                 "content": [{"type": "output_text", "text": "one"}]},
+                {"type": "reasoning", "id": "rs_2", "summary": [],
+                 "content": [{"type": "reasoning_text", "text": "second"}]},
+                {"type": "message", "role": "assistant",
+                 "content": [{"type": "output_text", "text": "two"}]}
+            ]
+        }))
+        .expect("parses");
+
+        let entries = resp.to_entries();
+        assert_eq!(
+            entries[0].as_response_blocks().expect("expected Response"),
+            [
+                ResponseBlock::Thinking(Thinking::Normal {
+                    thinking: "first".into()
+                }),
+                ResponseBlock::Text("one".into()),
+                ResponseBlock::Thinking(Thinking::Normal {
+                    thinking: "second".into()
+                }),
+                ResponseBlock::Text("two".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn prefers_encrypted_reasoning_and_keeps_synthesized_id_input_intact() {
+        let resp = ResponsesResponse::from_value(serde_json::json!({
+            "id": "resp_e", "model": "m",
+            "output": [
+                {
+                    "type": "reasoning", "id": "rs_1", "summary": [],
+                    "content": [{"type": "reasoning_text", "text": "plain"}],
+                    "encrypted_content": "opaque-openai-blob"
+                },
+                {"type": "message", "role": "assistant",
+                 "content": [{"type": "output_text", "text": "answer"}]}
+            ]
+        }))
+        .expect("parses");
+
+        let entries = resp.to_entries();
+        assert_eq!(entries[0].response_joined_text().as_deref(), Some("answer"));
+        assert!(matches!(
+            entries[0].response_thinking_blocks().as_slice(),
+            [Thinking::Encrypted { thinking }] if thinking == "opaque-openai-blob"
+        ));
+    }
+
+    #[test]
+    fn reasoning_without_message_becomes_thinking_only() {
+        let resp = ResponsesResponse::from_value(serde_json::json!({
+            "id": "resp_t", "model": "m",
+            "output": [
+                {
+                    "type": "reasoning", "id": "rs_1", "summary": [],
+                    "encrypted_content": "opaque"
+                }
+            ]
+        }))
+        .expect("parses");
+
+        let entries = resp.to_entries();
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(
+            entries[0].response_thinking_blocks().as_slice(),
+            [Thinking::Encrypted { thinking }] if thinking == "opaque"
+        ));
+        assert!(entries[0].response_text_blocks().is_empty());
+    }
+
+    #[test]
     fn skips_items_without_call_id_and_empty_messages() {
         let resp = ResponsesResponse::from_value(serde_json::json!({
             "id": "resp_y", "model": "m",
@@ -445,11 +549,11 @@ mod tests {
 
         let entries = resp.to_entries();
         assert_eq!(entries.len(), 1);
-        let Entry::ResponseNormal { content, thinking } = &entries[0] else {
-            panic!("expected ResponseNormal");
-        };
-        assert_eq!(content, "cannot comply");
-        assert!(thinking.is_empty());
+        assert_eq!(
+            entries[0].response_joined_text().as_deref(),
+            Some("cannot comply")
+        );
+        assert!(entries[0].response_thinking_blocks().is_empty());
     }
 
     /// Serialize a history into the request, feed the assistant-side output
@@ -489,15 +593,29 @@ mod tests {
     }
 
     #[test]
+    fn round_trip_interleaved_text_and_thinking() {
+        assert_round_trip(&[
+            text_user("q"),
+            Entry::response(vec![
+                ResponseBlock::Text("first part".into()),
+                ResponseBlock::Thinking(Thinking::Normal {
+                    thinking: "hmm".into(),
+                }),
+                ResponseBlock::Text("second part".into()),
+            ]),
+        ]);
+    }
+
+    #[test]
     fn round_trip_message_with_reasoning() {
         assert_round_trip(&[
             text_user("q"),
-            Entry::ResponseNormal {
-                thinking: vec![Thinking::Normal {
+            Entry::response(vec![
+                ResponseBlock::Thinking(Thinking::Normal {
                     thinking: "hmm".into(),
-                }],
-                content: "answer".into(),
-            },
+                }),
+                ResponseBlock::Text("answer".into()),
+            ]),
         ]);
     }
 
