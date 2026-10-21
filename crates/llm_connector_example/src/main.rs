@@ -9,11 +9,13 @@
 //! ```
 
 use std::{
+    cell::RefCell,
     collections::HashMap,
     fs,
     io::{self, Write},
 };
 
+use boa_engine::{Context, JsResult, JsValue, NativeFunction, Source};
 use http_body_util::BodyExt as _;
 use hyper::{Request, client::conn::http1};
 use hyper_util::rt::TokioIo;
@@ -110,6 +112,63 @@ impl Decoder {
     }
 }
 
+thread_local! {
+    /// Lines emitted by `print`/`console.log` during the current JS evaluation.
+    static JS_OUTPUT: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+fn js_print(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let line = args
+        .iter()
+        .map(|value| {
+            value
+                .to_string(context)
+                .map(|text| text.to_std_string_escaped())
+                .unwrap_or_else(|_| value.display().to_string())
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    JS_OUTPUT.with(|output| output.borrow_mut().push(line));
+    Ok(JsValue::undefined())
+}
+
+/// Runs `code` in an embedded Boa JavaScript engine and returns everything the
+/// snippet printed plus the value of its final expression.
+fn eval_javascript(code: &str) -> Result<String, String> {
+    JS_OUTPUT.with(|output| output.borrow_mut().clear());
+
+    let mut context = Context::default();
+    // Protect the host from runaway loops in model-generated code.
+    context.runtime_limits_mut().set_loop_iteration_limit(10_000_000);
+    context
+        .register_global_builtin_callable(
+            "print".into(),
+            1,
+            NativeFunction::from_fn_ptr(js_print),
+        )
+        .map_err(|err| format!("failed to initialize JavaScript runtime: {err}"))?;
+
+    // Boa has no console object; expose the common logging methods so snippets
+    // written for a browser or Node still run.
+    let source = format!(
+        "const console = {{ log: print, info: print, warn: print, error: print }};\n{code}"
+    );
+    let value = context
+        .eval(Source::from_bytes(&source))
+        .map_err(|err| format!("JavaScript error: {err}"))?;
+    let rendered = value
+        .to_string(&mut context)
+        .map(|text| text.to_std_string_escaped())
+        .unwrap_or_else(|_| value.display().to_string());
+    let printed = JS_OUTPUT.with(|output| output.borrow().join("\n"));
+
+    Ok(match (printed.is_empty(), rendered == "undefined") {
+        (true, _) => rendered,
+        (false, true) => printed,
+        (false, false) => format!("{printed}\n{rendered}"),
+    })
+}
+
 fn tools() -> Vec<Tool> {
     vec![
         Tool {
@@ -160,6 +219,25 @@ fn tools() -> Vec<Tool> {
                 hashmap
             },
         },
+        Tool {
+            name: "eval_javascript".into(),
+            description: Some(
+                "Execute JavaScript code in an embedded Boa interpreter. Returns the printed \
+                 output (print/console.log) followed by the value of the last expression."
+                    .into(),
+            ),
+            parameters: {
+                let mut hashmap = HashMap::new();
+                hashmap.insert(
+                    "code".to_string(),
+                    ParameterDescription {
+                        r#type: ParameterType::String,
+                        description: "JavaScript source code to execute".into(),
+                    },
+                );
+                hashmap
+            },
+        },
     ]
 }
 
@@ -200,13 +278,16 @@ async fn main() -> Result<(), anyhow::Error> {
         endpoint: provider.endpoint().into(),
     };
 
+    let user_prompt = std::env::var("PROMPT").unwrap_or_else(|_| {
+        "Hi! List all available tools and try guess what they do.".to_string()
+    });
     let mut history = vec![
         Entry::SystemPrompt {
-            content: "You are helpful assistant.".into(),
+            content: "You are helpful assistant. Avoid using markdown and LaTex notation.".into(),
         },
         Entry::UserMessage {
             content: MessageContent {
-                text: Some("Hi! List all available tools and try guess what they do.".into()),
+                text: Some(user_prompt),
                 image: None,
             },
         },
@@ -340,6 +421,34 @@ async fn main() -> Result<(), anyhow::Error> {
                         tool_use_id: i.tool_use_id.clone(),
                     });
                 }
+                if i.tool_name == "eval_javascript" {
+                    let result = match serde_json::from_str::<Value>(&i.toolcall_params) {
+                        Ok(v) => match v.get("code").and_then(Value::as_str) {
+                            Some(code) => eval_javascript(code),
+                            None => Err("missing required string parameter `code`".into()),
+                        },
+                        Err(err) => Err(format!("invalid tool arguments: {err}")),
+                    };
+                    let (result, is_error) = match result {
+                        Ok(output) => (output, false),
+                        Err(err) => (err, true),
+                    };
+                    tool_response.push(ToolCallResult {
+                        result,
+                        is_error,
+                        tool_use_id: i.tool_use_id.clone(),
+                    });
+                }
+                if !matches!(
+                    i.tool_name.as_str(),
+                    "get_weather" | "read_file" | "start_subagent" | "eval_javascript"
+                ) {
+                    tool_response.push(ToolCallResult {
+                        result: format!("Unknown tool: {}", i.tool_name),
+                        is_error: true,
+                        tool_use_id: i.tool_use_id.clone(),
+                    });
+                }
             }
             let entry = Entry::ToolCallResult {
                 tool_call: tool_response,
@@ -358,5 +467,29 @@ async fn main() -> Result<(), anyhow::Error> {
                 },
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::eval_javascript;
+
+    #[test]
+    fn returns_last_expression_value() {
+        assert_eq!(eval_javascript("1 + 2 * 3").unwrap(), "7");
+    }
+
+    #[test]
+    fn includes_printed_output_and_value() {
+        assert_eq!(
+            eval_javascript("console.log('hello'); 6 * 7").unwrap(),
+            "hello\n42"
+        );
+    }
+
+    #[test]
+    fn reports_javascript_errors() {
+        let error = eval_javascript("let = ;").unwrap_err();
+        assert!(error.contains("JavaScript error"), "{error}");
     }
 }
