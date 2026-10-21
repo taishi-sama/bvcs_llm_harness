@@ -5,5 +5,6 @@ pub mod openai_completions;
 pub mod openai_responses;
 pub mod sse;
 pub mod stream;
+pub mod usage;
 pub mod validation;
 pub mod wire_common;

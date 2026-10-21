@@ -1,6 +1,12 @@
 use serde::{Deserialize, Serialize};
 
 use crate::generic_tool::Tool;
+use crate::usage::UsageProvider;
+
+/// Default for [`ModelKind::OpenAICompatible::include_usage`].
+const fn default_true() -> bool {
+    true
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum ModelKind {
@@ -8,6 +14,16 @@ pub enum ModelKind {
         model_name: String,
         streaming: bool,
         prompt_cache_key: String,
+        /// Provider label copied into normalized [`crate::usage::Usage`].
+        /// DeepSeek and Z.ai share the Chat Completions wire shape, so the label
+        /// is the only way to distinguish their reports.
+        #[serde(default)]
+        provider: UsageProvider,
+        /// Ask for a final usage chunk (`stream_options.include_usage`) when
+        /// streaming. Defaults to `true`; disable it for compatible servers
+        /// that reject `stream_options`.
+        #[serde(default = "default_true")]
+        include_usage: bool,
     },
     AnthropicCompatible {
         model_name: String,
@@ -70,6 +86,20 @@ impl ModelKind {
         match self {
             ModelKind::OpenAICompatible { streaming, .. }
             | ModelKind::AnthropicCompatible { streaming, .. } => *streaming,
+        }
+    }
+    /// Provider label used for normalized usage reports.
+    pub const fn usage_provider(&self) -> UsageProvider {
+        match self {
+            ModelKind::OpenAICompatible { provider, .. } => *provider,
+            ModelKind::AnthropicCompatible { .. } => UsageProvider::Anthropic,
+        }
+    }
+    /// Whether this kind includes `stream_options.include_usage` on streams.
+    pub const fn include_usage(&self) -> bool {
+        match self {
+            ModelKind::OpenAICompatible { include_usage, .. } => *include_usage,
+            ModelKind::AnthropicCompatible { .. } => false,
         }
     }
 }

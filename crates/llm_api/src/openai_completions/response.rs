@@ -12,8 +12,11 @@
 //! this parser yields assistant-side entries only. `reasoning_content` is
 //! attached as [`Thinking::Normal`] to the produced assistant entry.
 
+use crate::usage::{ParsedResponse, Usage, UsageProvider};
 use llm_history_model::history::{Entry, ResponseBlock, Thinking, ToolCall};
 use serde::Deserialize;
+use serde_json::Value;
+use std::collections::BTreeMap;
 
 /// Top-level `POST /chat/completions` response body.
 #[derive(Debug, Clone, Deserialize)]
@@ -29,14 +32,43 @@ pub struct CompletionResponse {
     #[serde(default)]
     pub object: Option<String>,
     #[serde(default)]
-    pub usage: Option<Usage>,
+    pub usage: Option<ChatUsage>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct Usage {
+/// Chat Completions wire usage, shared by OpenAI, DeepSeek and Z.ai.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ChatUsage {
+    #[serde(default)]
     pub prompt_tokens: Option<u64>,
+    #[serde(default)]
     pub completion_tokens: Option<u64>,
+    #[serde(default)]
     pub total_tokens: Option<u64>,
+    #[serde(default)]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
+    #[serde(default)]
+    pub completion_tokens_details: Option<CompletionTokensDetails>,
+    /// DeepSeek cache-hit prompt tokens.
+    #[serde(default)]
+    pub prompt_cache_hit_tokens: Option<u64>,
+    /// DeepSeek cache-miss prompt tokens.
+    #[serde(default)]
+    pub prompt_cache_miss_tokens: Option<u64>,
+    /// Unknown numeric usage fields, preserved by the normalizer.
+    #[serde(flatten, default)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct PromptTokensDetails {
+    #[serde(default)]
+    pub cached_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CompletionTokensDetails {
+    #[serde(default)]
+    pub reasoning_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -122,6 +154,30 @@ impl CompletionResponse {
 
     pub fn from_value(value: serde_json::Value) -> serde_json::Result<Self> {
         serde_json::from_value(value)
+    }
+
+    /// Normalized usage for this response, labeled as OpenAI.
+    pub fn usage(&self) -> Option<Usage> {
+        self.usage_for(UsageProvider::OpenAI)
+    }
+
+    /// Normalized usage with an explicit provider label (for example DeepSeek
+    /// or Z.ai, which share this wire format).
+    pub fn usage_for(&self, provider: UsageProvider) -> Option<Usage> {
+        Usage::from_chat_for(self.usage.as_ref()?, provider)
+    }
+
+    /// Assistant-side entries plus the normalized usage of this response.
+    pub fn parse(&self) -> ParsedResponse {
+        self.parse_for(UsageProvider::OpenAI)
+    }
+
+    /// Assistant-side entries plus usage labeled with `provider`.
+    pub fn parse_for(&self, provider: UsageProvider) -> ParsedResponse {
+        ParsedResponse {
+            entries: self.to_entries(),
+            usage: self.usage_for(provider),
+        }
     }
 
     /// Converts the response's first choice back into history entries.
@@ -220,6 +276,8 @@ mod tests {
                 model_name: "gpt-test".into(),
                 streaming: false,
                 prompt_cache_key: "key".into(),
+                provider: crate::usage::UsageProvider::OpenAI,
+                include_usage: true,
             },
             tools: Default::default(),
             max_tokens: None,
@@ -239,6 +297,31 @@ mod tests {
         let mut history = vec![text_user("hi")];
         history.extend(entries);
         assert_eq!(validate_entries(&history, &config()), Ok(()));
+    }
+
+    #[test]
+    fn usage_is_normalized_and_parsed() {
+        let resp = CompletionResponse::from_value(serde_json::json!({
+            "id": "x", "model": "m",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hi"}}],
+            "usage": {
+                "prompt_tokens": 20,
+                "completion_tokens": 5,
+                "total_tokens": 25,
+                "prompt_tokens_details": {"cached_tokens": 8},
+                "completion_tokens_details": {"reasoning_tokens": 2}
+            }
+        }))
+        .expect("parses");
+
+        let parsed = resp.parse();
+        assert_eq!(parsed.entries.len(), 1);
+        let usage = parsed.usage.expect("usage");
+        assert_eq!(usage.input_tokens, Some(20));
+        assert_eq!(usage.output_tokens, Some(5));
+        assert_eq!(usage.cached_input_tokens, Some(8));
+        assert_eq!(usage.reasoning_tokens, Some(2));
+        assert_eq!(usage.total(), Some(25));
     }
 
     #[test]

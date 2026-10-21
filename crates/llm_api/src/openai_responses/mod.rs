@@ -297,6 +297,7 @@ pub fn to_responses_input<'a>(
         model_name,
         streaming,
         prompt_cache_key,
+        ..
     } = &config.kind
     else {
         return Err(vec![
@@ -332,6 +333,8 @@ mod tests {
                 prompt_cache_key: "prompt_cache_key".into(),
                 model_name: "gpt-test".into(),
                 streaming: false,
+                provider: crate::usage::UsageProvider::OpenAI,
+                include_usage: true,
             },
             tools: Default::default(),
             max_tokens: None,

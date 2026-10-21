@@ -4,12 +4,96 @@
 //! stream decoders mutate its [`DraftBlock`]s in place; once the stream is
 //! complete, [`finish_draft`] converts the draft into finalized history entries.
 //!
+//! Transports read raw HTTP body bytes into [`RawStreamBytes`] and hand them to
+//! a provider-specific decoder, which performs SSE framing and payload parsing.
+//! Decoders also accumulate normalized [`crate::usage::Usage`], expose it via
+//! `usage()`/`take_usage()`, and emit [`StreamEvent::Usage`] when it changes.
+//!
 //! Drafts are live state only: [`crate::validation::validate_entries`] rejects
 //! them, so a draft can never leak into a provider request.
 
 use crate::model_config::ModelKind;
+use crate::usage::Usage;
 use llm_history_model::history::{DraftBlock, Entry, ResponseBlock, Thinking, ToolCall};
 use std::fmt;
+
+/// A chunk of raw HTTP body bytes read from a streaming transport.
+///
+/// The buffer is owned so decoders can accept it without borrowing the
+/// transport's frame. Provider-specific decoders split it into SSE events and
+/// interpret their payloads.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RawStreamBytes {
+    bytes: Vec<u8>,
+}
+
+impl RawStreamBytes {
+    pub fn new(bytes: impl Into<Vec<u8>>) -> Self {
+        Self {
+            bytes: bytes.into(),
+        }
+    }
+
+    pub fn from_slice(bytes: &[u8]) -> Self {
+        Self {
+            bytes: bytes.to_vec(),
+        }
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+}
+
+impl AsRef<[u8]> for RawStreamBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+impl std::ops::Deref for RawStreamBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_bytes()
+    }
+}
+
+impl From<Vec<u8>> for RawStreamBytes {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self { bytes }
+    }
+}
+
+impl From<&[u8]> for RawStreamBytes {
+    fn from(bytes: &[u8]) -> Self {
+        Self::from_slice(bytes)
+    }
+}
+
+impl From<&Vec<u8>> for RawStreamBytes {
+    fn from(bytes: &Vec<u8>) -> Self {
+        Self::from_slice(bytes)
+    }
+}
+
+impl From<RawStreamBytes> for Vec<u8> {
+    fn from(raw: RawStreamBytes) -> Self {
+        raw.into_bytes()
+    }
+}
 
 /// A provider-neutral notification about stream progress.
 ///
@@ -26,6 +110,10 @@ pub enum StreamEvent {
         name: Option<String>,
         arguments: String,
     },
+    /// Normalized usage changed. `usage()` always returns the latest merged
+    /// value; this event carries the same snapshot for consumers that only
+    /// observe events.
+    Usage(Usage),
     /// The provider finished the response.
     Completed {
         stop_reason: Option<String>,
@@ -382,6 +470,8 @@ mod tests {
             model_name: "gpt".into(),
             streaming: true,
             prompt_cache_key: String::new(),
+            provider: crate::usage::UsageProvider::OpenAI,
+            include_usage: true,
         };
         let entries = finish_draft_for(
             Entry::Draft {
@@ -498,6 +588,20 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!(err, StreamError::MissingToolCallId { index: 3 });
+    }
+
+    #[test]
+    fn raw_stream_bytes_owns_its_buffer() {
+        let raw = RawStreamBytes::from_slice(b"abc");
+        assert_eq!(raw.as_bytes(), b"abc");
+        assert_eq!(raw.len(), 3);
+        assert_eq!(raw.into_bytes(), b"abc".to_vec());
+
+        let from_vec: RawStreamBytes = b"xyz".to_vec().into();
+        assert_eq!(&*from_vec, b"xyz");
+
+        let from_slice: RawStreamBytes = b"pqr".as_slice().into();
+        assert_eq!(from_slice.as_bytes(), b"pqr");
     }
 
     #[test]

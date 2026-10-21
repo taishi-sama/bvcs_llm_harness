@@ -752,6 +752,8 @@ mod tests {
                 model_name: "gpt".into(),
                 streaming: false,
                 prompt_cache_key: String::new(),
+                provider: crate::usage::UsageProvider::OpenAI,
+                include_usage: true,
             },
             tools: Default::default(),
             max_tokens: None,

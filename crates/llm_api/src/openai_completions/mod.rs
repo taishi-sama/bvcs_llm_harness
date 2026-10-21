@@ -22,6 +22,9 @@
 //!   when plaintext reasoning is also available and rejected by
 //!   [`to_completions_input`] when it is the only content of a turn.
 //! - `is_error` has no native flag; errors are prefixed `"ERROR: "`.
+//! - When `streaming` is enabled, `stream_options.include_usage` is sent
+//!   (unless `include_usage` is disabled in `ModelKind`) so the server emits a
+//!   final usage-only chunk.
 
 use crate::model_config::ModelConfig;
 use crate::validation::validate_entries;
@@ -44,10 +47,18 @@ pub struct CompletionsInput {
     pub stream: bool,
     #[serde(skip_serializing_if = "String::is_empty")]
     prompt_cache_key: String,
+    /// Asks the server for a final usage-only chunk when streaming.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<StreamOptions>,
     /// Function tools forwarded from `ModelConfig.tools`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<CompletionTool>,
     pub messages: Vec<Message>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StreamOptions {
+    pub include_usage: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -169,6 +180,8 @@ pub fn to_completions_input(
         model_name,
         streaming,
         prompt_cache_key,
+        include_usage,
+        ..
     } = &config.kind
     else {
         return Err(vec![
@@ -282,6 +295,9 @@ pub fn to_completions_input(
     Ok(CompletionsInput {
         model: model_name.to_string(),
         stream: *streaming,
+        stream_options: (*streaming && *include_usage).then_some(StreamOptions {
+            include_usage: true,
+        }),
         tools: tools_to_completions(&config.tools),
         messages,
         store: false,
@@ -304,6 +320,8 @@ mod tests {
                 prompt_cache_key: "prompt_cache_key".into(),
                 model_name: "gpt-test".into(),
                 streaming: false,
+                provider: crate::usage::UsageProvider::OpenAI,
+                include_usage: true,
             },
             tools: Default::default(),
             max_tokens: None,
@@ -530,6 +548,52 @@ mod tests {
                 kind: "opaque",
             })
         );
+    }
+
+    fn streaming_config(include_usage: bool) -> ModelConfig {
+        ModelConfig {
+            kind: ModelKind::OpenAICompatible {
+                model_name: "gpt-test".into(),
+                streaming: true,
+                prompt_cache_key: "key".into(),
+                provider: crate::usage::UsageProvider::OpenAI,
+                include_usage,
+            },
+            tools: Default::default(),
+            max_tokens: None,
+        }
+    }
+
+    #[test]
+    fn streaming_requests_include_usage() {
+        let v = serde_json::to_value(
+            to_completions_input(&[text_user("hi")], &streaming_config(true))
+                .expect("valid history"),
+        )
+        .unwrap();
+
+        assert_eq!(v["stream"], true);
+        assert_eq!(
+            v["stream_options"],
+            serde_json::json!({"include_usage": true})
+        );
+    }
+
+    #[test]
+    fn non_streaming_requests_omit_stream_options() {
+        let v = serialize(&[text_user("hi")]);
+        assert_eq!(v["stream"], false);
+        assert!(v.get("stream_options").is_none());
+    }
+
+    #[test]
+    fn include_usage_can_be_disabled() {
+        let v = serde_json::to_value(
+            to_completions_input(&[text_user("hi")], &streaming_config(false))
+                .expect("valid history"),
+        )
+        .unwrap();
+        assert!(v.get("stream_options").is_none());
     }
 
     #[test]

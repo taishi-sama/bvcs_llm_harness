@@ -15,8 +15,10 @@
 //! appear only in the first fragment for each `index`; later fragments may carry
 //! just `index` + `arguments`, so blocks are merged by index.
 
+use crate::openai_completions::response::ChatUsage;
 use crate::sse::SseDecoder;
-use crate::stream::{StreamError, StreamEvent, append_text, tool_call_position};
+use crate::stream::{RawStreamBytes, StreamError, StreamEvent, append_text, tool_call_position};
+use crate::usage::{Usage, UsageProvider};
 use llm_history_model::history::DraftBlock;
 use serde::Deserialize;
 
@@ -24,6 +26,10 @@ use serde::Deserialize;
 #[derive(Debug, Default)]
 pub struct StreamDecoder {
     sse: SseDecoder,
+    /// Provider label copied into normalized usage.
+    provider: UsageProvider,
+    /// Latest merged usage.
+    usage: Option<Usage>,
     thinking_pos: Option<usize>,
     text_pos: Option<usize>,
     stop_reason: Option<String>,
@@ -35,17 +41,44 @@ impl StreamDecoder {
         Self::default()
     }
 
+    /// Creates a decoder that labels usage with `provider`.
+    pub fn with_provider(provider: UsageProvider) -> Self {
+        Self {
+            provider,
+            ..Self::default()
+        }
+    }
+
+    /// Sets the provider label used for subsequent usage reports.
+    pub fn set_provider(&mut self, provider: UsageProvider) {
+        self.provider = provider;
+        if let Some(usage) = &mut self.usage {
+            usage.provider = provider;
+        }
+    }
+
     pub fn is_completed(&self) -> bool {
         self.completed
     }
 
+    /// Latest merged usage, if the provider has reported any.
+    pub fn usage(&self) -> Option<&Usage> {
+        self.usage.as_ref()
+    }
+
+    /// Takes the latest merged usage out of the decoder.
+    pub fn take_usage(&mut self) -> Option<Usage> {
+        self.usage.take()
+    }
+
     pub fn push_bytes(
         &mut self,
-        bytes: &[u8],
+        bytes: impl Into<RawStreamBytes>,
         blocks: &mut Vec<DraftBlock>,
     ) -> Result<Vec<StreamEvent>, StreamError> {
+        let bytes = bytes.into();
         let mut out = Vec::new();
-        for sse in self.sse.push(bytes) {
+        for sse in self.sse.push(bytes.as_bytes()) {
             self.handle_data(&sse.data, blocks, &mut out)?;
         }
         Ok(out)
@@ -93,6 +126,23 @@ impl StreamDecoder {
             event: None,
             details: e.to_string(),
         })?;
+
+        // Usage arrives in a final chunk with `choices: []`, so it must be
+        // handled before choice filtering.
+        if let Some(wire) = &chunk.usage
+            && let Some(usage) = Usage::from_chat_for(wire, self.provider)
+        {
+            let previous = self.usage.clone();
+            match &mut self.usage {
+                Some(existing) => existing.merge(&usage),
+                None => self.usage = Some(usage),
+            }
+            if self.usage != previous
+                && let Some(current) = &self.usage
+            {
+                out.push(StreamEvent::Usage(current.clone()));
+            }
+        }
 
         // `n > 1` is not supported by the response model; honor choice 0 only,
         // matching `response.rs`.
@@ -173,6 +223,8 @@ impl StreamDecoder {
 struct Chunk {
     #[serde(default)]
     choices: Vec<Choice>,
+    #[serde(default)]
+    usage: Option<ChatUsage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -326,14 +378,54 @@ mod tests {
     }
 
     #[test]
-    fn usage_only_chunk_is_ignored() {
+    fn usage_only_chunk_is_captured() {
         let raw = concat!(
             "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\n",
-            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2}}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"total_tokens\":12,\"prompt_tokens_details\":{\"cached_tokens\":4}}}\n\n",
             "data: [DONE]\n\n",
         );
         let mut decoder = StreamDecoder::new();
         let blocks = feed(&mut decoder, raw);
         assert_eq!(blocks, vec![DraftBlock::Text { text: "ok".into() }]);
+
+        let usage = decoder.usage().expect("usage captured");
+        assert_eq!(usage.input_tokens, Some(10));
+        assert_eq!(usage.output_tokens, Some(2));
+        assert_eq!(usage.cached_input_tokens, Some(4));
+        assert_eq!(usage.total(), Some(12));
+    }
+
+    #[test]
+    fn usage_only_chunk_emits_event() {
+        let raw = concat!(
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let mut decoder = StreamDecoder::new();
+        let mut blocks = Vec::new();
+        let events = decoder
+            .push_bytes(raw.as_bytes(), &mut blocks)
+            .expect("decodes");
+
+        assert!(matches!(
+            events.first(),
+            Some(StreamEvent::Usage(usage))
+                if usage.input_tokens == Some(1) && usage.output_tokens == Some(2)
+        ));
+    }
+
+    #[test]
+    fn deepseek_cache_fields_are_normalized() {
+        let raw = concat!(
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":80,\"completion_tokens\":20,\"total_tokens\":100,\"prompt_cache_hit_tokens\":64,\"prompt_cache_miss_tokens\":16}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let mut decoder = StreamDecoder::with_provider(UsageProvider::DeepSeek);
+        let _ = feed(&mut decoder, raw);
+
+        let usage = decoder.usage().expect("usage captured");
+        assert_eq!(usage.provider, UsageProvider::DeepSeek);
+        assert_eq!(usage.cached_input_tokens, Some(64));
+        assert_eq!(usage.extra.get("prompt_cache_miss_tokens"), Some(&16));
     }
 }

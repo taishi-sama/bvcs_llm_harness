@@ -20,7 +20,8 @@
 
 use crate::openai_responses::response::{OutputItem, ResponsesResponse};
 use crate::sse::SseDecoder;
-use crate::stream::{StreamError, StreamEvent};
+use crate::stream::{RawStreamBytes, StreamError, StreamEvent};
+use crate::usage::{Usage, UsageProvider};
 use llm_history_model::history::DraftBlock;
 use serde::Deserialize;
 use serde_json::Value;
@@ -30,6 +31,10 @@ use std::collections::HashMap;
 #[derive(Debug, Default)]
 pub struct StreamDecoder {
     sse: SseDecoder,
+    /// Provider label copied into normalized usage.
+    provider: UsageProvider,
+    /// Latest merged usage.
+    usage: Option<Usage>,
     /// `output_index` -> position in `blocks`.
     positions: HashMap<u32, usize>,
     last_position: Option<usize>,
@@ -42,17 +47,44 @@ impl StreamDecoder {
         Self::default()
     }
 
+    /// Creates a decoder that labels usage with `provider`.
+    pub fn with_provider(provider: UsageProvider) -> Self {
+        Self {
+            provider,
+            ..Self::default()
+        }
+    }
+
+    /// Sets the provider label used for subsequent usage reports.
+    pub fn set_provider(&mut self, provider: UsageProvider) {
+        self.provider = provider;
+        if let Some(usage) = &mut self.usage {
+            usage.provider = provider;
+        }
+    }
+
     pub fn is_completed(&self) -> bool {
         self.completed
     }
 
+    /// Latest merged usage, if the provider has reported any.
+    pub fn usage(&self) -> Option<&Usage> {
+        self.usage.as_ref()
+    }
+
+    /// Takes the latest merged usage out of the decoder.
+    pub fn take_usage(&mut self) -> Option<Usage> {
+        self.usage.take()
+    }
+
     pub fn push_bytes(
         &mut self,
-        bytes: &[u8],
+        bytes: impl Into<RawStreamBytes>,
         blocks: &mut Vec<DraftBlock>,
     ) -> Result<Vec<StreamEvent>, StreamError> {
+        let bytes = bytes.into();
         let mut out = Vec::new();
-        for sse in self.sse.push(bytes) {
+        for sse in self.sse.push(bytes.as_bytes()) {
             if sse.data.is_empty() {
                 continue;
             }
@@ -222,9 +254,22 @@ impl StreamDecoder {
                 // an empty `output`; keep the accumulated deltas in that case.
                 if let Some(response) = event.response
                     && let Ok(parsed) = serde_json::from_value::<ResponsesResponse>(response)
-                    && !parsed.output.is_empty()
                 {
-                    rebuild_from_response(&parsed, blocks);
+                    if let Some(usage) = parsed.usage_for(self.provider) {
+                        let previous = self.usage.clone();
+                        match &mut self.usage {
+                            Some(existing) => existing.merge(&usage),
+                            None => self.usage = Some(usage),
+                        }
+                        if self.usage != previous
+                            && let Some(current) = &self.usage
+                        {
+                            out.push(StreamEvent::Usage(current.clone()));
+                        }
+                    }
+                    if !parsed.output.is_empty() {
+                        rebuild_from_response(&parsed, blocks);
+                    }
                 }
 
                 out.push(StreamEvent::Completed {
@@ -732,5 +777,33 @@ mod tests {
                 message: "boom".into()
             }
         );
+    }
+
+    #[test]
+    fn completed_usage_is_captured_even_with_empty_output() {
+        let raw = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"Hi\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"model\":\"m\",\"status\":\"completed\",\"output\":[],",
+            "\"usage\":{\"input_tokens\":11,\"output_tokens\":7,\"total_tokens\":18,\"input_tokens_details\":{\"cached_tokens\":3},\"output_tokens_details\":{\"reasoning_tokens\":2}}}}\n\n",
+        );
+
+        let mut decoder = StreamDecoder::new();
+        let mut blocks = Vec::new();
+        let mut events = decoder
+            .push_bytes(raw.as_bytes(), &mut blocks)
+            .expect("decodes");
+        events.extend(decoder.finish(&mut blocks).expect("flushes"));
+
+        // Usage must not be tied to the presence of output items.
+        assert_eq!(blocks, vec![DraftBlock::Text { text: "Hi".into() }]);
+        let usage = decoder.usage().expect("usage captured");
+        assert_eq!(usage.input_tokens, Some(11));
+        assert_eq!(usage.output_tokens, Some(7));
+        assert_eq!(usage.cached_input_tokens, Some(3));
+        assert_eq!(usage.reasoning_tokens, Some(2));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::Usage(usage) if usage.total() == Some(18)
+        )));
     }
 }

@@ -20,9 +20,11 @@
 //!   [`Thinking::Normal`]; such a block cannot be replayed to Anthropic and is
 //!   reported by validation.
 
+use crate::usage::{ParsedResponse, Usage};
 use llm_history_model::history::{Entry, ResponseBlock, Thinking, ToolCall};
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 /// Top-level `POST /v1/messages` response body.
 #[derive(Debug, Clone, Deserialize)]
@@ -42,13 +44,34 @@ pub struct MessagesResponse {
     #[serde(rename = "type")]
     pub kind: Option<String>,
     #[serde(default)]
-    pub usage: Option<Usage>,
+    pub usage: Option<AnthropicUsage>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct Usage {
+/// Anthropic Messages API wire usage.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AnthropicUsage {
+    /// Prompt tokens excluding cache reads and writes.
+    #[serde(default)]
     pub input_tokens: Option<u64>,
+    #[serde(default)]
     pub output_tokens: Option<u64>,
+    #[serde(default)]
+    pub cache_creation_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub cache_read_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub cache_creation: Option<CacheCreation>,
+    /// Unknown numeric usage fields, preserved by the normalizer.
+    #[serde(flatten, default)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CacheCreation {
+    #[serde(default)]
+    pub ephemeral_5m_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub ephemeral_1h_input_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -83,6 +106,19 @@ impl MessagesResponse {
 
     pub fn from_value(value: Value) -> serde_json::Result<Self> {
         serde_json::from_value(value)
+    }
+
+    /// Normalized usage for this response (Anthropic provider label).
+    pub fn usage(&self) -> Option<Usage> {
+        Usage::from_anthropic(self.usage.as_ref()?)
+    }
+
+    /// Assistant-side entries plus the normalized usage of this response.
+    pub fn parse(&self) -> ParsedResponse {
+        ParsedResponse {
+            entries: self.to_entries(),
+            usage: self.usage(),
+        }
     }
 
     /// Converts the response content back into history entries.
@@ -207,6 +243,35 @@ mod tests {
     }
 
     #[test]
+    fn usage_sums_cache_creation_and_reads() {
+        let resp = MessagesResponse::from_value(serde_json::json!({
+            "id": "msg_u", "type": "message", "role": "assistant", "model": "m",
+            "content": [{"type": "text", "text": "Hi"}],
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 4,
+                "cache_creation_input_tokens": 6,
+                "cache_read_input_tokens": 2,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": 6,
+                    "ephemeral_1h_input_tokens": 0
+                }
+            }
+        }))
+        .expect("parses");
+
+        let usage = resp.usage().expect("usage");
+        assert_eq!(usage.provider, crate::usage::UsageProvider::Anthropic);
+        assert_eq!(usage.input_tokens, Some(18));
+        assert_eq!(usage.output_tokens, Some(4));
+        assert_eq!(usage.cached_input_tokens, Some(2));
+        assert_eq!(usage.cache_creation_input_tokens, Some(6));
+        assert_eq!(usage.total(), Some(22));
+        assert_eq!(usage.extra.get("raw_input_tokens"), Some(&10));
+        assert_eq!(usage.extra.get("ephemeral_5m_input_tokens"), Some(&6));
+    }
+
+    #[test]
     fn parses_text_and_signed_thinking() {
         let resp = MessagesResponse::from_value(serde_json::json!({
             "id": "msg_1", "type": "message", "role": "assistant", "model": "m",
@@ -221,6 +286,10 @@ mod tests {
 
         assert_eq!(resp.stop_reason.as_deref(), Some("end_turn"));
         assert_eq!(resp.usage.as_ref().unwrap().input_tokens, Some(10));
+        let normalized = resp.usage().expect("normalized usage");
+        assert_eq!(normalized.input_tokens, Some(10));
+        assert_eq!(normalized.output_tokens, Some(5));
+        assert_eq!(normalized.total(), Some(15));
 
         let entries = resp.to_entries();
         assert_eq!(entries.len(), 1);

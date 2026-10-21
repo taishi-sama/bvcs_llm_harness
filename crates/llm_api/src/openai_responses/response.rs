@@ -12,9 +12,11 @@
 //! stores plaintext thinking only. `function_call_output.is_error` has no wire
 //! representation, so results always deserialize as `is_error: false`.
 
+use crate::usage::{ParsedResponse, Usage, UsageProvider};
 use llm_history_model::history::{Entry, ResponseBlock, Thinking, ToolCall, ToolCallResult};
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 /// Top-level `POST /responses` response body.
 #[derive(Debug, Clone, Deserialize)]
@@ -35,7 +37,7 @@ pub struct ResponsesResponse {
     #[serde(default)]
     pub output: Vec<OutputItem>,
     #[serde(default)]
-    pub usage: Option<Usage>,
+    pub usage: Option<ResponsesUsage>,
     #[serde(default)]
     pub error: Option<ResponseError>,
 }
@@ -46,18 +48,34 @@ pub struct ResponseError {
     pub message: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct Usage {
+/// Responses API wire usage.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ResponsesUsage {
+    #[serde(default)]
     pub input_tokens: Option<u64>,
+    #[serde(default)]
     pub output_tokens: Option<u64>,
+    #[serde(default)]
     pub total_tokens: Option<u64>,
+    #[serde(default)]
     pub input_tokens_details: Option<InputTokensDetails>,
-    pub output_tokens_details: Option<Value>,
+    #[serde(default)]
+    pub output_tokens_details: Option<OutputTokensDetails>,
+    /// Unknown numeric usage fields, preserved by the normalizer.
+    #[serde(flatten, default)]
+    pub extra: BTreeMap<String, Value>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct InputTokensDetails {
+    #[serde(default)]
     pub cached_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct OutputTokensDetails {
+    #[serde(default)]
+    pub reasoning_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -205,6 +223,29 @@ impl ResponsesResponse {
         serde_json::from_value(value)
     }
 
+    /// Normalized usage for this response, labeled as OpenAI.
+    pub fn usage(&self) -> Option<Usage> {
+        self.usage_for(UsageProvider::OpenAI)
+    }
+
+    /// Normalized usage with an explicit provider label.
+    pub fn usage_for(&self, provider: UsageProvider) -> Option<Usage> {
+        Usage::from_responses_for(self.usage.as_ref()?, provider)
+    }
+
+    /// Assistant-side entries plus the normalized usage of this response.
+    pub fn parse(&self) -> ParsedResponse {
+        self.parse_for(UsageProvider::OpenAI)
+    }
+
+    /// Assistant-side entries plus usage labeled with `provider`.
+    pub fn parse_for(&self, provider: UsageProvider) -> ParsedResponse {
+        ParsedResponse {
+            entries: self.to_entries(),
+            usage: self.usage_for(provider),
+        }
+    }
+
     /// Converts the response output back into history entries.
     ///
     /// - reasoning and message items become ordered [`ResponseBlock`]s inside
@@ -319,6 +360,8 @@ mod tests {
                 model_name: "qwen3.6-35b-a3b".into(),
                 streaming: false,
                 prompt_cache_key: "prompt_cache_key".into(),
+                provider: crate::usage::UsageProvider::OpenAI,
+                include_usage: true,
             },
             tools: Default::default(),
             max_tokens: None,
@@ -369,6 +412,12 @@ mod tests {
             usage.input_tokens_details.as_ref().unwrap().cached_tokens,
             Some(0)
         );
+
+        let normalized = resp.usage().expect("normalized usage");
+        assert_eq!(normalized.input_tokens, Some(21));
+        assert_eq!(normalized.output_tokens, Some(247));
+        assert_eq!(normalized.cached_input_tokens, Some(0));
+        assert_eq!(normalized.total(), Some(268));
 
         let entries = resp.to_entries();
         assert_eq!(entries.len(), 1);

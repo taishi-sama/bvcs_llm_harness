@@ -24,7 +24,8 @@ use llm_api::{
     generic_tool::{ParameterDescription, ParameterType, Tool},
     model_config::{GlobalConfig, ModelConfig, ModelKind},
     openai_completions, openai_responses,
-    stream::{StreamError, StreamEvent, finish_draft_for},
+    stream::{RawStreamBytes, StreamError, StreamEvent, finish_draft_for},
+    usage::UsageProvider,
 };
 use llm_history_model::history::{DraftBlock, Entry, MessageContent, ToolCallResult};
 use serde_json::Value;
@@ -68,6 +69,8 @@ impl Provider {
                 model_name: model_name.into(),
                 streaming: true,
                 prompt_cache_key: String::new(),
+                provider: UsageProvider::Other,
+                include_usage: true,
             },
         }
     }
@@ -81,19 +84,21 @@ enum Decoder {
 }
 
 impl Decoder {
-    fn new(provider: Provider) -> Self {
+    fn new(provider: Provider, usage_provider: UsageProvider) -> Self {
         match provider {
             Provider::Anthropic => Self::Anthropic(anthropic::stream::StreamDecoder::new()),
-            Provider::Completions => {
-                Self::Completions(openai_completions::stream::StreamDecoder::new())
-            }
-            Provider::Responses => Self::Responses(openai_responses::stream::StreamDecoder::new()),
+            Provider::Completions => Self::Completions(
+                openai_completions::stream::StreamDecoder::with_provider(usage_provider),
+            ),
+            Provider::Responses => Self::Responses(
+                openai_responses::stream::StreamDecoder::with_provider(usage_provider),
+            ),
         }
     }
 
     fn push_bytes(
         &mut self,
-        bytes: &[u8],
+        bytes: RawStreamBytes,
         blocks: &mut Vec<DraftBlock>,
     ) -> Result<Vec<StreamEvent>, StreamError> {
         match self {
@@ -108,6 +113,14 @@ impl Decoder {
             Decoder::Anthropic(decoder) => decoder.finish(blocks),
             Decoder::Completions(decoder) => decoder.finish(blocks),
             Decoder::Responses(decoder) => decoder.finish(blocks),
+        }
+    }
+
+    fn usage(&self) -> Option<&llm_api::usage::Usage> {
+        match self {
+            Decoder::Anthropic(decoder) => decoder.usage(),
+            Decoder::Completions(decoder) => decoder.usage(),
+            Decoder::Responses(decoder) => decoder.usage(),
         }
     }
 }
@@ -336,7 +349,7 @@ async fn main() -> Result<(), anyhow::Error> {
         // Live assistant turn. It stays in the history (as the last entry) while
         // the stream is running and is replaced by finalized entries afterwards.
         history.push(Entry::draft());
-        let mut decoder = Decoder::new(provider);
+        let mut decoder = Decoder::new(provider, model.model_config.kind.usage_provider());
         while let Some(next) = res.frame().await {
             let frame = next?;
             if let Some(chunk) = frame.data_ref() {
@@ -344,12 +357,13 @@ async fn main() -> Result<(), anyhow::Error> {
                     .last_mut()
                     .and_then(|entry| entry.as_draft_mut())
                     .expect("draft entry is last");
-                for event in decoder.push_bytes(chunk, blocks)? {
+                for event in decoder.push_bytes(RawStreamBytes::from_slice(chunk), blocks)? {
                     match event {
                         StreamEvent::ThinkingDelta(text) | StreamEvent::TextDelta(text) => {
                             print!("{text}");
                             io::stdout().flush()?;
                         }
+                        StreamEvent::Usage(usage) => println!("\nusage: {usage:?}"),
                         other => println!("\n{other:?}"),
                     }
                 }
@@ -365,6 +379,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 println!("\n{event:?}");
             }
         }
+        println!("\nfinal usage: {:?}", decoder.usage());
 
         let draft = history.pop().expect("draft entry is last");
         let mut entries = finish_draft_for(draft, &model.model_config.kind)?;

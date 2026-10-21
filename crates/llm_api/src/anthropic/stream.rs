@@ -18,8 +18,10 @@
 //! Tool-call arguments arrive as `input_json_delta` fragments and are only valid
 //! JSON once the block closes.
 
+use crate::anthropic::response::AnthropicUsage;
 use crate::sse::SseDecoder;
-use crate::stream::{StreamError, StreamEvent};
+use crate::stream::{RawStreamBytes, StreamError, StreamEvent};
+use crate::usage::Usage;
 use llm_history_model::history::DraftBlock;
 use serde::Deserialize;
 use serde_json::Value;
@@ -29,6 +31,8 @@ use std::collections::HashMap;
 #[derive(Debug, Default)]
 pub struct StreamDecoder {
     sse: SseDecoder,
+    /// Latest merged usage (`message_start` + `message_delta`).
+    usage: Option<Usage>,
     /// Content-block `index` -> position in `blocks`.
     positions: HashMap<u32, usize>,
     /// Position in `blocks` of the currently open content block, used as a
@@ -51,17 +55,28 @@ impl StreamDecoder {
         self.completed
     }
 
+    /// Latest merged usage, if the provider has reported any.
+    pub fn usage(&self) -> Option<&Usage> {
+        self.usage.as_ref()
+    }
+
+    /// Takes the latest merged usage out of the decoder.
+    pub fn take_usage(&mut self) -> Option<Usage> {
+        self.usage.take()
+    }
+
     /// Feed raw HTTP body bytes, mutating `blocks` as events arrive.
     ///
     /// Returns progress events for UI/logging. The caller owns the draft; this
     /// decoder never adds or removes history entries.
     pub fn push_bytes(
         &mut self,
-        bytes: &[u8],
+        bytes: impl Into<RawStreamBytes>,
         blocks: &mut Vec<DraftBlock>,
     ) -> Result<Vec<StreamEvent>, StreamError> {
+        let bytes = bytes.into();
         let mut out = Vec::new();
-        for sse in self.sse.push(bytes) {
+        for sse in self.sse.push(bytes.as_bytes()) {
             if sse.data == "[DONE]" {
                 self.completed = true;
                 out.push(StreamEvent::Completed {
@@ -80,6 +95,22 @@ impl StreamDecoder {
             self.handle(event, blocks, &mut out)?;
         }
         Ok(out)
+    }
+
+    fn merge_usage(&mut self, wire: &AnthropicUsage, out: &mut Vec<StreamEvent>) {
+        let Some(usage) = Usage::from_anthropic(wire) else {
+            return;
+        };
+        let previous = self.usage.clone();
+        match &mut self.usage {
+            Some(existing) => existing.merge(&usage),
+            None => self.usage = Some(usage),
+        }
+        if self.usage != previous
+            && let Some(current) = &self.usage
+        {
+            out.push(StreamEvent::Usage(current.clone()));
+        }
     }
 
     /// Flush any pending SSE frame at end of stream.
@@ -109,7 +140,13 @@ impl StreamDecoder {
         out: &mut Vec<StreamEvent>,
     ) -> Result<(), StreamError> {
         match event {
-            Event::MessageStart | Event::Ping | Event::Other => {}
+            Event::MessageStart { message } => {
+                if let Some(usage) = message.and_then(|message| message.usage) {
+                    self.merge_usage(&usage, out);
+                }
+            }
+
+            Event::Ping | Event::Other => {}
 
             Event::ContentBlockStart {
                 index,
@@ -223,9 +260,12 @@ impl StreamDecoder {
                 self.input_seeded = false;
             }
 
-            Event::MessageDelta { delta } => {
+            Event::MessageDelta { delta, usage } => {
                 if delta.stop_reason.is_some() {
                     self.stop_reason = delta.stop_reason;
+                }
+                if let Some(usage) = usage {
+                    self.merge_usage(&usage, out);
                 }
             }
 
@@ -252,7 +292,10 @@ impl StreamDecoder {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Event {
-    MessageStart,
+    MessageStart {
+        #[serde(default)]
+        message: Option<MessageStartBody>,
+    },
     ContentBlockStart {
         index: u32,
         content_block: StartBlock,
@@ -267,6 +310,8 @@ enum Event {
     },
     MessageDelta {
         delta: MessageDeltaBody,
+        #[serde(default)]
+        usage: Option<AnthropicUsage>,
     },
     MessageStop,
     Ping,
@@ -276,6 +321,12 @@ enum Event {
     /// Forward compatibility: ignore event types we do not model.
     #[serde(other)]
     Other,
+}
+
+#[derive(Debug, Deserialize)]
+struct MessageStartBody {
+    #[serde(default)]
+    usage: Option<AnthropicUsage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -578,5 +629,42 @@ mod tests {
             entries[0].response_thinking_blocks().as_slice(),
             [Thinking::Redacted { thinking }] if thinking == "opaque"
         ));
+    }
+
+    #[test]
+    fn usage_merges_message_start_and_message_delta() {
+        let raw = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"usage\":{\"input_tokens\":17,\"cache_read_input_tokens\":0,\"output_tokens\":0}}}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":186}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+
+        let mut decoder = StreamDecoder::new();
+        let mut blocks = Vec::new();
+        let mut events = decoder
+            .push_bytes(raw.as_bytes(), &mut blocks)
+            .expect("decodes");
+        events.extend(decoder.finish(&mut blocks).expect("flushes"));
+
+        let usage = decoder.usage().expect("usage merged");
+        assert_eq!(usage.input_tokens, Some(17));
+        assert_eq!(usage.output_tokens, Some(186));
+        assert_eq!(usage.total(), Some(203));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::Usage(usage) if usage.output_tokens == Some(186)
+        )));
+    }
+
+    #[test]
+    fn missing_usage_yields_none() {
+        let raw = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\"}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+
+        let mut decoder = StreamDecoder::new();
+        let _ = feed(&mut decoder, raw);
+        assert!(decoder.usage().is_none());
     }
 }
