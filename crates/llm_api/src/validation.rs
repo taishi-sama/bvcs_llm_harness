@@ -40,6 +40,9 @@ pub enum ValidationError {
         expected: &'static str,
         actual: &'static str,
     },
+    /// A streaming draft is still present. Drafts are live state and cannot be
+    /// replayed to a provider; finish the stream and commit the draft first.
+    DraftNotFinal { index: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +51,8 @@ enum Kind {
     UserMsg,
     Assistant,
     Results,
+    /// Live streaming state; rejected before serialization.
+    Draft,
 }
 
 const fn kind_of(e: &Entry) -> Kind {
@@ -56,6 +61,7 @@ const fn kind_of(e: &Entry) -> Kind {
         Entry::UserMessage { .. } => Kind::UserMsg,
         Entry::ResponseNormal { .. } | Entry::ResponseToolCall { .. } => Kind::Assistant,
         Entry::ToolCallResult { .. } => Kind::Results,
+        Entry::Draft { .. } => Kind::Draft,
     }
 }
 
@@ -65,6 +71,7 @@ const fn kind_name(k: Kind) -> &'static str {
         Kind::UserMsg => "user",
         Kind::Assistant => "assistant",
         Kind::Results => "results",
+        Kind::Draft => "draft",
     }
 }
 
@@ -76,17 +83,21 @@ fn transition_ok(from: Option<Kind>, to: Kind) -> bool {
         Some(Kind::UserMsg) => matches!(to, Kind::Assistant),
         Some(Kind::Assistant) => matches!(to, Kind::UserMsg | Kind::Results),
         Some(Kind::Results) => matches!(to, Kind::Assistant | Kind::Results),
+        // Drafts never reach this check (they are rejected and skipped), but
+        // keep the transition permissive so an earlier draft cannot cascade
+        // into unrelated transition errors.
+        Some(Kind::Draft) => true,
         Some(Kind::System) => true,
     }
 }
 
-/// Previous non-system entry kind before `upto`
+/// Previous non-system, non-draft entry kind before `upto`
 fn last_kind(entries: &[Entry], upto: usize) -> Option<Kind> {
     entries[..upto]
         .iter()
         .rev()
         .map(kind_of)
-        .find(|k| *k != Kind::System)
+        .find(|k| !matches!(k, Kind::System | Kind::Draft))
 }
 
 fn is_json_object(s: &str) -> bool {
@@ -133,6 +144,7 @@ fn check_provider_rules(
 /// - every `toolcall_params` parses as a JSON object
 /// - every result references a call from the immediately preceding batch
 /// - no duplicate tool_use_ids, no unanswered calls at the end of history
+/// - no [`Entry::Draft`] (finish the stream and commit it first)
 ///
 /// Provider-specific (`config.kind`):
 /// - `AnthropicCompatible`: rejects unsigned [`Thinking::Normal`] blocks
@@ -154,6 +166,14 @@ pub fn validate_entries(
             continue;
         }
 
+        // A draft is live streaming state. It is structurally allowed while a
+        // response is being received, but it can never be sent back to a
+        // provider, so any draft makes the history non-serializable.
+        if entry.is_draft() {
+            errors.push(ValidationError::DraftNotFinal { index: i });
+            continue;
+        }
+
         let prev = last_kind(entries, i);
         let k = kind_of(entry);
         if !transition_ok(prev, k) {
@@ -166,6 +186,7 @@ pub fn validate_entries(
 
         match entry {
             Entry::SystemPrompt { .. } => unreachable!("handled above"),
+            Entry::Draft { .. } => unreachable!("handled above"),
             Entry::UserMessage { content } => {
                 let has_text = content.text.as_ref().is_some_and(|t| !t.is_empty());
                 if !has_text && content.image.is_none() {
@@ -233,7 +254,9 @@ pub fn validate_entries(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use llm_history_model::history::{Image, ImageMIME, MessageContent, ToolCall, ToolCallResult};
+    use llm_history_model::history::{
+        DraftBlock, Image, ImageMIME, MessageContent, ToolCall, ToolCallResult,
+    };
 
     fn openai_config() -> ModelConfig {
         ModelConfig {
@@ -251,6 +274,7 @@ mod tests {
         ModelConfig {
             kind: ModelKind::AnthropicCompatible {
                 model_name: "claude-test".into(),
+                streaming: false,
             },
             tools: Default::default(),
             max_tokens: Some(1024),
@@ -515,6 +539,57 @@ mod tests {
                 tool_use_ids: vec!["dangling".into()]
             })
         ));
+    }
+
+    #[test]
+    fn rejects_streaming_draft() {
+        let h = vec![text_user("q"), Entry::draft()];
+        assert!(matches!(
+            validate_entries(&h, &openai_config()),
+            Err(e) if e.contains(&ValidationError::DraftNotFinal { index: 1 })
+        ));
+    }
+
+    #[test]
+    fn rejects_draft_in_the_middle() {
+        let mut draft = Entry::draft();
+        draft
+            .as_draft_mut()
+            .unwrap()
+            .push(llm_history_model::history::DraftBlock::Text {
+                text: "partial".into(),
+            });
+        let h = vec![text_user("q"), draft, assistant_text("done")];
+        assert!(matches!(
+            validate_entries(&h, &openai_config()),
+            Err(e) if e.contains(&ValidationError::DraftNotFinal { index: 1 })
+        ));
+    }
+
+    #[test]
+    fn rescued_draft_is_valid_history() {
+        let draft = Entry::Draft {
+            blocks: vec![
+                DraftBlock::Thinking {
+                    text: "hmm".into(),
+                    signature: None,
+                },
+                DraftBlock::Text {
+                    text: "partial answer".into(),
+                },
+                DraftBlock::ToolCall {
+                    index: 0,
+                    tool_use_id: Some("c1".into()),
+                    tool_name: Some("get_weather".into()),
+                    arguments: r#"{"city":"Os"#.into(),
+                },
+            ],
+        };
+        let rescued = draft
+            .try_to_rescue_draft("[thinking only]", false)
+            .expect("text is rescuable");
+        let h = vec![text_user("q"), rescued];
+        assert_eq!(validate_entries(&h, &openai_config()), Ok(()));
     }
 
     #[test]

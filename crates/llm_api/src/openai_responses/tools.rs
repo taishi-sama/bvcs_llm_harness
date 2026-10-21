@@ -34,7 +34,8 @@ impl OpenAiTool {
             function: OpenAiFunction {
                 name: tool.name.clone(),
                 description: tool.description.clone().unwrap_or_default(),
-                parameters: parameters_schema(tool),            },
+                parameters: parameters_schema(tool),
+            },
         }
     }
 }

@@ -23,6 +23,7 @@ use llm_history_model::history::{Entry, MessageContent};
 use serde::Serialize;
 
 pub mod response;
+pub mod stream;
 pub mod tools;
 
 pub use tools::{CompletionTool, FunctionDefinition, tools_to_completions};
@@ -145,15 +146,17 @@ pub fn to_completions_input(
         prompt_cache_key,
     } = &config.kind
     else {
-        return Err(vec![crate::validation::ValidationError::WrongProviderKind {
-            expected: "openai_compatible",
-            actual: config.kind.name(),
-        }]);
+        return Err(vec![
+            crate::validation::ValidationError::WrongProviderKind {
+                expected: "openai_compatible",
+                actual: config.kind.name(),
+            },
+        ]);
     };
 
     let mut messages: Vec<Message> = Vec::new();
 
-    for entry in entries {
+    for (i, entry) in entries.iter().enumerate() {
         match entry {
             Entry::SystemPrompt { content } => messages.push(Message {
                 role: Role::System,
@@ -162,6 +165,12 @@ pub fn to_completions_input(
                 tool_calls: Vec::new(),
                 tool_call_id: None,
             }),
+
+            Entry::Draft { .. } => {
+                return Err(vec![crate::validation::ValidationError::DraftNotFinal {
+                    index: i,
+                }]);
+            }
 
             Entry::UserMessage { content } => messages.push(Message {
                 role: Role::User,
@@ -236,9 +245,9 @@ pub fn to_completions_input(
 
 #[cfg(test)]
 mod tests {
-    use llm_history_model::history::ImageMIME;
     use super::*;
     use crate::model_config::ModelKind;
+    use llm_history_model::history::ImageMIME;
     use llm_history_model::history::{Image, ToolCall as HistoryToolCall, ToolCallResult};
 
     fn config() -> ModelConfig {
@@ -446,6 +455,7 @@ mod tests {
         let cfg = ModelConfig {
             kind: ModelKind::AnthropicCompatible {
                 model_name: "claude".into(),
+                streaming: false,
             },
             tools: Default::default(),
             max_tokens: None,

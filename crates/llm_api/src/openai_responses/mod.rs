@@ -19,6 +19,7 @@
 //!   track provider item ids.
 
 pub mod response;
+pub mod stream;
 pub mod tools;
 
 use crate::model_config::ModelConfig;
@@ -177,9 +178,15 @@ pub fn to_responses_input<'a>(
     let mut items: Vec<InputItem> = Vec::new();
     let mut reasoning_count = 0usize;
 
-    for entry in entries {
+    for (i, entry) in entries.iter().enumerate() {
         match entry {
             Entry::SystemPrompt { content } => instructions = Some(content),
+
+            Entry::Draft { .. } => {
+                return Err(vec![crate::validation::ValidationError::DraftNotFinal {
+                    index: i,
+                }]);
+            }
 
             Entry::UserMessage { content } => items.push(InputItem::Message(MessageItem {
                 role: Role::User,
@@ -237,10 +244,12 @@ pub fn to_responses_input<'a>(
         prompt_cache_key,
     } = &config.kind
     else {
-        return Err(vec![crate::validation::ValidationError::WrongProviderKind {
-            expected: "openai_compatible",
-            actual: config.kind.name(),
-        }]);
+        return Err(vec![
+            crate::validation::ValidationError::WrongProviderKind {
+                expected: "openai_compatible",
+                actual: config.kind.name(),
+            },
+        ]);
     };
     Ok(ResponsesInput {
         prompt_cache_key: prompt_cache_key.clone(),
@@ -255,9 +264,9 @@ pub fn to_responses_input<'a>(
 
 #[cfg(test)]
 mod tests {
-    use llm_history_model::history::ImageMIME;
     use super::*;
     use crate::model_config::ModelKind;
+    use llm_history_model::history::ImageMIME;
     use llm_history_model::history::{Image, MessageContent, ToolCall, ToolCallResult};
     use serde_json::{Value, json};
 
@@ -578,6 +587,7 @@ mod tests {
         let cfg = ModelConfig {
             kind: ModelKind::AnthropicCompatible {
                 model_name: "claude".into(),
+                streaming: false,
             },
             tools: Default::default(),
             max_tokens: None,

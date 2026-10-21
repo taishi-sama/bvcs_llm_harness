@@ -135,7 +135,7 @@ fn join_texts<'a>(texts: impl Iterator<Item = &'a str>) -> String {
 
 impl Reasoning {
     /// Plaintext reasoning: prefers `content[]`, falls back to `summary[]`.
-    fn text(&self) -> String {
+    pub(crate) fn text(&self) -> String {
         if let Some(parts) = &self.content {
             let s = join_texts(parts.iter().map(|p| p.text.as_str()));
             if !s.is_empty() {
@@ -148,7 +148,7 @@ impl Reasoning {
 
 impl OutputMessage {
     /// Visible text produced by the model (`output_text` + `refusal` parts).
-    fn text(&self) -> String {
+    pub(crate) fn text(&self) -> String {
         join_texts(self.content.iter().filter_map(|p| match p {
             OutputContentPart::Text { text } => Some(text.as_str()),
             OutputContentPart::Refusal { refusal } => Some(refusal.as_str()),
@@ -445,11 +445,7 @@ mod tests {
 
         let entries = resp.to_entries();
         assert_eq!(entries.len(), 1);
-        let Entry::ResponseNormal {
-            content,
-            thinking,
-        } = &entries[0]
-        else {
+        let Entry::ResponseNormal { content, thinking } = &entries[0] else {
             panic!("expected ResponseNormal");
         };
         assert_eq!(content, "cannot comply");
@@ -468,17 +464,14 @@ mod tests {
         // The wire `output` never contains the user message; assistant-side
         // items start after the first (user) item. Output-side messages also
         // always carry content as typed parts (never the string shorthand).
-        let assistant_items: Vec<Value> = items
-            .as_array()
-            .unwrap()[1..]
-            .to_vec()
-            .into_iter()
+        let assistant_items: Vec<Value> = items.as_array().unwrap()[1..]
+            .iter()
+            .cloned()
             .map(|mut item| {
-                if item["type"] == "message" {
-                    if let Some(text) = item["content"].as_str().map(str::to_owned) {
-                        item["content"] =
-                            serde_json::json!([{"type": "output_text", "text": text}]);
-                    }
+                if item["type"] == "message"
+                    && let Some(text) = item["content"].as_str().map(str::to_owned)
+                {
+                    item["content"] = serde_json::json!([{"type": "output_text", "text": text}]);
                 }
                 item
             })

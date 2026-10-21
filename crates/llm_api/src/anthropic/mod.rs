@@ -29,6 +29,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 pub mod response;
+pub mod stream;
 pub mod tools;
 
 pub use tools::{AnthropicTool, tools_to_anthropic};
@@ -148,7 +149,8 @@ pub fn to_anthropic_messages<'a>(
 ) -> Result<MessagesInput<'a>, Vec<ValidationError>> {
     validate_entries(entries, config)?;
 
-    let crate::model_config::ModelKind::AnthropicCompatible { model_name } = &config.kind else {
+    let crate::model_config::ModelKind::AnthropicCompatible { model_name, .. } = &config.kind
+    else {
         return Err(vec![ValidationError::WrongProviderKind {
             expected: "anthropic_compatible",
             actual: config.kind.name(),
@@ -166,6 +168,10 @@ pub fn to_anthropic_messages<'a>(
     for (i, entry) in entries.iter().enumerate() {
         match entry {
             Entry::SystemPrompt { content } => system = Some(content),
+
+            Entry::Draft { .. } => {
+                return Err(vec![ValidationError::DraftNotFinal { index: i }]);
+            }
 
             Entry::UserMessage { content } => {
                 let message = match (&content.text, &content.image) {
@@ -284,9 +290,9 @@ pub fn to_anthropic_messages<'a>(
 
 #[cfg(test)]
 mod tests {
-    use llm_history_model::history::ImageMIME;
     use super::*;
     use crate::model_config::ModelKind;
+    use llm_history_model::history::ImageMIME;
     use llm_history_model::history::{
         Image, MessageContent, ToolCall as HistoryToolCall, ToolCallResult,
     };
@@ -295,6 +301,7 @@ mod tests {
         ModelConfig {
             kind: ModelKind::AnthropicCompatible {
                 model_name: "claude-test".into(),
+                streaming: false,
             },
             tools: Default::default(),
             max_tokens: Some(1024),

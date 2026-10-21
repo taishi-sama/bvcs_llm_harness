@@ -130,12 +130,16 @@ mod tests {
     #[test]
     fn thinking_joined_concatenates_all_variants() {
         let thinking = vec![
-            Thinking::Normal { thinking: "a".into() },
+            Thinking::Normal {
+                thinking: "a".into(),
+            },
             Thinking::Signed {
                 thinking: "b".into(),
                 signature: "sig".into(),
             },
-            Thinking::Redacted { thinking: "c".into() },
+            Thinking::Redacted {
+                thinking: "c".into(),
+            },
         ];
         assert_eq!(thinking_joined(&thinking).as_deref(), Some("a\n\nb\n\nc"));
         assert_eq!(thinking_joined(&[]), None);

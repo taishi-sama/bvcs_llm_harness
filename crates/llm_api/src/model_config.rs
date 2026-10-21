@@ -11,6 +11,9 @@ pub enum ModelKind {
     },
     AnthropicCompatible {
         model_name: String,
+        /// Whether to request a server-sent event stream (`stream: true`).
+        #[serde(default)]
+        streaming: bool,
     },
 }
 impl ModelKind {
@@ -24,13 +27,13 @@ impl ModelKind {
     pub fn get_model_name(&self) -> &str {
         match self {
             ModelKind::OpenAICompatible { model_name, .. }
-            | ModelKind::AnthropicCompatible { model_name } => model_name,
+            | ModelKind::AnthropicCompatible { model_name, .. } => model_name,
         }
     }
     pub fn get_streamable(&self) -> bool {
         match self {
-            ModelKind::OpenAICompatible { streaming, .. } => *streaming,
-            ModelKind::AnthropicCompatible { .. } => false,
+            ModelKind::OpenAICompatible { streaming, .. }
+            | ModelKind::AnthropicCompatible { streaming, .. } => *streaming,
         }
     }
 }

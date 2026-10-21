@@ -165,6 +165,7 @@ mod tests {
         ModelConfig {
             kind: ModelKind::AnthropicCompatible {
                 model_name: "claude-test".into(),
+                streaming: false,
             },
             tools: Default::default(),
             max_tokens: Some(2048),
