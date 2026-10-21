@@ -7,29 +7,36 @@
 //! PROVIDER=completions  cargo run -p llm_connector_example  # /v1/chat/completions
 //! PROVIDER=responses    cargo run -p llm_connector_example  # /v1/responses
 //! ```
+//!
+//! `ENDPOINT`, `MODEL`, `API_TOKEN` and `SESSION_ID` override the defaults. A
+//! non-empty `API_TOKEN` is sent as `Authorization: Bearer <token>`, and
+//! `SESSION_ID` is sent as `x-opencode-session` for OpenCode Go routing:
+//!
+//! ```text
+//! ENDPOINT=https://opencode.ai/inference/go/openai/v1/chat/completions \
+//! MODEL=deepseek-v4.1-flash \
+//! API_TOKEN=... \
+//! PROVIDER=completions cargo run -p llm_connector_example
+//! ```
 
 use std::{
     cell::RefCell,
     collections::HashMap,
-    fs,
     io::{self, Write},
 };
 
 use boa_engine::{Context, JsResult, JsValue, NativeFunction, Source};
-use http_body_util::BodyExt as _;
-use hyper::{Request, client::conn::http1};
-use hyper_util::rt::TokioIo;
+use futures_util::StreamExt as _;
 use llm_api::{
     anthropic,
     generic_tool::{ParameterDescription, ParameterType, Tool},
-    model_config::{GlobalConfig, ModelConfig, ModelKind},
+    model_config::{GlobalConfig, ModelConfig, ModelKind, generate_session_id},
     openai_completions, openai_responses,
     stream::{RawStreamBytes, StreamError, StreamEvent, finish_draft_for},
     usage::UsageProvider,
 };
 use llm_history_model::history::{DraftBlock, Entry, MessageContent, ToolCallResult};
 use serde_json::Value;
-use tokio::net::TcpStream;
 
 /// Which server-side streaming API to exercise.
 #[derive(Clone, Copy, Debug)]
@@ -198,21 +205,23 @@ fn tools() -> Vec<Tool> {
                 hashmap
             },
         },
-        Tool {
-            name: "read_file".into(),
-            description: None,
-            parameters: {
-                let mut hashmap = HashMap::new();
-                hashmap.insert(
-                    "file_path".to_string(),
-                    ParameterDescription {
-                        r#type: ParameterType::String,
-                        description: "Path to file on user's PC".into(),
-                    },
-                );
-                hashmap
-            },
-        },
+        // Disabled: arbitrary file reads let the model exfiltrate secrets such
+        // as API tokens from /proc/self/cmdline.
+        // Tool {
+        //     name: "read_file".into(),
+        //     description: None,
+        //     parameters: {
+        //         let mut hashmap = HashMap::new();
+        //         hashmap.insert(
+        //             "file_path".to_string(),
+        //             ParameterDescription {
+        //                 r#type: ParameterType::String,
+        //                 description: "Path to file on user's PC".into(),
+        //             },
+        //         );
+        //         hashmap
+        //     },
+        // },
         Tool {
             name: "start_subagent".into(),
             description: Some(
@@ -274,21 +283,39 @@ fn request_body(
     })
 }
 
+/// Stable identifier for OpenCode Go request routing. `SESSION_ID` overrides
+/// it; otherwise one id is derived once per process so prompt caching stays
+/// effective for the whole conversation.
+fn session_id() -> String {
+    std::env::var("SESSION_ID").unwrap_or_else(|_| generate_session_id())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     let provider = Provider::from_env();
     println!("Provider: {provider:?}");
 
     let model = ModelConfig {
-        kind: provider.kind("qwen3.6-35b-a3b"),
+        kind: provider
+            .kind(&std::env::var("MODEL").unwrap_or_else(|_| "qwen3.6-35b-a3b".to_owned())),
         tools: tools(),
         max_tokens: Some(50000),
     };
     let model = GlobalConfig {
         model_config: model,
-        token: String::new(),
-        endpoint: provider.endpoint().into(),
+        token: std::env::var("API_TOKEN").unwrap_or_default(),
+        endpoint: std::env::var("ENDPOINT").unwrap_or_else(|_| provider.endpoint().into()),
     };
+    println!(
+        "Endpoint: {} (token: {})",
+        model.endpoint,
+        if model.bearer_token().is_some() {
+            "set"
+        } else {
+            "none"
+        }
+    );
+    let session_id = session_id();
 
     let user_prompt = std::env::var("PROMPT")
         .unwrap_or_else(|_| "Hi! List all available tools and try guess what they do.".to_string());
@@ -307,66 +334,46 @@ async fn main() -> Result<(), anyhow::Error> {
         println!("{:?}", i)
     }
 
+    let client = reqwest::Client::new();
+
     loop {
         let body = request_body(provider, &history, &model.model_config)?;
-        let url = model.endpoint.clone().parse::<hyper::Uri>()?;
-        let host = url.host().expect("uri has no host");
-        let port = url.port_u16().unwrap_or(80);
-        let address = format!("{}:{}", host, port);
 
-        // Open a TCP connection to the remote host.
-        let stream = TcpStream::connect(address).await?;
-        let io = TokioIo::new(stream);
+        let mut request = client
+            .post(&model.endpoint)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(reqwest::header::USER_AGENT, "bvcs_llm_harness/0.1")
+            .header("x-opencode-session", &session_id)
+            .body(body);
+        if let Some(token) = model.bearer_token() {
+            request = request.bearer_auth(token);
+        }
 
-        // Drive the HTTP state.
-        let (mut sender, conn) = http1::handshake(io).await?;
-        tokio::task::spawn(async move {
-            if let Err(err) = conn.await {
-                println!("Connection failed: {:?}", err);
-            }
-        });
-
-        let authority = url.authority().unwrap().clone();
-        let req = Request::builder()
-            .uri(url.path())
-            .header(hyper::header::HOST, authority.as_str())
-            .header(hyper::header::CONTENT_TYPE, "application/json")
-            .method("POST")
-            .body(body)?;
-
-        let mut res = sender.send_request(req).await?;
+        let res = request.send().await?;
         println!("Response status: {}", res.status());
         if !res.status().is_success() {
-            let mut body = Vec::new();
-            while let Some(next) = res.frame().await {
-                let frame = next?;
-                if let Some(chunk) = frame.data_ref() {
-                    body.extend_from_slice(chunk);
-                }
-            }
-            anyhow::bail!("HTTP {}: {}", res.status(), String::from_utf8_lossy(&body));
+            anyhow::bail!("HTTP {}: {}", res.status(), res.text().await?);
         }
 
         // Live assistant turn. It stays in the history (as the last entry) while
         // the stream is running and is replaced by finalized entries afterwards.
         history.push(Entry::draft());
         let mut decoder = Decoder::new(provider, model.model_config.kind.usage_provider());
-        while let Some(next) = res.frame().await {
-            let frame = next?;
-            if let Some(chunk) = frame.data_ref() {
-                let blocks = history
-                    .last_mut()
-                    .and_then(|entry| entry.as_draft_mut())
-                    .expect("draft entry is last");
-                for event in decoder.push_bytes(RawStreamBytes::from_slice(chunk), blocks)? {
-                    match event {
-                        StreamEvent::ThinkingDelta(text) | StreamEvent::TextDelta(text) => {
-                            print!("{text}");
-                            io::stdout().flush()?;
-                        }
-                        StreamEvent::Usage(usage) => println!("\nusage: {usage:?}"),
-                        other => println!("\n{other:?}"),
+        let mut stream = res.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            let blocks = history
+                .last_mut()
+                .and_then(|entry| entry.as_draft_mut())
+                .expect("draft entry is last");
+            for event in decoder.push_bytes(RawStreamBytes::from_slice(&chunk), blocks)? {
+                match event {
+                    StreamEvent::ThinkingDelta(text) | StreamEvent::TextDelta(text) => {
+                        print!("{text}");
+                        io::stdout().flush()?;
                     }
+                    StreamEvent::Usage(usage) => println!("\nusage: {usage:?}"),
+                    other => println!("\n{other:?}"),
                 }
             }
         }
@@ -408,22 +415,23 @@ async fn main() -> Result<(), anyhow::Error> {
                         tool_use_id: i.tool_use_id.clone(),
                     });
                 }
-                if i.tool_name == "read_file" {
-                    let v: Value = serde_json::from_str(&i.toolcall_params)?;
-                    let path = v.get("file_path").unwrap().as_str().unwrap();
-                    match fs::read_to_string(path) {
-                        Ok(s) => tool_response.push(ToolCallResult {
-                            result: s,
-                            is_error: false,
-                            tool_use_id: i.tool_use_id.clone(),
-                        }),
-                        Err(e) => tool_response.push(ToolCallResult {
-                            result: e.to_string(),
-                            is_error: true,
-                            tool_use_id: i.tool_use_id.clone(),
-                        }),
-                    }
-                }
+                // Disabled with the tool definition above.
+                // if i.tool_name == "read_file" {
+                //     let v: Value = serde_json::from_str(&i.toolcall_params)?;
+                //     let path = v.get("file_path").unwrap().as_str().unwrap();
+                //     match fs::read_to_string(path) {
+                //         Ok(s) => tool_response.push(ToolCallResult {
+                //             result: s,
+                //             is_error: false,
+                //             tool_use_id: i.tool_use_id.clone(),
+                //         }),
+                //         Err(e) => tool_response.push(ToolCallResult {
+                //             result: e.to_string(),
+                //             is_error: true,
+                //             tool_use_id: i.tool_use_id.clone(),
+                //         }),
+                //     }
+                // }
                 if i.tool_name == "start_subagent" {
                     let v: Value = serde_json::from_str(&i.toolcall_params)?;
                     let prompt = v.get("prompt").unwrap().as_str().unwrap();
@@ -453,7 +461,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 }
                 if !matches!(
                     i.tool_name.as_str(),
-                    "get_weather" | "read_file" | "start_subagent" | "eval_javascript"
+                    "get_weather" | "start_subagent" | "eval_javascript"
                 ) {
                     tool_response.push(ToolCallResult {
                         result: format!("Unknown tool: {}", i.tool_name),

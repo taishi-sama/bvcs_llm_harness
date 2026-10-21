@@ -134,3 +134,84 @@ pub struct GlobalConfig {
     pub token: String,
     pub endpoint: String,
 }
+
+impl GlobalConfig {
+    /// Returns the token for an `Authorization: Bearer <token>` header.
+    ///
+    /// An empty token means "unauthenticated" (for example a local llama.cpp
+    /// server) and yields `None`, so callers can omit the header entirely.
+    pub fn bearer_token(&self) -> Option<&str> {
+        let token = self.token.trim();
+        (!token.is_empty()).then_some(token)
+    }
+}
+
+/// Generates a stable `x-opencode-session` identifier for one conversation:
+/// `ses_` followed by 12 hex characters and 14 base62 characters.
+///
+/// Callers should store the result and reuse it for every request in the
+/// conversation; OpenCode Go uses it for routing and prompt caching.
+pub fn generate_session_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos() as u64)
+        .unwrap_or(0);
+    const BASE62: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    let mut state = nanos | 1;
+    let mut tail = String::with_capacity(14);
+    for _ in 0..14 {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        tail.push(BASE62[(state % BASE62.len() as u64) as usize] as char);
+    }
+    format!("ses_{:012x}{tail}", nanos & 0x0000_ffff_ffff_ffff)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(token: &str) -> GlobalConfig {
+        GlobalConfig {
+            model_config: ModelConfig {
+                kind: ModelKind::OpenAICompatible {
+                    model_name: "model".into(),
+                    streaming: false,
+                    prompt_cache_key: String::new(),
+                    provider: UsageProvider::Other,
+                    include_usage: true,
+                },
+                tools: Vec::new(),
+                max_tokens: None,
+            },
+            token: token.into(),
+            endpoint: "https://example.com/v1/chat/completions".into(),
+        }
+    }
+
+    #[test]
+    fn empty_token_means_no_authorization_header() {
+        assert_eq!(config("").bearer_token(), None);
+        assert_eq!(config("   ").bearer_token(), None);
+    }
+
+    #[test]
+    fn token_is_trimmed_and_returned() {
+        assert_eq!(config("  oc_sk_test  ").bearer_token(), Some("oc_sk_test"));
+    }
+
+    #[test]
+    fn generated_session_ids_have_opencode_shape() {
+        let id = generate_session_id();
+        assert!(id.starts_with("ses_"), "{id}");
+        assert_eq!(id.len(), 4 + 12 + 14, "{id}");
+        let (hex, tail) = id[4..].split_at(12);
+        assert!(
+            hex.chars()
+                .all(|c| c.is_ascii_digit() || matches!(c, 'a'..='f')),
+            "{id}"
+        );
+        assert!(tail.chars().all(|c| c.is_ascii_alphanumeric()), "{id}");
+    }
+}

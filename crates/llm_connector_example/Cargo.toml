@@ -11,7 +11,4 @@ llm_history_model = { path = "../llm_history_model"}
 llm_api = { path = "../llm_api"}
 futures-util = "0.3.34"
 serde_json = "1.0.151"
-hyper = { version = "1.11.0", features = ["full"] }
-hyper-util = { version = "0.1.20", features = ["full"] }
-http-body-util = { version = "0.1.5", features = ["full"] }
 boa_engine = "0.22.0"

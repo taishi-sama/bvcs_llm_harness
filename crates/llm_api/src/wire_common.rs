@@ -23,23 +23,29 @@ const fn parameter_type_str(t: &ParameterType) -> &'static str {
 /// are rejected (`additionalProperties: false`) — matching what OpenAI's
 /// `strict` mode expects.
 pub fn parameters_schema(tool: &Tool) -> Value {
+    // `serde_json` preserves insertion order, so iterate in a stable order.
+    // `Tool.parameters` is a `HashMap`; leaving its iteration order in the
+    // output would reshuffle the tool schema between requests and invalidate
+    // provider prompt caches (the schema is part of the cached prefix).
+    let mut names: Vec<&str> = tool.parameters.keys().map(String::as_str).collect();
+    names.sort_unstable();
+
     let mut properties = Map::new();
-    for (name, param) in &tool.parameters {
+    for name in &names {
+        let param = &tool.parameters[*name];
         properties.insert(
-            name.clone(),
+            (*name).to_owned(),
             serde_json::json!({
                 "type": parameter_type_str(&param.r#type),
                 "description": param.description,
             }),
         );
     }
-    let mut required: Vec<&str> = tool.parameters.keys().map(String::as_str).collect();
-    required.sort_unstable();
 
     serde_json::json!({
         "type": "object",
         "properties": properties,
-        "required": required,
+        "required": names,
         "additionalProperties": false,
     })
 }
@@ -140,6 +146,39 @@ mod tests {
         assert_eq!(schema["required"], serde_json::json!(["city", "days"]));
         assert_eq!(schema["properties"]["city"]["type"], "string");
         assert_eq!(schema["properties"]["days"]["type"], "number");
+    }
+
+    #[test]
+    fn schema_property_order_is_stable() {
+        // `Tool.parameters` is a `HashMap`; the serialized schema must not
+        // inherit its randomized iteration order or prompt caches break.
+        let mut parameters = HashMap::new();
+        for name in ["zulu", "alpha", "mike", "bravo", "yankee", "charlie"] {
+            parameters.insert(
+                name.to_owned(),
+                ParameterDescription {
+                    r#type: ParameterType::String,
+                    description: name.to_owned(),
+                },
+            );
+        }
+        let tool = Tool {
+            name: "many".to_owned(),
+            parameters,
+            description: None,
+        };
+
+        let schema = parameters_schema(&tool);
+        let keys: Vec<&str> = schema["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            ["alpha", "bravo", "charlie", "mike", "yankee", "zulu"]
+        );
     }
 
     #[test]

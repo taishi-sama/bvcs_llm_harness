@@ -10,7 +10,15 @@
 //! PROVIDER=anthropic    cargo run      # http://127.0.0.1:8080/v1/messages (best effort)
 //! ```
 //!
-//! `MODEL` overrides the model name sent to the server.
+//! `MODEL` overrides the model name sent to the server. `ENDPOINT` overrides
+//! the provider URL (for example an HTTPS OpenCode Go endpoint), `API_TOKEN`
+//! is sent as `Authorization: Bearer <token>`, and `SESSION_ID` is sent as
+//! `x-opencode-session` for request routing:
+//!
+//! ```text
+//! ENDPOINT=https://opencode.ai/inference/go/openai/v1/chat/completions \
+//! PROVIDER=completions MODEL=deepseek-v4.1-flash API_TOKEN=... cargo run
+//! ```
 //!
 //! Each conversation is a [`Agent`] component on its own entity. Tabs select
 //! the visible agent while all agents can stream independently.
@@ -23,7 +31,7 @@
 
 use std::{
     collections::{HashMap, VecDeque},
-    env, fs,
+    env,
     sync::mpsc::{self, Receiver},
 };
 
@@ -43,9 +51,7 @@ use bevy::{
 use bevy_brp_extras::BrpExtrasPlugin;
 use bevy_tokio_tasks::{TaskContext, TokioTasksPlugin, TokioTasksRuntime};
 use boa_engine::{Context as JsContext, JsValue, NativeFunction, Source};
-use http_body_util::BodyExt as _;
-use hyper::{Request, client::conn::http1, header};
-use hyper_util::rt::TokioIo;
+use futures_util::StreamExt as _;
 use llm_api::{
     anthropic,
     generic_tool::{ParameterDescription, ParameterType, Tool},
@@ -59,7 +65,7 @@ use llm_history_model::history::{
     DraftBlock, Entry, MessageContent, Thinking, ToolCall, ToolCallResult,
 };
 use serde_json::Value;
-use tokio::{net::TcpStream, sync::watch};
+use tokio::sync::watch;
 
 /// Which server-side streaming API to exercise.
 #[derive(Clone, Copy, Debug)]
@@ -150,6 +156,10 @@ impl JsRuntimes {
             .context
             .eval(Source::from_bytes(code))
             .map_err(|err| format!("JavaScript error: {err}"))?;
+        let _async_result = session
+            .context
+            .run_jobs()
+            .map_err(|err| format!("JavaScript async error: {err}"))?;
         let rendered = value
             .to_string(&mut session.context)
             .map(|text| text.to_std_string_escaped())
@@ -366,8 +376,9 @@ struct Agent {
     current_turn: Option<u64>,
     streaming_text: String,
     streaming_thinking: String,
-    queued_input: VecDeque<String>,
-    inbox: VecDeque<InboxMessage>,
+    /// Messages waiting for the next legal history boundary (after a reply or
+    /// a completed tool-call round), in arrival order.
+    pending_messages: VecDeque<QueuedMessage>,
     /// Last unanswered user message, kept so Retry can resend it after a
     /// failure or cancellation.
     retry_message: Option<String>,
@@ -390,8 +401,7 @@ impl Agent {
             current_turn: None,
             streaming_text: String::new(),
             streaming_thinking: String::new(),
-            queued_input: VecDeque::new(),
-            inbox: VecDeque::new(),
+            pending_messages: VecDeque::new(),
             retry_message: None,
         }
     }
@@ -405,9 +415,12 @@ impl Agent {
     }
 }
 
-struct InboxMessage {
-    from: String,
-    text: String,
+/// A message waiting for the next legal insertion point in an agent's history.
+enum QueuedMessage {
+    /// Typed by the user into this agent's input box.
+    User(String),
+    /// Sent by another agent through `send_message_to_agent`.
+    Agent { from: String, text: String },
 }
 
 /// Entity handles for one agent's UI.
@@ -417,6 +430,8 @@ struct AgentView {
     log: Entity,
     input: Entity,
     status: Entity,
+    /// Fixed-width usage readout (input/output/cached tokens).
+    stats: Entity,
     assistant: Option<AssistantView>,
     scroll_to_bottom: bool,
     /// Whether streaming should keep the transcript pinned to the newest text.
@@ -454,6 +469,25 @@ struct StatusText;
 struct AppConfig {
     provider: Provider,
     model_name: String,
+    endpoint: String,
+    token: String,
+    /// Stable `x-opencode-session` value used for request routing.
+    session_id: String,
+}
+
+impl AppConfig {
+    /// Returns the token for an `Authorization: Bearer <token>` header.
+    fn bearer_token(&self) -> Option<&str> {
+        let token = self.token.trim();
+        (!token.is_empty()).then_some(token)
+    }
+}
+
+/// Stable identifier for OpenCode Go request routing. `SESSION_ID` overrides
+/// it; otherwise one id is derived once per process so prompt caching stays
+/// effective for the whole session.
+fn session_id_from_env() -> String {
+    env::var("SESSION_ID").unwrap_or_else(|_| llm_api::model_config::generate_session_id())
 }
 
 /// Handles for the shared shell that hosts all agents.
@@ -471,6 +505,168 @@ struct ActiveAgent(Option<Entity>);
 #[derive(Resource, Default)]
 struct AgentIndex {
     by_name: HashMap<String, Entity>,
+}
+
+/// Shared in-memory flat filesystem. Every agent reads and writes the same
+/// files, and nothing touches the host filesystem.
+#[derive(Resource, Default)]
+struct VirtualFs {
+    files: HashMap<String, String>,
+}
+
+fn split_virtual_file(content: &str) -> (Vec<String>, bool) {
+    (
+        content.lines().map(str::to_owned).collect(),
+        content.ends_with('\n'),
+    )
+}
+
+impl VirtualFs {
+    /// The virtual filesystem has no directories: a path is a plain file name.
+    fn normalize_path(path: &str) -> Result<String, String> {
+        let path = path.trim();
+        if path.is_empty() {
+            return Err("path must not be empty".to_owned());
+        }
+        if path.contains('/') || path.contains('\\') {
+            return Err(format!(
+                "invalid path `{path}`: the virtual filesystem is flat (no directories)"
+            ));
+        }
+        if path == "." || path == ".." {
+            return Err(format!("invalid file name `{path}`"));
+        }
+        Ok(path.to_owned())
+    }
+
+    fn list(&self) -> String {
+        if self.files.is_empty() {
+            return "Virtual filesystem is empty.".to_owned();
+        }
+
+        let mut names: Vec<&String> = self.files.keys().collect();
+        names.sort_unstable();
+        let mut listing = format!("Files ({}):", names.len());
+        for name in names {
+            let content = &self.files[name];
+            listing.push_str(&format!(
+                "\n{name} - {} bytes, {} line(s)",
+                content.len(),
+                content.lines().count()
+            ));
+        }
+        listing
+    }
+
+    fn read(&self, path: &str) -> Result<String, String> {
+        let path = Self::normalize_path(path)?;
+        self.files
+            .get(&path)
+            .cloned()
+            .ok_or_else(|| format!("No such file: `{path}`. Use fs_write to create it."))
+    }
+
+    fn write(&mut self, path: &str, content: String) -> Result<String, String> {
+        let path = Self::normalize_path(path)?;
+        let lines = content.lines().count();
+        self.files.insert(path.clone(), content);
+        Ok(format!("Wrote `{path}` ({lines} lines)."))
+    }
+
+    fn delete(&mut self, path: &str) -> Result<String, String> {
+        let path = Self::normalize_path(path)?;
+        let content = self
+            .files
+            .remove(&path)
+            .ok_or_else(|| format!("No such file: `{path}`"))?;
+        Ok(format!("Deleted `{path}` ({} bytes).", content.len()))
+    }
+
+    /// Replaces an inclusive, 1-based line range. An empty `content` deletes
+    /// the selected lines.
+    fn edit_lines(
+        &mut self,
+        path: &str,
+        start_line: u64,
+        end_line: u64,
+        content: String,
+    ) -> Result<String, String> {
+        let path = Self::normalize_path(path)?;
+        let original = self
+            .files
+            .get(&path)
+            .cloned()
+            .ok_or_else(|| format!("No such file: `{path}`"))?;
+        let (mut lines, trailing_newline) = split_virtual_file(&original);
+
+        let start = usize::try_from(start_line)
+            .map_err(|_| format!("invalid start_line `{start_line}`"))?;
+        let end =
+            usize::try_from(end_line).map_err(|_| format!("invalid end_line `{end_line}`"))?;
+        if start == 0 {
+            return Err("start_line is 1-based and must be at least 1".to_owned());
+        }
+        if end < start {
+            return Err(format!(
+                "end_line ({end_line}) must be greater than or equal to start_line ({start_line})"
+            ));
+        }
+        if end > lines.len() {
+            return Err(format!(
+                "line range {start_line}-{end_line} is out of bounds; `{path}` has {} line(s)",
+                lines.len()
+            ));
+        }
+
+        let replacement: Vec<String> = if content.is_empty() {
+            Vec::new()
+        } else {
+            content.lines().map(str::to_owned).collect()
+        };
+        lines.splice(start - 1..end, replacement);
+
+        let mut updated = lines.join("\n");
+        if trailing_newline && !updated.is_empty() {
+            updated.push('\n');
+        }
+        let line_count = lines.len();
+        self.files.insert(path.clone(), updated);
+        Ok(format!(
+            "Replaced lines {start_line}-{end_line} in `{path}`; file now has {line_count} line(s)."
+        ))
+    }
+
+    /// Replaces a literal substring only when it occurs exactly once.
+    fn edit_pattern(
+        &mut self,
+        path: &str,
+        pattern: &str,
+        replacement: &str,
+    ) -> Result<String, String> {
+        let path = Self::normalize_path(path)?;
+        if pattern.is_empty() {
+            return Err("pattern must not be empty".to_owned());
+        }
+        let original = self
+            .files
+            .get(&path)
+            .cloned()
+            .ok_or_else(|| format!("No such file: `{path}`"))?;
+
+        match original.matches(pattern).count() {
+            0 => Err(format!("Pattern not found in `{path}`.")),
+            1 => {
+                self.files
+                    .insert(path.clone(), original.replacen(pattern, replacement, 1));
+                Ok(format!(
+                    "Replaced the single match of the pattern in `{path}`."
+                ))
+            }
+            count => Err(format!(
+                "Pattern matches {count} times in `{path}`; refusing to edit because exactly one match is required."
+            )),
+        }
+    }
 }
 
 /// Incremental decoder state keyed by agent entity.
@@ -547,6 +743,9 @@ impl Decoder {
 fn main() {
     let provider = Provider::from_env();
     let model_name = env::var("MODEL").unwrap_or_else(|_| "qwen3.6-35b-a3b".to_owned());
+    let endpoint = env::var("ENDPOINT").unwrap_or_else(|_| provider.endpoint().to_owned());
+    let token = env::var("API_TOKEN").unwrap_or_default();
+    let session_id = session_id_from_env();
 
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -563,9 +762,13 @@ fn main() {
         .insert_resource(AppConfig {
             provider,
             model_name,
+            endpoint,
+            token,
+            session_id,
         })
         .init_resource::<AgentRuntime>()
         .init_resource::<AgentIndex>()
+        .init_resource::<VirtualFs>()
         .init_non_send::<JsRuntimes>()
         .add_message::<StartAgentTurn>()
         .add_message::<NewAgentRequested>()
@@ -590,7 +793,7 @@ fn main() {
                 cancel_agent_turn,
                 retry_agent_turn,
                 submit_input,
-                deliver_inbox_messages,
+                deliver_pending_messages,
                 decode_stream_chunks,
                 handle_stream_events,
                 handle_turn_finished,
@@ -644,7 +847,7 @@ fn setup(mut commands: Commands, config: Res<AppConfig>) {
                     "{} | {} | {}",
                     config.provider.label(),
                     config.model_name,
-                    config.provider.endpoint()
+                    config.endpoint
                 )),
                 TextFont {
                     font_size: FontSize::Px(13.),
@@ -780,6 +983,7 @@ fn create_agent(
         log: panel.log,
         input: panel.input,
         status: panel.status,
+        stats: panel.stats,
         assistant: None,
         scroll_to_bottom: false,
         follow_tail: true,
@@ -800,6 +1004,7 @@ struct PanelEntities {
     log: Entity,
     input: Entity,
     status: Entity,
+    stats: Entity,
 }
 
 fn create_agent_panel(
@@ -966,6 +1171,46 @@ fn create_agent_panel(
             commands.write_message(CancelAgentRequest { agent });
         });
 
+    let scroll_to_bottom = commands
+        .spawn((
+            Button,
+            Node {
+                min_width: px(140.),
+                height: px(28.),
+                flex_shrink: 0.,
+                padding: UiRect::horizontal(px(10.)),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                border: px(1.).all(),
+                border_radius: BorderRadius::all(px(8.)),
+                ..default()
+            },
+            BackgroundColor(Color::srgb(0.13, 0.16, 0.21)),
+            BorderColor::all(Color::srgb(0.30, 0.36, 0.46)),
+            TabIndex(4),
+        ))
+        .with_children(|parent| {
+            parent.spawn((
+                Text::new("Scroll to bottom"),
+                TextFont {
+                    font_size: FontSize::Px(12.),
+                    ..default()
+                },
+                TextColor(Color::srgb(0.82, 0.88, 0.96)),
+            ));
+        })
+        .id();
+
+    commands.entity(scroll_to_bottom).observe(
+        move |_: On<Activate>, mut views: Query<&mut AgentView>| {
+            if let Ok(mut view) = views.get_mut(agent) {
+                // Jump now and keep following new streaming output.
+                view.follow_tail = true;
+                view.scroll_to_bottom = true;
+            }
+        },
+    );
+
     let input_row = commands
         .spawn(Node {
             width: percent(100.),
@@ -989,9 +1234,53 @@ fn create_agent_panel(
         ))
         .id();
 
+    let mut stats = Entity::PLACEHOLDER;
+    let stats_box = commands
+        .spawn((
+            Node {
+                width: px(320.),
+                height: px(28.),
+                flex_shrink: 0.,
+                padding: UiRect::horizontal(px(10.)),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                border: px(1.).all(),
+                border_radius: BorderRadius::all(px(8.)),
+                ..default()
+            },
+            BackgroundColor(Color::srgb(0.10, 0.12, 0.16)),
+            BorderColor::all(Color::srgb(0.22, 0.26, 0.33)),
+        ))
+        .with_children(|parent| {
+            stats = parent
+                .spawn((
+                    Text::new(stats_text(None)),
+                    TextFont {
+                        font_size: FontSize::Px(12.),
+                        ..default()
+                    },
+                    TextColor(Color::srgb(0.62, 0.68, 0.78)),
+                    TextLayout::no_wrap(),
+                ))
+                .id();
+        })
+        .id();
+
+    let footer = commands
+        .spawn(Node {
+            width: percent(100.),
+            flex_direction: FlexDirection::Row,
+            justify_content: JustifyContent::SpaceBetween,
+            align_items: AlignItems::Center,
+            column_gap: px(8.),
+            ..default()
+        })
+        .add_children(&[status, stats_box, scroll_to_bottom])
+        .id();
+
     commands
         .entity(panel)
-        .add_children(&[log, input_row, status]);
+        .add_children(&[log, input_row, footer]);
     commands.entity(panels_root).add_children(&[panel]);
 
     spawn_message_card(
@@ -1002,7 +1291,7 @@ fn create_agent_panel(
         format!(
             "{name} connected to {} at {}. Type a message and press Enter.",
             config.provider.label(),
-            config.provider.endpoint()
+            config.endpoint
         ),
         Color::srgb(0.09, 0.10, 0.13),
     );
@@ -1012,6 +1301,7 @@ fn create_agent_panel(
         log,
         input,
         status,
+        stats,
     }
 }
 
@@ -1368,8 +1658,7 @@ fn cancel_agent_turn(
         // stopping does not immediately start another request. Keep the user
         // text so Retry can resend it.
         agent.retry_message = rollback_pending_turn(&mut agent.history);
-        agent.queued_input.clear();
-        agent.inbox.clear();
+        agent.pending_messages.clear();
         agent.pending = false;
         agent.current_turn = None;
         agent.streaming_text.clear();
@@ -1419,17 +1708,101 @@ fn submit_input(
     // it up in this same frame; if it is busy, the message waits until the next
     // legal history boundary (after a reply or a completed tool-call round).
     input.clear();
-    agent.queued_input.push_back(prompt.to_owned());
+    agent
+        .pending_messages
+        .push_back(QueuedMessage::User(prompt.to_owned()));
 
     let status = if agent.pending {
-        format!("Queued message ({} waiting)", agent.queued_input.len())
+        format!("Queued message ({} waiting)", agent.pending_messages.len())
     } else {
         "Starting request...".to_owned()
     };
     set_text(&mut texts, view.status, status);
 }
 
-fn deliver_inbox_messages(
+/// One queued message rendered for both history and the transcript.
+struct PendingDelivery {
+    text: String,
+    role: String,
+    role_color: Color,
+    background: Color,
+    status: &'static str,
+}
+
+fn take_pending_message(agent: &mut Agent) -> Option<PendingDelivery> {
+    match agent.pending_messages.pop_front()? {
+        QueuedMessage::User(text) => Some(PendingDelivery {
+            text,
+            role: "You".to_owned(),
+            role_color: Color::srgb(0.55, 0.75, 1.0),
+            background: Color::srgb(0.12, 0.17, 0.26),
+            status: "Starting request...",
+        }),
+        QueuedMessage::Agent { from, text } => Some(PendingDelivery {
+            text: format!(
+                "<system_message>[Message from {from}, answer with a tool \"send_message_to_agent\" if you need to reply]\n{text}</system_message>"
+            ),
+            role: format!("From {from}"),
+            role_color: Color::srgb(0.78, 0.64, 1.0),
+            background: Color::srgb(0.17, 0.13, 0.24),
+            status: "Message received; starting request...",
+        }),
+    }
+}
+
+/// Moves waiting messages into `agent.history` at the current legal boundary.
+///
+/// When `all` is set every queued message is flushed (used after tool results,
+/// where the agent is about to continue anyway); otherwise only the oldest
+/// message is delivered so an idle agent answers one message per turn.
+/// Returns how many messages were inserted.
+fn flush_pending_messages(
+    agent: &mut Agent,
+    view: &mut AgentView,
+    commands: &mut Commands,
+    texts: &mut Query<&mut Text>,
+    all: bool,
+) -> usize {
+    let mut combined = Vec::new();
+    let mut status = None;
+
+    while let Some(delivery) = take_pending_message(agent) {
+        spawn_message_card(
+            commands,
+            view.log,
+            &delivery.role,
+            delivery.role_color,
+            delivery.text.clone(),
+            delivery.background,
+        );
+        combined.push(delivery.text);
+        status = Some(delivery.status);
+        if !all {
+            break;
+        }
+    }
+
+    if combined.is_empty() {
+        return 0;
+    }
+
+    // Consecutive user turns are rejected by history validation, so one batch
+    // of pending messages becomes a single user entry in arrival order.
+    agent.history.push(Entry::UserMessage {
+        content: MessageContent {
+            text: Some(combined.join("\n\n")),
+            image: None,
+        },
+    });
+    view.follow_tail = true;
+    view.scroll_to_bottom = true;
+    if let Some(status) = status {
+        set_text(texts, view.status, status);
+    }
+    combined.len()
+}
+
+fn deliver_pending_messages(
     mut agents: Query<(Entity, &mut Agent, &mut AgentView)>,
     mut texts: Query<&mut Text>,
     mut start_turn: MessageWriter<StartAgentTurn>,
@@ -1440,48 +1813,13 @@ fn deliver_inbox_messages(
             continue;
         }
 
-        // Local input has priority over remote messages so a user message
-        // typed while another agent was replying is inserted before that
-        // remote message starts its own turn.
-        let (text, role, role_color, background, status) =
-            if let Some(text) = agent.queued_input.pop_front() {
-                (
-                    text,
-                    "You".to_owned(),
-                    Color::srgb(0.55, 0.75, 1.0),
-                    Color::srgb(0.12, 0.17, 0.26),
-                    "Starting request...",
-                )
-            } else if let Some(message) = agent.inbox.pop_front() {
-                let text = format!(
-                    "<system_message>[Message from {}, answer with a tool]\n{}</system_message>",
-                    message.from, message.text
-                );
-                (
-                    text,
-                    format!("From {}", message.from),
-                    Color::srgb(0.78, 0.64, 1.0),
-                    Color::srgb(0.17, 0.13, 0.24),
-                    "Message received; starting request...",
-                )
-            } else {
-                continue;
-            };
+        if flush_pending_messages(&mut agent, &mut view, &mut commands, &mut texts, false) == 0 {
+            continue;
+        }
 
-        agent.history.push(Entry::UserMessage {
-            content: MessageContent {
-                text: Some(text.clone()),
-                image: None,
-            },
-        });
         agent.pending = true;
         agent.streaming_text.clear();
         agent.streaming_thinking.clear();
-
-        spawn_message_card(&mut commands, view.log, &role, role_color, text, background);
-        view.follow_tail = true;
-        view.scroll_to_bottom = true;
-        set_text(&mut texts, view.status, status);
 
         start_turn.write(StartAgentTurn { agent: entity });
     }
@@ -1497,6 +1835,7 @@ fn start_agent_turn(
     mut runtime: ResMut<AgentRuntime>,
     mut texts: Query<&mut Text>,
     tokio_runtime: Res<TokioTasksRuntime>,
+    app_config: Res<AppConfig>,
     mut commands: Commands,
 ) {
     for request in requests.read() {
@@ -1539,10 +1878,22 @@ fn start_agent_turn(
         set_text(&mut texts, view.status, "Connecting...");
 
         let agent_entity = request.agent;
-        let endpoint = provider.endpoint().to_owned();
+        let endpoint = app_config.endpoint.clone();
+        let token = app_config.bearer_token().map(str::to_owned);
+        let session_id = app_config.session_id.clone();
         let (cancel_tx, cancel_rx) = watch::channel(false);
         tokio_runtime.spawn_background_task(move |ctx| async move {
-            stream_transport(ctx, cancel_rx, agent_entity, turn_id, endpoint, body).await;
+            stream_transport(
+                ctx,
+                cancel_rx,
+                agent_entity,
+                turn_id,
+                endpoint,
+                token,
+                session_id,
+                body,
+            )
+            .await;
         });
 
         runtime.active.insert(
@@ -1748,6 +2099,9 @@ fn handle_stream_events(
             StreamEvent::Completed { .. } => {
                 set_text(&mut texts, view.status, "Finishing...");
             }
+            StreamEvent::Usage(usage) => {
+                set_text(&mut texts, view.stats, stats_text(Some(usage)));
+            }
             _ => {}
         }
     }
@@ -1770,6 +2124,10 @@ fn handle_turn_finished(
         };
         if agent.current_turn != Some(message.turn_id) {
             continue;
+        }
+
+        if message.usage.is_some() {
+            set_text(&mut texts, view.stats, stats_text(message.usage.as_ref()));
         }
 
         let answer = if !agent.streaming_text.is_empty() {
@@ -1820,12 +2178,7 @@ fn handle_turn_finished(
             } else {
                 agent.pending = false;
                 agent.retry_message = None;
-                let usage = usage_summary(message.usage.as_ref());
                 let mut status = String::from("Ready");
-                if !usage.is_empty() {
-                    status.push_str(" | ");
-                    status.push_str(&usage);
-                }
                 if let Some(reason) = message
                     .stop_reason
                     .as_deref()
@@ -1847,6 +2200,7 @@ fn execute_tool_calls(
     mut agents: Query<(&mut Agent, &mut AgentView)>,
     mut index: ResMut<AgentIndex>,
     mut layout: ResMut<AgentLayout>,
+    mut fs: ResMut<VirtualFs>,
     config: Res<AppConfig>,
     mut texts: Query<&mut Text>,
     mut send_agent_message: MessageWriter<SendAgentMessage>,
@@ -1882,6 +2236,7 @@ fn execute_tool_calls(
                     request.agent,
                     &agent.name,
                     &index,
+                    &mut fs,
                     &mut send_agent_message,
                     &mut js_runtimes,
                 ));
@@ -1906,6 +2261,7 @@ fn execute_tool_calls(
         agent
             .history
             .push(Entry::ToolCallResult { tool_call: results });
+
         spawn_message_card(
             &mut commands,
             view.log,
@@ -1916,6 +2272,19 @@ fn execute_tool_calls(
         );
         view.scroll_to_bottom = true;
         set_text(&mut texts, view.status, "Tools finished; continuing...");
+
+        // Force waiting user and cross-agent messages into the history now:
+        // a completed tool round is a legal boundary, and leaving them queued
+        // would delay them until the whole agent loop finishes.
+        let inserted =
+            flush_pending_messages(&mut agent, &mut view, &mut commands, &mut texts, true);
+        if inserted > 0 {
+            set_text(
+                &mut texts,
+                view.status,
+                format!("Inserted {inserted} pending message(s); continuing..."),
+            );
+        }
 
         start_turn.write(StartAgentTurn {
             agent: request.agent,
@@ -1929,7 +2298,7 @@ fn handle_send_agent_message(
 ) {
     for message in messages.read() {
         if let Ok(mut agent) = agents.get_mut(message.target) {
-            agent.inbox.push_back(InboxMessage {
+            agent.pending_messages.push_back(QueuedMessage::Agent {
                 from: message.from.clone(),
                 text: message.message.clone(),
             });
@@ -1980,9 +2349,22 @@ async fn stream_transport(
     agent: Entity,
     turn_id: u64,
     endpoint: String,
+    token: Option<String>,
+    session_id: String,
     body: String,
 ) {
-    if let Err(err) = stream_request(&mut ctx, &mut cancel, agent, turn_id, endpoint, body).await {
+    if let Err(err) = stream_request(
+        &mut ctx,
+        &mut cancel,
+        agent,
+        turn_id,
+        endpoint,
+        token,
+        session_id,
+        body,
+    )
+    .await
+    {
         let message = format!("{err:#}");
         ctx.run_on_main_thread(move |ctx| {
             ctx.world.write_message(StreamFailed {
@@ -1995,82 +2377,59 @@ async fn stream_transport(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn stream_request(
     ctx: &mut TaskContext,
     cancel: &mut watch::Receiver<bool>,
     agent: Entity,
     turn_id: u64,
     endpoint: String,
+    token: Option<String>,
+    session_id: String,
     body: String,
 ) -> Result<(), anyhow::Error> {
-    let url = endpoint.parse::<hyper::Uri>()?;
-    let host = url
-        .host()
-        .ok_or_else(|| anyhow::anyhow!("endpoint has no host"))?;
-    let port = url.port_u16().unwrap_or(80);
-    let address = format!("{host}:{port}");
-
-    let stream = TcpStream::connect(address).await?;
-    let io = TokioIo::new(stream);
-
-    let (mut sender, conn) = http1::handshake(io).await?;
-    tokio::spawn(async move {
-        if let Err(err) = conn.await {
-            eprintln!("connection failed: {err:?}");
-        }
-    });
-
-    let authority = url
-        .authority()
-        .ok_or_else(|| anyhow::anyhow!("endpoint has no authority"))?
-        .clone();
-    let req = Request::builder()
-        .uri(url.path())
-        .header(header::HOST, authority.as_str())
-        .header(header::CONTENT_TYPE, "application/json")
-        .method("POST")
-        .body(body)?;
-
-    let mut res = sender.send_request(req).await?;
-    if !res.status().is_success() {
-        let mut body = Vec::new();
-        while let Some(next) = res.frame().await {
-            let frame = next?;
-            if let Some(chunk) = frame.data_ref() {
-                body.extend_from_slice(chunk);
-            }
-        }
-        anyhow::bail!("HTTP {}: {}", res.status(), String::from_utf8_lossy(&body));
+    let client = reqwest::Client::new();
+    let mut request = client
+        .post(&endpoint)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header(reqwest::header::USER_AGENT, "bvcs_llm_harness/0.1")
+        .header("x-opencode-session", session_id)
+        .body(body);
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
     }
 
+    let res = request.send().await?;
+    if !res.status().is_success() {
+        anyhow::bail!("HTTP {}: {}", res.status(), res.text().await?);
+    }
+
+    let mut stream = res.bytes_stream();
     loop {
         if *cancel.borrow() {
             return Ok(());
         }
 
         let next = tokio::select! {
-            next = res.frame() => next,
+            next = stream.next() => next,
             changed = cancel.changed() => {
                 let _ = changed;
                 return Ok(());
             }
         };
 
-        let Some(next) = next else {
+        let Some(chunk) = next else {
             break;
         };
-        let frame = next?;
-        if let Some(chunk) = frame.data_ref() {
-            let bytes = chunk.to_vec();
-            ctx.run_on_main_thread(move |ctx| {
-                ctx.world.write_message(StreamChunk {
-                    agent,
-                    turn_id,
-                    bytes,
-                });
-            })
-            .await;
-        }
+        let bytes = chunk?.to_vec();
+        ctx.run_on_main_thread(move |ctx| {
+            ctx.world.write_message(StreamChunk {
+                agent,
+                turn_id,
+                bytes,
+            });
+        })
+        .await;
 
         if *cancel.borrow() {
             return Ok(());
@@ -2107,13 +2466,159 @@ fn tools() -> Vec<Tool> {
             )]),
         },
         Tool {
-            name: "read_file".into(),
-            description: Some("Reads a UTF-8 text file from the user's computer.".into()),
+            name: "fs_read".into(),
+            description: Some(
+                "Read a file from the shared virtual flat filesystem. Every LLM Agent sees \
+                 the same files. Paths are plain file names without directories."
+                    .into(),
+            ),
             parameters: HashMap::from([(
-                "file_path".to_owned(),
+                "path".to_owned(),
                 ParameterDescription {
                     r#type: ParameterType::String,
-                    description: "Absolute or relative path to the file".into(),
+                    description: "File name".into(),
+                },
+            )]),
+        },
+        Tool {
+            name: "fs_ls".into(),
+            description: Some(
+                "List files in the shared virtual flat filesystem with their sizes and line \
+                 counts. Every LLM Agent sees the same files."
+                    .into(),
+            ),
+            parameters: HashMap::new(),
+        },
+        Tool {
+            name: "fs_write".into(),
+            description: Some(
+                "Create or overwrite a file in the shared virtual flat filesystem. Every LLM \
+                 Agent sees the same files. Paths are plain file names without directories."
+                    .into(),
+            ),
+            parameters: HashMap::from([
+                (
+                    "path".to_owned(),
+                    ParameterDescription {
+                        r#type: ParameterType::String,
+                        description: "File name".into(),
+                    },
+                ),
+                (
+                    "content".to_owned(),
+                    ParameterDescription {
+                        r#type: ParameterType::String,
+                        description: "Complete new file content".into(),
+                    },
+                ),
+            ]),
+        },
+        Tool {
+            name: "fs_edit_lines".into(),
+            description: Some(
+                "Replace an inclusive, 1-based line range in a shared virtual file. An empty \
+                 content string deletes the selected lines."
+                    .into(),
+            ),
+            parameters: HashMap::from([
+                (
+                    "path".to_owned(),
+                    ParameterDescription {
+                        r#type: ParameterType::String,
+                        description: "File name".into(),
+                    },
+                ),
+                (
+                    "start_line".to_owned(),
+                    ParameterDescription {
+                        r#type: ParameterType::Number,
+                        description: "First line to replace (1-based)".into(),
+                    },
+                ),
+                (
+                    "end_line".to_owned(),
+                    ParameterDescription {
+                        r#type: ParameterType::Number,
+                        description: "Last line to replace (inclusive)".into(),
+                    },
+                ),
+                (
+                    "content".to_owned(),
+                    ParameterDescription {
+                        r#type: ParameterType::String,
+                        description: "Replacement text; may contain newlines".into(),
+                    },
+                ),
+            ]),
+        },
+        Tool {
+            name: "fs_edit_pattern".into(),
+            description: Some(
+                "Replace a literal substring in a shared virtual file. Fails unless the \
+                 pattern occurs exactly once, so ambiguous edits cannot happen."
+                    .into(),
+            ),
+            parameters: HashMap::from([
+                (
+                    "path".to_owned(),
+                    ParameterDescription {
+                        r#type: ParameterType::String,
+                        description: "File name".into(),
+                    },
+                ),
+                (
+                    "pattern".to_owned(),
+                    ParameterDescription {
+                        r#type: ParameterType::String,
+                        description: "Literal text to find".into(),
+                    },
+                ),
+                (
+                    "replacement".to_owned(),
+                    ParameterDescription {
+                        r#type: ParameterType::String,
+                        description: "Replacement text (may be empty)".into(),
+                    },
+                ),
+            ]),
+        },
+        Tool {
+            name: "fs_delete".into(),
+            description: Some("Delete a file from the shared virtual flat filesystem.".into()),
+            parameters: HashMap::from([(
+                "path".to_owned(),
+                ParameterDescription {
+                    r#type: ParameterType::String,
+                    description: "File name".into(),
+                },
+            )]),
+        },
+        // Disabled: `read_file` lets the model read process command lines
+        // (for example /proc/self/cmdline) and exfiltrate API tokens.
+        // Tool {
+        //     name: "read_file".into(),
+        //     description: Some("Reads a UTF-8 text file from the user's computer.".into()),
+        //     parameters: HashMap::from([(
+        //         "file_path".to_owned(),
+        //         ParameterDescription {
+        //             r#type: ParameterType::String,
+        //             description: "Absolute or relative path to the file".into(),
+        //         },
+        //     )]),
+        // },
+        Tool {
+            name: "run_javascript".into(),
+            description: Some(
+                "Read a JavaScript file from the shared virtual filesystem and execute it in \
+                 this agent's persistent Boa context. Returns printed output (print/console.log) \
+                 followed by the last expression value. Variables and globals persist across runs."
+                    .into(),
+            ),
+            parameters: HashMap::from([(
+                "file".to_owned(),
+                ParameterDescription {
+                    r#type: ParameterType::String,
+                    description: "Virtual file name containing JavaScript source".into(),
                 },
             )]),
         },
@@ -2193,6 +2698,7 @@ fn execute_tool_call(
     source_entity: Entity,
     source_agent: &str,
     index: &AgentIndex,
+    fs: &mut VirtualFs,
     send_agent_message: &mut MessageWriter<SendAgentMessage>,
     js_runtimes: &mut JsRuntimes,
 ) -> ToolCallResult {
@@ -2203,15 +2709,89 @@ fn execute_tool_call(
             Some(city) => (format!("{city}: 30 degrees Celsius"), false),
             None => ("missing required string parameter `city`".to_owned(), true),
         },
-        "read_file" => match arguments.get("file_path").and_then(Value::as_str) {
-            Some(path) => match fs::read_to_string(path) {
-                Ok(contents) => (contents, false),
-                Err(err) => (err.to_string(), true),
+        "fs_read" => match arguments.get("path").and_then(Value::as_str) {
+            Some(path) => match fs.read(path) {
+                Ok(content) => (content, false),
+                Err(err) => (err, true),
             },
-            None => (
-                "missing required string parameter `file_path`".to_owned(),
+            None => ("missing required string parameter `path`".to_owned(), true),
+        },
+        "fs_ls" => (fs.list(), false),
+        "fs_write" => match (
+            arguments.get("path").and_then(Value::as_str),
+            arguments.get("content").and_then(Value::as_str),
+        ) {
+            (Some(path), Some(content)) => match fs.write(path, content.to_owned()) {
+                Ok(message) => (message, false),
+                Err(err) => (err, true),
+            },
+            _ => (
+                "missing required string parameters `path` and `content`".to_owned(),
                 true,
             ),
+        },
+        "fs_edit_lines" => match (
+            arguments.get("path").and_then(Value::as_str),
+            arguments.get("start_line").and_then(Value::as_u64),
+            arguments.get("end_line").and_then(Value::as_u64),
+            arguments.get("content").and_then(Value::as_str),
+        ) {
+            (Some(path), Some(start), Some(end), Some(content)) => {
+                match fs.edit_lines(path, start, end, content.to_owned()) {
+                    Ok(message) => (message, false),
+                    Err(err) => (err, true),
+                }
+            }
+            _ => (
+                "missing required parameters `path`, `start_line`, `end_line`, `content`"
+                    .to_owned(),
+                true,
+            ),
+        },
+        "fs_edit_pattern" => match (
+            arguments.get("path").and_then(Value::as_str),
+            arguments.get("pattern").and_then(Value::as_str),
+            arguments.get("replacement").and_then(Value::as_str),
+        ) {
+            (Some(path), Some(pattern), Some(replacement)) => {
+                match fs.edit_pattern(path, pattern, replacement) {
+                    Ok(message) => (message, false),
+                    Err(err) => (err, true),
+                }
+            }
+            _ => (
+                "missing required string parameters `path`, `pattern`, `replacement`".to_owned(),
+                true,
+            ),
+        },
+        "fs_delete" => match arguments.get("path").and_then(Value::as_str) {
+            Some(path) => match fs.delete(path) {
+                Ok(message) => (message, false),
+                Err(err) => (err, true),
+            },
+            None => ("missing required string parameter `path`".to_owned(), true),
+        },
+        // Disabled together with the tool definition above: arbitrary file
+        // reads leak secrets such as tokens from /proc/self/cmdline.
+        // "read_file" => match arguments.get("file_path").and_then(Value::as_str) {
+        //     Some(path) => match fs::read_to_string(path) {
+        //         Ok(contents) => (contents, false),
+        //         Err(err) => (err.to_string(), true),
+        //     },
+        //     None => (
+        //         "missing required string parameter `file_path`".to_owned(),
+        //         true,
+        //     ),
+        // },
+        "run_javascript" => match arguments.get("file").and_then(Value::as_str) {
+            Some(file) => match fs.read(file) {
+                Ok(source) => match js_runtimes.eval(source_entity, &source) {
+                    Ok(output) => (output, false),
+                    Err(err) => (err, true),
+                },
+                Err(err) => (err, true),
+            },
+            None => ("missing required string parameter `file`".to_owned(), true),
         },
         "eval_javascript" => match arguments.get("code").and_then(Value::as_str) {
             Some(code) => match js_runtimes.eval(source_entity, code) {
@@ -2265,7 +2845,12 @@ fn execute_tool_call(
                             from: source_agent.to_owned(),
                             message: message.to_owned(),
                         });
-                        (format!("Queued message for `{target_name}`."), false)
+                        (
+                            format!(
+                                "Queued message for `{target_name}`. Continue your task or end turn to await reply."
+                            ),
+                            false,
+                        )
                     } else {
                         let mut names = index.by_name.keys().cloned().collect::<Vec<_>>();
                         names.sort();
@@ -2393,28 +2978,17 @@ fn set_display(nodes: &mut Query<&mut Node>, entity: Entity, display: Display) {
     }
 }
 
-fn usage_summary(usage: Option<&Usage>) -> String {
-    let Some(usage) = usage.filter(|usage| !usage.is_empty()) else {
-        return String::new();
-    };
-
-    let mut parts = Vec::new();
-    if let Some(input) = usage.input_tokens {
-        parts.push(format!("in {input}"));
-    }
-    if let Some(output) = usage.output_tokens {
-        parts.push(format!("out {output}"));
-    }
-    if let Some(cached) = usage.cached_input_tokens {
-        parts.push(format!("cached {cached}"));
-    }
-    if parts.is_empty()
-        && let Some(total) = usage.total()
-    {
-        parts.push(format!("total {total}"));
+/// Renders the fixed-width usage readout. Fields are padded so the text does
+/// not shift as token counts grow (Bevy's default font is monospaced).
+fn stats_text(usage: Option<&Usage>) -> String {
+    fn field(value: Option<u64>) -> String {
+        value.map_or_else(|| "-".to_owned(), |value| value.to_string())
     }
 
-    parts.join(", ")
+    let input = field(usage.and_then(|usage| usage.input_tokens));
+    let output = field(usage.and_then(|usage| usage.output_tokens));
+    let cached = field(usage.and_then(|usage| usage.cached_input_tokens));
+    format!("in {input:>6}   out {output:>6}   cached {cached:>6}")
 }
 
 fn auto_scroll(
@@ -2456,6 +3030,93 @@ mod tests {
                 .unwrap(),
             "hello\n82"
         );
+    }
+
+    #[test]
+    fn stats_readout_keeps_fixed_width() {
+        let usage = Usage {
+            input_tokens: Some(534),
+            output_tokens: Some(3),
+            cached_input_tokens: Some(512),
+            ..Default::default()
+        };
+        assert_eq!(
+            stats_text(Some(&usage)),
+            "in    534   out      3   cached    512"
+        );
+        assert_eq!(stats_text(None), "in      -   out      -   cached      -");
+    }
+
+    #[test]
+    fn virtual_fs_supports_shared_file_lifecycle() {
+        let mut fs = VirtualFs::default();
+        assert!(fs.read("notes.txt").is_err());
+
+        fs.write("notes.txt", "one\ntwo\nthree\n".into()).unwrap();
+        assert_eq!(fs.read("notes.txt").unwrap(), "one\ntwo\nthree\n");
+        let listing = fs.list();
+        assert!(listing.contains("Files (1):"), "{listing}");
+        assert!(
+            listing.contains("notes.txt - 14 bytes, 3 line(s)"),
+            "{listing}"
+        );
+
+        fs.edit_lines("notes.txt", 2, 2, "TWO".into()).unwrap();
+        assert_eq!(fs.read("notes.txt").unwrap(), "one\nTWO\nthree\n");
+
+        fs.edit_pattern("notes.txt", "TWO", "two").unwrap();
+        assert_eq!(fs.read("notes.txt").unwrap(), "one\ntwo\nthree\n");
+
+        fs.delete("notes.txt").unwrap();
+        assert!(fs.read("notes.txt").is_err());
+        assert_eq!(fs.list(), "Virtual filesystem is empty.");
+    }
+
+    #[test]
+    fn virtual_fs_edits_are_unambiguous_and_bounded() {
+        let mut fs = VirtualFs::default();
+        fs.write("a.txt", "same same\nsecond".into()).unwrap();
+
+        let err = fs
+            .edit_pattern("a.txt", "same", "other")
+            .expect_err("ambiguous pattern must fail");
+        assert!(err.contains("2 times"), "{err}");
+
+        assert!(fs.edit_pattern("a.txt", "missing", "x").is_err());
+        assert!(fs.edit_lines("a.txt", 0, 1, "x".into()).is_err());
+        assert!(fs.edit_lines("a.txt", 3, 3, "x".into()).is_err());
+        assert!(fs.edit_lines("a.txt", 2, 1, "x".into()).is_err());
+        assert!(fs.write("dir/file.txt", "x".into()).is_err());
+        assert!(fs.read("..").is_err());
+    }
+
+    #[test]
+    fn virtual_fs_line_edits_can_delete_lines() {
+        let mut fs = VirtualFs::default();
+        fs.write("d.txt", "a\nb\nc".into()).unwrap();
+
+        fs.edit_lines("d.txt", 2, 2, String::new()).unwrap();
+        assert_eq!(fs.read("d.txt").unwrap(), "a\nc");
+
+        fs.edit_lines("d.txt", 1, 2, String::new()).unwrap();
+        assert_eq!(fs.read("d.txt").unwrap(), "");
+    }
+
+    #[test]
+    fn virtual_javascript_file_runs_in_agent_context() {
+        let mut fs = VirtualFs::default();
+        fs.write(
+            "script.js",
+            "var from_file = 6 * 7; print('ran'); from_file".into(),
+        )
+        .unwrap();
+        let source = fs.read("script.js").unwrap();
+
+        let mut runtimes = JsRuntimes::default();
+        let agent = Entity::PLACEHOLDER;
+        assert_eq!(runtimes.eval(agent, &source).unwrap(), "ran\n42");
+        // The file runs in the same persistent context as eval_javascript.
+        assert_eq!(runtimes.eval(agent, "from_file").unwrap(), "42");
     }
 
     #[test]

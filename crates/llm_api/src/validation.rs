@@ -61,6 +61,9 @@ pub enum ValidationError {
     /// A system/environment message cannot be inserted while tool calls are
     /// still waiting for results.
     SystemMessageDuringToolCall { index: usize },
+    /// A user message cannot be inserted while tool calls are still waiting
+    /// for results.
+    UserMessageDuringToolCall { index: usize },
     /// The configured provider cannot represent an in-conversation system
     /// message (Anthropic with `SystemMessagePolicy::Reject`).
     SystemMessageUnsupported { index: usize },
@@ -111,13 +114,17 @@ const fn kind_name(k: Kind) -> &'static str {
 }
 
 /// Legal turn structure once grouped the way wire APIs require:
-/// Start -> User, User -> Assistant, Assistant -> User | Results, Results -> Assistant | Results
+/// Start -> User, User -> Assistant, Assistant -> User | Results,
+/// Results -> Assistant | Results | User
 fn transition_ok(from: Option<Kind>, to: Kind) -> bool {
     match from {
         None => to == Kind::UserMsg,
         Some(Kind::UserMsg) => matches!(to, Kind::Assistant),
         Some(Kind::Assistant) => matches!(to, Kind::UserMsg | Kind::Results),
-        Some(Kind::Results) => matches!(to, Kind::Assistant | Kind::Results),
+        // A user message may follow a completed tool-result batch. Anthropic
+        // folds it into the same user turn; Chat Completions and Responses
+        // send it immediately after the tool outputs.
+        Some(Kind::Results) => matches!(to, Kind::Assistant | Kind::Results | Kind::UserMsg),
         // Drafts never reach this check (they are rejected and skipped), but
         // keep the transition permissive so an earlier draft cannot cascade
         // into unrelated transition errors.
@@ -225,7 +232,10 @@ fn check_provider_rules(
 ///
 /// Enforced rules:
 /// - at most one [`Entry::SystemPrompt`], at index 0
-/// - strict alternation `User -> Assistant -> Results* -> Assistant ...`, starting with user
+/// - strict alternation `User -> Assistant -> Results* -> (User | Assistant)`,
+///   starting with user; a user turn may follow a completed tool-result batch
+///   (Anthropic folds it into the same turn, OpenAI sends it after the tool
+///   messages)
 /// - [`Entry::SystemMessage`] is a non-turn entry: it may appear between turns
 ///   but not while tool calls are waiting for results
 /// - non-empty user messages (text or image) and non-empty assistant responses
@@ -295,6 +305,11 @@ pub fn validate_entries(
             Entry::SystemMessage { .. } => unreachable!("handled above"),
             Entry::Draft { .. } => unreachable!("handled above"),
             Entry::UserMessage { content } => {
+                // Placing a user turn between a tool call and its results would
+                // break the call/result pairing on the wire.
+                if !pending.is_empty() {
+                    errors.push(ValidationError::UserMessageDuringToolCall { index: i });
+                }
                 let has_text = content.text.as_ref().is_some_and(|t| !t.is_empty());
                 if !has_text && content.image.is_none() {
                     errors.push(ValidationError::EmptyUserMessage { index: i });
@@ -476,6 +491,34 @@ mod tests {
         ];
         assert_eq!(validate_entries(&h, &openai_config()), Ok(()));
         assert_eq!(validate_entries(&h, &anthropic_config()), Ok(()));
+    }
+
+    #[test]
+    fn accepts_user_message_after_tool_results() {
+        // The harness inserts queued user/agent messages at tool boundaries.
+        let h = vec![
+            text_user("weather?"),
+            tool_call("call_1"),
+            tool_result("call_1"),
+            text_user("also check Oslo tomorrow"),
+            assistant_text("Done."),
+        ];
+        assert_eq!(validate_entries(&h, &openai_config()), Ok(()));
+        assert_eq!(validate_entries(&h, &anthropic_config()), Ok(()));
+    }
+
+    #[test]
+    fn rejects_user_message_before_tool_results() {
+        let h = vec![
+            text_user("q"),
+            tool_call("c1"),
+            text_user("interrupt"),
+            tool_result("c1"),
+        ];
+        assert!(matches!(
+            validate_entries(&h, &openai_config()),
+            Err(e) if e.contains(&ValidationError::UserMessageDuringToolCall { index: 2 })
+        ));
     }
 
     #[test]

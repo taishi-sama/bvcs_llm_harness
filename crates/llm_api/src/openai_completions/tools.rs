@@ -23,16 +23,16 @@ pub struct FunctionDefinition {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// JSON Schema object describing the arguments.
-    #[serde(skip_serializing_if = "Value::is_null")]
+    ///
+    /// Always serialized, even for tools without arguments: Chat Completions
+    /// servers (including OpenCode Go) reject a function whose definition has
+    /// no `parameters` field.
     pub parameters: Value,
 }
 
-/// A tool with no parameters yields `Value::Null` so it is omitted (the spec
-/// treats that as an empty parameter list).
+/// A tool with no parameters still gets an empty object schema because the
+/// field is required on the wire.
 fn parameters_schema(tool: &Tool) -> Value {
-    if tool.parameters.is_empty() {
-        return Value::Null;
-    }
     crate::wire_common::parameters_schema(tool)
 }
 
@@ -92,7 +92,7 @@ mod tests {
     }
 
     #[test]
-    fn omits_description_when_absent() {
+    fn no_argument_tools_still_include_parameters() {
         let wire = tools_to_completions(&[Tool {
             name: "t".into(),
             parameters: HashMap::new(),
@@ -100,7 +100,15 @@ mod tests {
         }]);
         let value = serde_json::to_value(&wire[0]).unwrap();
         assert!(value["function"].get("description").is_none());
-        assert!(value["function"].get("parameters").is_none());
+        assert_eq!(
+            value["function"]["parameters"],
+            serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": false
+            })
+        );
     }
 
     #[test]

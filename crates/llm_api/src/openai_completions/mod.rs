@@ -609,6 +609,35 @@ mod tests {
     }
 
     #[test]
+    fn user_message_after_tool_result_is_serialized_in_order() {
+        let v = serialize(&[
+            text_user("q"),
+            Entry::ResponseToolCall {
+                blocks: Vec::new(),
+                tool_call: vec![HistoryToolCall {
+                    tool_name: "a".into(),
+                    toolcall_params: "{}".into(),
+                    tool_use_id: "c1".into(),
+                }],
+            },
+            Entry::ToolCallResult {
+                tool_call: vec![ToolCallResult {
+                    result: "r".into(),
+                    is_error: false,
+                    tool_use_id: "c1".into(),
+                }],
+            },
+            text_user("more"),
+            Entry::response_text("ok"),
+        ]);
+
+        assert_eq!(v["messages"][2]["role"], "tool");
+        assert_eq!(v["messages"][2]["tool_call_id"], "c1");
+        assert_eq!(v["messages"][3]["role"], "user");
+        assert_eq!(v["messages"][3]["content"], "more");
+    }
+
+    #[test]
     fn streaming_requests_include_usage() {
         let v = serde_json::to_value(
             to_completions_input(&[text_user("hi")], &streaming_config(true))

@@ -262,6 +262,35 @@ pub fn to_anthropic_messages<'a>(
             },
 
             Entry::UserMessage { content } => {
+                // A user message directly after tool results belongs to the
+                // same user turn on the Messages API. Tool results must stay
+                // first, so append text/image blocks to the existing turn.
+                if let Some(Message {
+                    role: Role::User,
+                    content: Content::Blocks(existing),
+                }) = messages.last_mut()
+                    && !existing.is_empty()
+                    && existing
+                        .iter()
+                        .all(|block| matches!(block, Block::ToolResult { .. }))
+                {
+                    if let Some(text) = &content.text
+                        && !text.is_empty()
+                    {
+                        existing.push(Block::Text { text: text.clone() });
+                    }
+                    if let Some(img) = &content.image {
+                        existing.push(Block::Image {
+                            source: ImageSource {
+                                kind: "base64",
+                                media_type: anthropic_media_type_str(&img.mime),
+                                data: img.base64.clone(),
+                            },
+                        });
+                    }
+                    continue;
+                }
+
                 let message = match (&content.text, &content.image) {
                     (Some(text), None) => Message {
                         role: Role::User,
@@ -510,6 +539,41 @@ mod tests {
                 {"type": "redacted_thinking", "data": "opaque"},
                 {"type": "text", "text": "calling now"},
                 {"type": "tool_use", "id": "c1", "name": "a", "input": {}}
+            ])
+        );
+    }
+
+    #[test]
+    fn user_text_after_tool_result_merges_into_same_turn() {
+        let v = serialize(&[
+            text_user("price?"),
+            Entry::ResponseToolCall {
+                blocks: Vec::new(),
+                tool_call: vec![HistoryToolCall {
+                    tool_name: "get_stock_price".into(),
+                    toolcall_params: "{}".into(),
+                    tool_use_id: "c1".into(),
+                }],
+            },
+            Entry::ToolCallResult {
+                tool_call: vec![ToolCallResult {
+                    result: "r".into(),
+                    is_error: false,
+                    tool_use_id: "c1".into(),
+                }],
+            },
+            text_user("and tomorrow?"),
+            Entry::response_text("ok"),
+        ]);
+
+        let messages = v["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(
+            messages[2]["content"],
+            serde_json::json!([
+                {"type": "tool_result", "tool_use_id": "c1", "content": "r", "is_error": false},
+                {"type": "text", "text": "and tomorrow?"}
             ])
         );
     }

@@ -14,11 +14,10 @@ anyhow = "1.0.104"
 bevy = { version = "0.20.0", features = ["system_font_discovery"]}
 boa_engine = "0.22.0"
 bevy-tokio-tasks = "0.20.0"
-http-body-util = "0.1.5"
-hyper = { version = "1.12.0", features = ["client", "http1"] }
-hyper-util = { version = "0.1.20", features = ["tokio"] }
+futures-util = "0.3.34"
 llm_api = { path = "crates/llm_api" }
 llm_history_model = { path = "crates/llm_history_model" }
 bevy_brp_extras = "0.23.0"
+reqwest = { version = "0.13.4", features = ["json", "stream"] }
 serde_json = "1.0.151"
 tokio = { version = "1.54.0", features = ["full"] }

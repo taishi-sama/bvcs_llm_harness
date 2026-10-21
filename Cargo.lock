@@ -2343,11 +2343,10 @@ dependencies = [
  "bevy-tokio-tasks",
  "bevy_brp_extras",
  "boa_engine",
- "http-body-util",
- "hyper",
- "hyper-util",
+ "futures-util",
  "llm_api",
  "llm_history_model",
+ "reqwest",
  "serde_json",
  "tokio",
 ]
@@ -3634,7 +3633,6 @@ dependencies = [
  "http",
  "http-body",
  "pin-project-lite",
- "tokio",
 ]
 
 [[package]]
@@ -3706,7 +3704,6 @@ dependencies = [
  "socket2",
  "system-configuration",
  "tokio",
- "tower-layer",
  "tower-service",
  "tracing",
  "windows-registry",
@@ -4296,9 +4293,6 @@ dependencies = [
  "anyhow",
  "boa_engine",
  "futures-util",
- "http-body-util",
- "hyper",
- "hyper-util",
  "llm_api",
  "llm_history_model",
  "reqwest",
