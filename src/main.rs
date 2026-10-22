@@ -35,7 +35,8 @@
 //! `run_javascript` are submitted to the interpreter and completed later.
 //!
 //! Module layout:
-//! - `agent`: agent state, UI, tool rounds, and per-agent systems
+//! - `agent`: agent state, turn loop, tool rounds, and per-agent systems
+//! - `transcript`: chat-log cards, collapsible text, bounded window, scrolling
 //! - `messages`: the Bevy message protocol shared by all layers
 //! - `transport`: HTTP streaming and provider request bodies
 //! - `tools`: tool definitions, routing, and execution
@@ -50,6 +51,7 @@ mod js_runtime;
 mod messages;
 mod shell;
 mod tools;
+mod transcript;
 mod transport;
 mod virtual_fs;
 
@@ -67,6 +69,7 @@ use agent::*;
 use config::{AppConfig, Provider, session_id_from_env};
 use messages::*;
 use shell::setup;
+use transcript::{TextCollapseConfig, auto_scroll, refresh_transcripts};
 use virtual_fs::{VfsStateDir, VirtualFs};
 
 fn main() {
@@ -153,7 +156,6 @@ fn main() {
                     start_agent_turn,
                     handle_agent_failed,
                     refresh_transcripts,
-                    trim_transcripts,
                     rename_agents,
                     remove_agents,
                 )

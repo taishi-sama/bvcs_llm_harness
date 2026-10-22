@@ -89,13 +89,13 @@ impl VirtualFs {
         self.read_range(path, None, None)
     }
 
-    /// Read a byte range. `seek` and `len` are byte offsets into the UTF-8
+    /// Read a byte range. `offset` and `limit` are byte offsets into the UTF-8
     /// contents; omitted bounds read from the start / to the end.
     pub(crate) fn read_range(
         &self,
         path: &str,
-        seek: Option<u64>,
-        len: Option<u64>,
+        offset: Option<u64>,
+        limit: Option<u64>,
     ) -> Result<String, String> {
         let path = Self::normalize_path(path)?;
         let content = self
@@ -103,31 +103,31 @@ impl VirtualFs {
             .get(&path)
             .ok_or_else(|| format!("No such file: `{path}`. Use fs_write to create it."))?;
 
-        let start = usize::try_from(seek.unwrap_or(0))
-            .map_err(|_| "`seek` is too large for this platform".to_owned())?;
+        let start = usize::try_from(offset.unwrap_or(0))
+            .map_err(|_| "`offset` is too large for this platform".to_owned())?;
         if start > content.len() {
             return Err(format!(
-                "`seek` ({start}) is past the end of `{path}` ({} bytes)",
+                "`offset` ({start}) is past the end of `{path}` ({} bytes)",
                 content.len()
             ));
         }
         if !content.is_char_boundary(start) {
             return Err(format!(
-                "`seek` ({start}) is not on a UTF-8 character boundary in `{path}`"
+                "`offset` ({start}) is not on a UTF-8 character boundary in `{path}`"
             ));
         }
 
-        let end = match len {
-            Some(len) => {
-                let len = usize::try_from(len)
-                    .map_err(|_| "`len` is too large for this platform".to_owned())?;
-                start.saturating_add(len).min(content.len())
+        let end = match limit {
+            Some(limit) => {
+                let limit = usize::try_from(limit)
+                    .map_err(|_| "`limit` is too large for this platform".to_owned())?;
+                start.saturating_add(limit).min(content.len())
             }
             None => content.len(),
         };
         if !content.is_char_boundary(end) {
             return Err(format!(
-                "`seek` + `len` ends at byte {end}, which is not on a UTF-8 character boundary in `{path}`"
+                "`offset` + `limit` ends at byte {end}, which is not on a UTF-8 character boundary in `{path}`"
             ));
         }
 

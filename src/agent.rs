@@ -1,4 +1,7 @@
-//! Agent state, UI, and per-agent systems.
+//! Agent state, turn loop, tool rounds, and per-agent systems.
+//!
+//! Chat-log rendering, cards, collapsibles, and scrolling live in
+//! [`crate::transcript`].
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -7,13 +10,11 @@ use std::{
 };
 
 use bevy::{
-    input::mouse::MouseScrollUnit,
-    input_focus::{FocusCause, InputFocus, tab_navigation::TabIndex},
+    input_focus::{FocusCause, InputFocus},
     log::error,
-    picking::events::{PointerClick, PointerScroll},
     prelude::*,
-    text::{EditableText, TextCursorStyle},
-    ui_widgets::{Activate, Button, TextInput},
+    text::EditableText,
+    ui_widgets::Activate,
 };
 use bevy_tokio_tasks::TokioTasksRuntime;
 use llm_api::{
@@ -22,11 +23,8 @@ use llm_api::{
     openai_completions, openai_responses,
     stream::{RawStreamBytes, StreamEvent, finish_draft_for},
     usage::{Usage, UsageProvider},
-    wire_common::thinking_joined,
 };
-use llm_history_model::history::{
-    DraftBlock, Entry, MessageContent, Thinking, ToolCall, ToolCallResult,
-};
+use llm_history_model::history::{DraftBlock, Entry, MessageContent, ToolCall, ToolCallResult};
 use serde_json::Value;
 use tokio::sync::watch;
 
@@ -35,12 +33,19 @@ use crate::{
     js_runtime::{HostCommand, HostRequest, JsChannels, JsEvent, JsRuntimeHandle},
     messages::*,
     tools::{ToolTarget, background_setting, classify_tool_call, execute_tool, interpreter_task},
+    transcript::{
+        AgentTab, AgentView, CollapsibleText, RetryAgentButton, TextCollapseConfig,
+        TranscriptAnchor, begin_live_assistant, create_agent_panel, create_agent_tab,
+        ensure_live_assistant, render_transcript, response_display_text, response_thinking_text,
+        set_collapsible_text, set_display, set_text, stats_text,
+    },
     transport::{request_body, stream_transport},
     virtual_fs::VirtualFs,
 };
 
-/// Keep the rendered transcript bounded even when the conversation keeps growing.
-const MAX_TRANSCRIPT_CARDS: usize = 120;
+#[cfg(test)]
+use crate::transcript::{AssistantView, TranscriptCard, TranscriptLog};
+
 /// Prevent accidental runaway agent spawning from exhausting UI/VRAM.
 pub(crate) const MAX_AGENTS: usize = 64;
 
@@ -90,32 +95,6 @@ impl Default for BackgroundPolicy {
             auto_after: (millis > 0).then(|| Duration::from_millis(millis)),
         }
     }
-}
-
-/// Truncation limits for long reasoning and tool-call bodies. A body collapses
-/// when it exceeds either limit.
-#[derive(Resource, Clone, Debug)]
-pub(crate) struct TextCollapseConfig {
-    pub(crate) max_chars: usize,
-    pub(crate) max_lines: usize,
-}
-
-impl Default for TextCollapseConfig {
-    fn default() -> Self {
-        const DEFAULT_CHARS: usize = 1_000;
-        const DEFAULT_LINES: usize = 10;
-        Self {
-            max_chars: env_limit("COLLAPSE_MAX_CHARS").unwrap_or(DEFAULT_CHARS),
-            max_lines: env_limit("COLLAPSE_MAX_LINES").unwrap_or(DEFAULT_LINES),
-        }
-    }
-}
-
-fn env_limit(name: &str) -> Option<usize> {
-    env::var(name)
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
 }
 
 /// Tracks tool rounds that are waiting for one or more JS contexts.
@@ -223,7 +202,7 @@ pub(crate) struct Agent {
 }
 
 impl Agent {
-    fn new(name: String, provider: Provider, model_name: String) -> Self {
+    pub(crate) fn new(name: String, provider: Provider, model_name: String) -> Self {
         Self {
             name: name.clone(),
             provider,
@@ -260,6 +239,33 @@ impl Agent {
     pub(crate) fn history(&self) -> &[Entry] {
         &self.history
     }
+
+    /// Text received so far for the in-flight response.
+    pub(crate) fn streaming_text(&self) -> &str {
+        &self.streaming_text
+    }
+
+    /// Reasoning received so far for the in-flight response.
+    pub(crate) fn streaming_thinking(&self) -> &str {
+        &self.streaming_thinking
+    }
+
+    /// Whether a request is currently streaming or waiting for tools.
+    pub(crate) fn has_active_turn(&self) -> bool {
+        self.current_turn.is_some()
+    }
+
+    /// Append a history entry from display-layer tests.
+    #[cfg(test)]
+    pub(crate) fn push_entry_for_test(&mut self, entry: Entry) {
+        self.history.push(entry);
+    }
+
+    /// Pretend a response is in flight from display-layer tests.
+    #[cfg(test)]
+    pub(crate) fn mark_active_turn_for_test(&mut self) {
+        self.current_turn = Some(1);
+    }
 }
 
 /// A message waiting for the next legal insertion point in an agent's history.
@@ -276,240 +282,6 @@ pub(crate) enum QueuedMessage {
         result: String,
         is_error: bool,
     },
-}
-
-/// Entity handles for one agent's UI.
-#[derive(Component)]
-pub(crate) struct AgentView {
-    panel: Entity,
-    log: Entity,
-    input: Entity,
-    status: Entity,
-    /// Fixed-width usage readout (input/output/cached tokens).
-    stats: Entity,
-    tab_label: Entity,
-    assistant: Option<AssistantView>,
-    /// Whether the transcript cards for this agent are currently spawned.
-    transcript_visible: bool,
-    /// Number of history entries the current transcript reflects.
-    rendered_entries: usize,
-    scroll_to_bottom: bool,
-    /// Whether streaming should keep the transcript pinned to the newest text.
-    /// Cleared when the user scrolls away from the bottom.
-    follow_tail: bool,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct AssistantView {
-    card: Entity,
-    thinking_container: Entity,
-    thinking_body: Entity,
-    answer_body: Entity,
-}
-
-/// The visible agent tab for [`Agent`].
-#[derive(Component)]
-pub(crate) struct AgentTab {
-    agent: Entity,
-}
-
-/// Retry button belonging to one agent.
-#[derive(Component)]
-pub(crate) struct RetryAgentButton {
-    agent: Entity,
-}
-
-/// Destructive button that removes the agent it belongs to.
-#[derive(Component)]
-pub(crate) struct KillAgentButton {
-    agent: Entity,
-}
-
-#[derive(Component)]
-pub(crate) struct MessageBody;
-
-#[derive(Component)]
-pub(crate) struct StatusText;
-
-/// The scroll container that owns one agent's transcript cards.
-#[derive(Component)]
-pub(crate) struct TranscriptLog;
-
-/// A removable transcript card root.
-#[derive(Component)]
-pub(crate) struct TranscriptCard;
-
-/// How a collapsed body chooses the text it keeps visible.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CollapseMode {
-    /// Show the leading lines (used for tool output).
-    Head,
-    /// Show the leading and trailing lines (used for live reasoning, so the
-    /// newest reasoning stays visible while it streams in).
-    HeadAndTail,
-}
-
-/// A text body that collapses behind a "Show more" header when it exceeds the
-/// configured character or line limit.
-#[derive(Component)]
-pub(crate) struct CollapsibleText {
-    full: String,
-    collapsed: bool,
-    max_chars: usize,
-    max_lines: usize,
-    mode: CollapseMode,
-    /// Text entity in the header that shows the expand/collapse affordance.
-    hint: Entity,
-}
-
-impl CollapsibleText {
-    fn new(full: String, config: &TextCollapseConfig, mode: CollapseMode, hint: Entity) -> Self {
-        Self {
-            full,
-            collapsed: true,
-            max_chars: config.max_chars,
-            max_lines: config.max_lines,
-            mode,
-            hint,
-        }
-    }
-
-    fn exceeds_limit(&self) -> bool {
-        self.full.chars().count() > self.max_chars || self.full.lines().count() > self.max_lines
-    }
-
-    /// Text that should currently be rendered. Long text starts truncated and
-    /// is only shown in full after the user expands it.
-    fn visible_text(&self) -> String {
-        if self.collapsed && self.exceeds_limit() {
-            match self.mode {
-                CollapseMode::Head => collapsed_text(&self.full, self.max_chars, self.max_lines),
-                CollapseMode::HeadAndTail => {
-                    collapsed_head_tail_text(&self.full, self.max_chars, self.max_lines)
-                }
-            }
-        } else {
-            self.full.clone()
-        }
-    }
-
-    fn hint_text(&self) -> String {
-        if !self.exceeds_limit() {
-            return String::new();
-        }
-        if self.collapsed {
-            format!(
-                "Show more ({} chars, {} lines)",
-                self.full.chars().count(),
-                self.full.lines().count()
-            )
-        } else {
-            "Show less".to_owned()
-        }
-    }
-}
-
-/// Clickable header that toggles the [`CollapsibleText`] stored on `body`.
-#[derive(Component)]
-pub(crate) struct CollapsibleToggle {
-    body: Entity,
-}
-
-/// Keep the first `max_lines` lines and then at most `max_chars` characters.
-fn collapsed_text(full: &str, max_chars: usize, max_lines: usize) -> String {
-    let line_limited = full.lines().take(max_lines).collect::<Vec<_>>().join("\n");
-    let truncated = line_limited.chars().take(max_chars).collect::<String>();
-    let hidden = full
-        .chars()
-        .count()
-        .saturating_sub(truncated.chars().count());
-    if hidden == 0 {
-        truncated
-    } else {
-        format!("{truncated}\n... ({hidden} more characters)")
-    }
-}
-
-/// Show the first half and the last half of the line budget, with an ellipsis
-/// between them. Each side also gets half of the character budget, so the
-/// collapsed block stays compact even when lines are very long.
-fn collapsed_head_tail_text(full: &str, max_chars: usize, max_lines: usize) -> String {
-    const SEPARATOR: &str = "\n...\n";
-    let lines = full.lines().collect::<Vec<_>>();
-
-    if lines.len() <= max_lines {
-        // Only the character limit was exceeded. Split the single block into
-        // leading and trailing character windows instead.
-        return head_tail_chars(full, max_chars, SEPARATOR);
-    }
-
-    let head_lines = (max_lines / 2).max(1);
-    let tail_lines = max_lines.saturating_sub(head_lines).max(1);
-    let head_end = head_lines.min(lines.len());
-    let tail_start = lines.len().saturating_sub(tail_lines).max(head_end);
-    let head = lines[..head_end].join("\n");
-    let tail = lines[tail_start..].join("\n");
-
-    let budget = max_chars.saturating_sub(SEPARATOR.chars().count());
-    let head_budget = budget / 2;
-    let tail_budget = budget - head_budget;
-    let head = head.chars().take(head_budget).collect::<String>();
-    let tail = tail
-        .chars()
-        .rev()
-        .take(tail_budget)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<String>();
-
-    format!("{head}{SEPARATOR}{tail}")
-}
-
-fn head_tail_chars(full: &str, max_chars: usize, separator: &str) -> String {
-    let budget = max_chars.saturating_sub(separator.chars().count());
-    let head_budget = budget / 2;
-    let tail_budget = budget - head_budget;
-    let head = full.chars().take(head_budget).collect::<String>();
-    let tail = full
-        .chars()
-        .rev()
-        .take(tail_budget)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<String>();
-    format!("{head}{separator}{tail}")
-}
-
-/// Toggles a collapsible body when its header is clicked. Pointer events bubble
-/// from the header's text children, so `click.entity` is the header entity.
-fn toggle_collapsible(
-    click: On<PointerClick>,
-    toggles: Query<&CollapsibleToggle>,
-    mut bodies: Query<&mut CollapsibleText>,
-    mut texts: Query<&mut Text>,
-) {
-    let Ok(toggle) = toggles.get(click.entity) else {
-        return;
-    };
-    let Ok(mut body) = bodies.get_mut(toggle.body) else {
-        return;
-    };
-    if !body.exceeds_limit() {
-        return;
-    }
-
-    body.collapsed = !body.collapsed;
-    let visible = body.visible_text();
-    let hint = body.hint_text();
-    let hint_entity = body.hint;
-    if let Ok(mut text) = texts.get_mut(toggle.body) {
-        text.0 = visible;
-    }
-    if let Ok(mut text) = texts.get_mut(hint_entity) {
-        text.0 = hint;
-    }
 }
 
 /// Handles for the shared shell that hosts all agents.
@@ -650,7 +422,8 @@ pub(crate) fn create_agent(
         transcript_visible: false,
         rendered_entries: 0,
         scroll_to_bottom: false,
-        follow_tail: true,
+        scroll_to_top: false,
+        anchor: TranscriptAnchor::FollowTail,
     });
 
     // Select this tab when clicked.
@@ -661,865 +434,6 @@ pub(crate) fn create_agent(
         });
 
     agent_entity
-}
-
-pub(crate) struct PanelEntities {
-    panel: Entity,
-    log: Entity,
-    input: Entity,
-    status: Entity,
-    stats: Entity,
-}
-
-pub(crate) fn create_agent_panel(
-    commands: &mut Commands,
-    panels_root: Entity,
-    agent: Entity,
-) -> PanelEntities {
-    let panel = commands
-        .spawn((
-            Node {
-                width: percent(100.),
-                height: percent(100.),
-                min_height: px(0.),
-                display: Display::None,
-                flex_direction: FlexDirection::Column,
-                row_gap: px(12.),
-                ..default()
-            },
-            Visibility::Hidden,
-        ))
-        .id();
-
-    let log = commands
-        .spawn((
-            Node {
-                width: percent(100.),
-                flex_basis: px(0.),
-                flex_grow: 1.,
-                min_height: px(0.),
-                flex_direction: FlexDirection::Column,
-                row_gap: px(10.),
-                padding: px(4.).all(),
-                overflow: Overflow::scroll_y(),
-                ..default()
-            },
-            TranscriptLog,
-        ))
-        .id();
-
-    // Manual scrolling. The observer is attached to the scroll container so
-    // wheel events that hit child message cards bubble up to it.
-    commands.entity(log).observe(
-        move |on_scroll: On<PointerScroll>,
-              mut logs: Query<(&mut ScrollPosition, &ComputedNode)>,
-              mut views: Query<&mut AgentView>| {
-            let Ok((mut scroll_position, computed)) = logs.get_mut(on_scroll.entity) else {
-                return;
-            };
-
-            let dy = match on_scroll.unit {
-                MouseScrollUnit::Line => on_scroll.y * 20.,
-                MouseScrollUnit::Pixel => on_scroll.y,
-            };
-            let max_offset = ((computed.content_size().y - computed.size().y).max(0.))
-                * computed.inverse_scale_factor();
-            let next = (scroll_position.y - dy).clamp(0., max_offset);
-            scroll_position.y = next;
-
-            if let Ok(mut view) = views.get_mut(agent) {
-                view.follow_tail = next >= max_offset - 1.;
-                view.scroll_to_bottom = false;
-            }
-        },
-    );
-
-    let input = commands
-        .spawn((
-            Node {
-                flex_grow: 1.,
-                flex_basis: px(0.),
-                min_width: px(0.),
-                min_height: px(46.),
-                padding: px(12.).all(),
-                border: px(2.).all(),
-                border_radius: BorderRadius::all(px(10.)),
-                align_items: AlignItems::Center,
-                ..default()
-            },
-            TextInput,
-            EditableText {
-                visible_lines: Some(1.),
-                allow_newlines: false,
-                ..default()
-            },
-            TextLayout::no_wrap(),
-            TextFont {
-                font_size: FontSize::Px(18.),
-                ..default()
-            },
-            TextCursorStyle::default(),
-            BackgroundColor(Color::srgb(0.10, 0.115, 0.15)),
-            BorderColor::all(Color::srgb(0.24, 0.28, 0.36)),
-            TabIndex(1),
-        ))
-        .id();
-
-    let retry = commands
-        .spawn((
-            Button,
-            RetryAgentButton { agent },
-            Node {
-                min_width: px(82.),
-                height: px(46.),
-                padding: UiRect::horizontal(px(14.)),
-                justify_content: JustifyContent::Center,
-                align_items: AlignItems::Center,
-                border: px(2.).all(),
-                border_radius: BorderRadius::all(px(10.)),
-                ..default()
-            },
-            BackgroundColor(Color::srgb(0.11, 0.12, 0.14)),
-            BorderColor::all(Color::srgb(0.22, 0.25, 0.30)),
-            TabIndex(2),
-        ))
-        .with_children(|parent| {
-            parent.spawn((
-                Text::new("Retry"),
-                TextFont {
-                    font_size: FontSize::Px(16.),
-                    ..default()
-                },
-                TextColor(Color::srgb(0.82, 0.88, 0.96)),
-            ));
-        })
-        .id();
-
-    commands
-        .entity(retry)
-        .observe(move |_: On<Activate>, mut commands: Commands| {
-            commands.write_message(RetryAgentTurn { agent });
-        });
-
-    let stop = commands
-        .spawn((
-            Button,
-            Node {
-                min_width: px(82.),
-                height: px(46.),
-                padding: UiRect::horizontal(px(14.)),
-                justify_content: JustifyContent::Center,
-                align_items: AlignItems::Center,
-                border: px(2.).all(),
-                border_radius: BorderRadius::all(px(10.)),
-                ..default()
-            },
-            BackgroundColor(Color::srgb(0.22, 0.10, 0.11)),
-            BorderColor::all(Color::srgb(0.55, 0.25, 0.27)),
-            TabIndex(3),
-        ))
-        .with_children(|parent| {
-            parent.spawn((
-                Text::new("Stop"),
-                TextFont {
-                    font_size: FontSize::Px(16.),
-                    ..default()
-                },
-                TextColor(Color::srgb(0.98, 0.82, 0.82)),
-            ));
-        })
-        .id();
-
-    commands
-        .entity(stop)
-        .observe(move |_: On<Activate>, mut commands: Commands| {
-            commands.write_message(CancelAgentRequest { agent });
-        });
-
-    let kill = commands
-        .spawn((
-            Button,
-            KillAgentButton { agent },
-            Node {
-                min_width: px(82.),
-                height: px(46.),
-                padding: UiRect::horizontal(px(14.)),
-                justify_content: JustifyContent::Center,
-                align_items: AlignItems::Center,
-                border: px(2.).all(),
-                border_radius: BorderRadius::all(px(10.)),
-                ..default()
-            },
-            BackgroundColor(Color::srgb(0.30, 0.07, 0.08)),
-            BorderColor::all(Color::srgb(0.72, 0.20, 0.22)),
-            TabIndex(5),
-        ))
-        .with_children(|parent| {
-            parent.spawn((
-                Text::new("Kill"),
-                TextFont {
-                    font_size: FontSize::Px(16.),
-                    ..default()
-                },
-                TextColor(Color::srgb(1.0, 0.78, 0.78)),
-            ));
-        })
-        .id();
-
-    commands.entity(kill).observe(
-        |activate: On<Activate>, buttons: Query<&KillAgentButton>, mut commands: Commands| {
-            if let Ok(button) = buttons.get(activate.entity) {
-                commands.write_message(RemoveAgentRequest {
-                    agent: button.agent,
-                });
-            }
-        },
-    );
-
-    let scroll_to_bottom = commands
-        .spawn((
-            Button,
-            Node {
-                min_width: px(140.),
-                height: px(28.),
-                flex_shrink: 0.,
-                padding: UiRect::horizontal(px(10.)),
-                justify_content: JustifyContent::Center,
-                align_items: AlignItems::Center,
-                border: px(1.).all(),
-                border_radius: BorderRadius::all(px(8.)),
-                ..default()
-            },
-            BackgroundColor(Color::srgb(0.13, 0.16, 0.21)),
-            BorderColor::all(Color::srgb(0.30, 0.36, 0.46)),
-            TabIndex(4),
-        ))
-        .with_children(|parent| {
-            parent.spawn((
-                Text::new("Scroll to bottom"),
-                TextFont {
-                    font_size: FontSize::Px(12.),
-                    ..default()
-                },
-                TextColor(Color::srgb(0.82, 0.88, 0.96)),
-            ));
-        })
-        .id();
-
-    commands.entity(scroll_to_bottom).observe(
-        move |_: On<Activate>, mut views: Query<&mut AgentView>| {
-            if let Ok(mut view) = views.get_mut(agent) {
-                // Jump now and keep following new streaming output.
-                view.follow_tail = true;
-                view.scroll_to_bottom = true;
-            }
-        },
-    );
-
-    let input_row = commands
-        .spawn(Node {
-            width: percent(100.),
-            flex_direction: FlexDirection::Row,
-            align_items: AlignItems::Center,
-            column_gap: px(8.),
-            ..default()
-        })
-        .add_children(&[input, retry, stop, kill])
-        .id();
-
-    let status = commands
-        .spawn((
-            Text::new("Ready"),
-            TextFont {
-                font_size: FontSize::Px(13.),
-                ..default()
-            },
-            TextColor(Color::srgb(0.55, 0.60, 0.70)),
-            StatusText,
-        ))
-        .id();
-
-    let mut stats = Entity::PLACEHOLDER;
-    let stats_box = commands
-        .spawn((
-            Node {
-                width: px(320.),
-                height: px(28.),
-                flex_shrink: 0.,
-                padding: UiRect::horizontal(px(10.)),
-                justify_content: JustifyContent::Center,
-                align_items: AlignItems::Center,
-                border: px(1.).all(),
-                border_radius: BorderRadius::all(px(8.)),
-                ..default()
-            },
-            BackgroundColor(Color::srgb(0.10, 0.12, 0.16)),
-            BorderColor::all(Color::srgb(0.22, 0.26, 0.33)),
-        ))
-        .with_children(|parent| {
-            stats = parent
-                .spawn((
-                    Text::new(stats_text(None)),
-                    TextFont {
-                        font_size: FontSize::Px(12.),
-                        ..default()
-                    },
-                    TextColor(Color::srgb(0.62, 0.68, 0.78)),
-                    TextLayout::no_wrap(),
-                ))
-                .id();
-        })
-        .id();
-
-    let footer = commands
-        .spawn(Node {
-            width: percent(100.),
-            flex_direction: FlexDirection::Row,
-            justify_content: JustifyContent::SpaceBetween,
-            align_items: AlignItems::Center,
-            column_gap: px(8.),
-            ..default()
-        })
-        .add_children(&[status, stats_box, scroll_to_bottom])
-        .id();
-
-    commands
-        .entity(panel)
-        .add_children(&[log, input_row, footer]);
-    commands.entity(panels_root).add_children(&[panel]);
-
-    PanelEntities {
-        panel,
-        log,
-        input,
-        status,
-        stats,
-    }
-}
-
-pub(crate) fn create_agent_tab(
-    commands: &mut Commands,
-    tabs: Entity,
-    agent: Entity,
-    name: &str,
-    tab_index: i32,
-) -> (Entity, Entity) {
-    let mut label = Entity::PLACEHOLDER;
-    let tab = commands
-        .spawn((
-            Button,
-            AgentTab { agent },
-            Node {
-                min_width: px(84.),
-                height: px(34.),
-                padding: UiRect::horizontal(px(14.)),
-                justify_content: JustifyContent::Center,
-                align_items: AlignItems::Center,
-                border: px(1.).all(),
-                border_radius: BorderRadius::all(px(8.)),
-                ..default()
-            },
-            BackgroundColor(Color::srgb(0.12, 0.14, 0.18)),
-            BorderColor::all(Color::srgb(0.24, 0.28, 0.36)),
-            TabIndex(tab_index),
-        ))
-        .with_children(|parent| {
-            label = parent
-                .spawn((
-                    Text::new(name.to_owned()),
-                    TextFont {
-                        font_size: FontSize::Px(14.),
-                        ..default()
-                    },
-                    TextColor(Color::srgb(0.82, 0.87, 0.95)),
-                ))
-                .id();
-        })
-        .id();
-
-    commands.entity(tabs).add_children(&[tab]);
-    (tab, label)
-}
-
-/// Header and body entities for a collapsible text block.
-struct CollapsibleParts {
-    header: Entity,
-    body: Entity,
-}
-
-/// Spawn a text block with a clickable header. The body starts collapsed when
-/// its contents exceed the configured limit.
-#[allow(clippy::too_many_arguments)]
-fn spawn_collapsible_text(
-    commands: &mut Commands,
-    label: &str,
-    label_font_size: f32,
-    label_color: Color,
-    text: String,
-    font_size: f32,
-    text_color: Color,
-    mode: CollapseMode,
-    collapse: &TextCollapseConfig,
-) -> CollapsibleParts {
-    let mut hint = Entity::PLACEHOLDER;
-    let header = commands
-        .spawn((
-            Node {
-                width: percent(100.),
-                flex_direction: FlexDirection::Row,
-                justify_content: JustifyContent::SpaceBetween,
-                align_items: AlignItems::Center,
-                column_gap: px(8.),
-                ..default()
-            },
-            CollapsibleToggle {
-                body: Entity::PLACEHOLDER,
-            },
-        ))
-        .with_children(|parent| {
-            parent.spawn((
-                Text::new(label.to_owned()),
-                TextFont {
-                    font_size: FontSize::Px(label_font_size),
-                    ..default()
-                },
-                TextColor(label_color),
-            ));
-            hint = parent
-                .spawn((
-                    Text::new(""),
-                    TextFont {
-                        font_size: FontSize::Px(12.),
-                        ..default()
-                    },
-                    TextColor(Color::srgb(0.55, 0.75, 1.0)),
-                    TextLayout::no_wrap(),
-                ))
-                .id();
-        })
-        .id();
-
-    let state = CollapsibleText::new(text, collapse, mode, hint);
-    let hint_text = state.hint_text();
-    let visible = state.visible_text();
-    let body = commands
-        .spawn((
-            Text::new(visible),
-            TextFont {
-                font_size: FontSize::Px(font_size),
-                ..default()
-            },
-            TextColor(text_color),
-            TextLayout {
-                linebreak: LineBreak::WordOrCharacter,
-                ..default()
-            },
-            Node {
-                width: percent(100.),
-                ..default()
-            },
-            state,
-        ))
-        .id();
-
-    commands.entity(hint).insert(Text::new(hint_text));
-    commands
-        .entity(header)
-        .insert(CollapsibleToggle { body })
-        .observe(toggle_collapsible);
-
-    CollapsibleParts { header, body }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn spawn_message_card(
-    commands: &mut Commands,
-    log: Entity,
-    role: &str,
-    role_color: Color,
-    text: String,
-    background: Color,
-    collapsible: bool,
-    collapse: &TextCollapseConfig,
-) -> Entity {
-    let card = commands
-        .spawn((
-            Node {
-                width: percent(100.),
-                flex_direction: FlexDirection::Column,
-                row_gap: px(4.),
-                padding: px(12.).all(),
-                border_radius: BorderRadius::all(px(10.)),
-                ..default()
-            },
-            BackgroundColor(background),
-            TranscriptCard,
-        ))
-        .id();
-
-    let body = if collapsible {
-        let parts = spawn_collapsible_text(
-            commands,
-            role,
-            13.,
-            role_color,
-            text,
-            18.,
-            Color::srgb(0.90, 0.92, 0.96),
-            CollapseMode::Head,
-            collapse,
-        );
-        commands
-            .entity(card)
-            .add_children(&[parts.header, parts.body]);
-        parts.body
-    } else {
-        let mut body = Entity::PLACEHOLDER;
-        commands.entity(card).with_children(|parent| {
-            parent.spawn((
-                Text::new(role),
-                TextFont {
-                    font_size: FontSize::Px(13.),
-                    ..default()
-                },
-                TextColor(role_color),
-            ));
-            body = parent
-                .spawn((
-                    Text::new(text),
-                    TextFont {
-                        font_size: FontSize::Px(18.),
-                        ..default()
-                    },
-                    TextColor(Color::srgb(0.90, 0.92, 0.96)),
-                    TextLayout {
-                        linebreak: LineBreak::WordOrCharacter,
-                        ..default()
-                    },
-                    Node {
-                        width: percent(100.),
-                        ..default()
-                    },
-                    MessageBody,
-                ))
-                .id();
-        });
-        body
-    };
-
-    commands.entity(log).add_children(&[card]);
-    body
-}
-
-pub(crate) fn spawn_assistant_card(
-    commands: &mut Commands,
-    log: Entity,
-    text: &str,
-    thinking: Option<&str>,
-    collapse: &TextCollapseConfig,
-) -> AssistantView {
-    let card = commands
-        .spawn((
-            Node {
-                width: percent(100.),
-                flex_direction: FlexDirection::Column,
-                row_gap: px(8.),
-                padding: px(12.).all(),
-                border_radius: BorderRadius::all(px(10.)),
-                ..default()
-            },
-            BackgroundColor(Color::srgb(0.10, 0.115, 0.15)),
-            TranscriptCard,
-        ))
-        .id();
-
-    let role = commands
-        .spawn((
-            Text::new("Assistant"),
-            TextFont {
-                font_size: FontSize::Px(13.),
-                ..default()
-            },
-            TextColor(Color::srgb(0.55, 0.85, 0.70)),
-        ))
-        .id();
-
-    let thinking_container = commands
-        .spawn(Node {
-            width: percent(100.),
-            display: if thinking.is_some() {
-                Display::Flex
-            } else {
-                Display::None
-            },
-            flex_direction: FlexDirection::Column,
-            row_gap: px(3.),
-            padding: px(9.).all(),
-            border_radius: BorderRadius::all(px(7.)),
-            ..default()
-        })
-        .insert(BackgroundColor(Color::srgb(0.085, 0.095, 0.125)))
-        .id();
-
-    let thinking_parts = spawn_collapsible_text(
-        commands,
-        "Thinking",
-        12.,
-        Color::srgb(0.62, 0.66, 0.76),
-        thinking.map(str::to_owned).unwrap_or_default(),
-        15.,
-        Color::srgb(0.70, 0.74, 0.82),
-        CollapseMode::HeadAndTail,
-        collapse,
-    );
-
-    let answer = if !text.is_empty() {
-        text.to_owned()
-    } else if thinking.is_some() {
-        "".to_owned()
-    } else {
-        "(empty response)".to_owned()
-    };
-
-    let answer_body = commands
-        .spawn((
-            Text::new(answer),
-            TextFont {
-                font_size: FontSize::Px(18.),
-                ..default()
-            },
-            TextColor(Color::srgb(0.90, 0.92, 0.96)),
-            TextLayout {
-                linebreak: LineBreak::WordOrCharacter,
-                ..default()
-            },
-            Node {
-                width: percent(100.),
-                ..default()
-            },
-            MessageBody,
-        ))
-        .id();
-
-    commands
-        .entity(thinking_container)
-        .add_children(&[thinking_parts.header, thinking_parts.body]);
-    commands
-        .entity(card)
-        .add_children(&[role, thinking_container, answer_body]);
-    commands.entity(log).add_children(&[card]);
-
-    AssistantView {
-        card,
-        thinking_container,
-        thinking_body: thinking_parts.body,
-        answer_body,
-    }
-}
-
-fn tool_result_summary(results: &[ToolCallResult], tool_names: &HashMap<String, String>) -> String {
-    results
-        .iter()
-        .map(|result| {
-            let name = tool_names
-                .get(&result.tool_use_id)
-                .map(String::as_str)
-                .unwrap_or(&result.tool_use_id);
-            format!(
-                "{name} [{}]\n{}",
-                if result.is_error { "error" } else { "ok" },
-                result.result
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n")
-}
-
-fn tool_name_map(history: &[Entry]) -> HashMap<String, String> {
-    let mut names = HashMap::new();
-    for entry in history {
-        if let Entry::ResponseToolCall { tool_call, .. } = entry {
-            for call in tool_call {
-                names.insert(call.tool_use_id.clone(), call.tool_name.clone());
-            }
-        }
-    }
-    names
-}
-
-fn render_entry(
-    commands: &mut Commands,
-    log: Entity,
-    entry: &Entry,
-    tool_names: &HashMap<String, String>,
-    collapse: &TextCollapseConfig,
-) {
-    match entry {
-        Entry::SystemPrompt { content } | Entry::SystemMessage { content, .. } => {
-            spawn_message_card(
-                commands,
-                log,
-                "System",
-                Color::srgb(0.55, 0.60, 0.70),
-                content.clone(),
-                Color::srgb(0.09, 0.10, 0.13),
-                false,
-                collapse,
-            );
-        }
-        Entry::UserMessage { content } => {
-            if let Some(text) = &content.text {
-                spawn_message_card(
-                    commands,
-                    log,
-                    "You",
-                    Color::srgb(0.55, 0.75, 1.0),
-                    text.clone(),
-                    Color::srgb(0.12, 0.17, 0.26),
-                    false,
-                    collapse,
-                );
-            }
-        }
-        Entry::Response { .. } | Entry::ResponseToolCall { .. } => {
-            let text = entry.response_joined_text().unwrap_or_default();
-            let thinking = response_thinking_text(std::slice::from_ref(entry));
-            if !text.is_empty() || thinking.is_some() {
-                spawn_assistant_card(commands, log, &text, thinking.as_deref(), collapse);
-            }
-
-            if let Entry::ResponseToolCall { tool_call, .. } = entry
-                && !tool_call.is_empty()
-            {
-                let names = tool_call
-                    .iter()
-                    .map(|call| format!("`{}`", call.tool_name))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                spawn_message_card(
-                    commands,
-                    log,
-                    "Tool calls",
-                    Color::srgb(0.95, 0.75, 0.40),
-                    format!("Calling {names}"),
-                    Color::srgb(0.13, 0.115, 0.09),
-                    true,
-                    collapse,
-                );
-            }
-        }
-        Entry::ToolCallResult { tool_call } => {
-            spawn_message_card(
-                commands,
-                log,
-                "Tool calls",
-                Color::srgb(0.95, 0.75, 0.40),
-                tool_result_summary(tool_call, tool_names),
-                Color::srgb(0.13, 0.115, 0.09),
-                true,
-                collapse,
-            );
-        }
-        Entry::Draft { .. } => {}
-    }
-}
-
-/// Rebuild the visible transcript from the last [`MAX_TRANSCRIPT_CARDS`]
-/// history entries plus the live streaming card, if any.
-pub(crate) fn render_transcript(
-    commands: &mut Commands,
-    view: &mut AgentView,
-    agent: &Agent,
-    collapse: &TextCollapseConfig,
-) {
-    commands.entity(view.log).despawn_children();
-
-    let start = agent.history.len().saturating_sub(MAX_TRANSCRIPT_CARDS);
-    let recent = &agent.history[start..];
-    let tool_names = tool_name_map(recent);
-    for entry in recent {
-        render_entry(commands, view.log, entry, &tool_names, collapse);
-    }
-
-    view.assistant = None;
-    if !agent.streaming_text.is_empty() || !agent.streaming_thinking.is_empty() {
-        let thinking =
-            (!agent.streaming_thinking.is_empty()).then_some(agent.streaming_thinking.as_str());
-        view.assistant = Some(spawn_assistant_card(
-            commands,
-            view.log,
-            &agent.streaming_text,
-            thinking,
-            collapse,
-        ));
-    }
-
-    view.transcript_visible = true;
-    view.rendered_entries = agent.history.len();
-    view.scroll_to_bottom = true;
-}
-
-/// Render only the newest history entry when exactly one was appended. This is
-/// the "draft popped" path: the live assistant card is replaced by the
-/// finalized block without rebuilding the whole transcript.
-pub(crate) fn refresh_transcripts(
-    mut commands: Commands,
-    mut views: Query<(&mut AgentView, &Agent)>,
-    collapse: Res<TextCollapseConfig>,
-) {
-    for (mut view, agent) in &mut views {
-        if !view.transcript_visible {
-            continue;
-        }
-
-        let history_len = agent.history.len();
-        if history_len < view.rendered_entries {
-            // Rollback or reset: the transcript is no longer trustworthy.
-            render_transcript(&mut commands, &mut view, agent, &collapse);
-            continue;
-        }
-        if history_len > view.rendered_entries + 1 {
-            render_transcript(&mut commands, &mut view, agent, &collapse);
-            continue;
-        }
-        if history_len == view.rendered_entries + 1 {
-            if let Some(assistant) = view.assistant.take() {
-                commands.entity(assistant.card).despawn();
-            }
-            if let Some(entry) = agent.history.last() {
-                let start = history_len.saturating_sub(MAX_TRANSCRIPT_CARDS);
-                let tool_names = tool_name_map(&agent.history[start..history_len]);
-                render_entry(&mut commands, view.log, entry, &tool_names, &collapse);
-            }
-            view.rendered_entries = history_len;
-            view.scroll_to_bottom = true;
-        }
-    }
-}
-
-/// Keep the number of live transcript cards bounded.
-pub(crate) fn trim_transcripts(
-    mut commands: Commands,
-    logs: Query<&Children, With<TranscriptLog>>,
-    cards: Query<(), With<TranscriptCard>>,
-) {
-    for children in &logs {
-        let excess = children.len().saturating_sub(MAX_TRANSCRIPT_CARDS);
-        if excess == 0 {
-            continue;
-        }
-
-        let mut removed = 0;
-        for child in children.iter() {
-            if cards.contains(child) {
-                commands.entity(child).despawn();
-                removed += 1;
-                if removed == excess {
-                    break;
-                }
-            }
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1707,8 +621,7 @@ pub(crate) fn retry_agent_turn(
         agent.pending = true;
         agent.streaming_text.clear();
         agent.streaming_thinking.clear();
-        view.follow_tail = true;
-        view.scroll_to_bottom = true;
+        view.follow_tail();
         set_text(&mut texts, view.status, "Retrying...");
 
         start_turn.write(StartAgentTurn {
@@ -1757,7 +670,7 @@ pub(crate) fn cancel_agent_turn(
         if let Some(assistant) = view.assistant.take() {
             commands.entity(assistant.card).despawn();
         }
-        view.scroll_to_bottom = true;
+        view.scroll_tail_if_following();
         set_text(&mut texts, view.status, "Interrupted");
     }
 }
@@ -1886,8 +799,7 @@ pub(crate) fn flush_pending_messages(
             image: None,
         },
     });
-    view.follow_tail = true;
-    view.scroll_to_bottom = true;
+    view.follow_tail();
     if let Some(status) = status {
         set_text(texts, view.status, status);
     }
@@ -1966,12 +878,11 @@ pub(crate) fn start_agent_turn(
         agent.streaming_thinking.clear();
 
         if view.transcript_visible {
-            let assistant = spawn_assistant_card(&mut commands, view.log, "...", None, &collapse);
-            view.assistant = Some(assistant);
+            begin_live_assistant(&mut commands, &mut view, &agent, &collapse);
         } else {
             view.assistant = None;
         }
-        view.scroll_to_bottom = true;
+        view.scroll_tail_if_following();
         set_text(&mut texts, view.status, "Connecting...");
 
         let agent_entity = request.agent;
@@ -2138,25 +1049,6 @@ pub(crate) fn write_stream_events(
     }
 }
 
-fn ensure_live_assistant(
-    commands: &mut Commands,
-    view: &mut AgentView,
-    agent: &Agent,
-    collapse: &TextCollapseConfig,
-) {
-    if view.assistant.is_none() && view.transcript_visible {
-        let thinking =
-            (!agent.streaming_thinking.is_empty()).then_some(agent.streaming_thinking.as_str());
-        view.assistant = Some(spawn_assistant_card(
-            commands,
-            view.log,
-            &agent.streaming_text,
-            thinking,
-            collapse,
-        ));
-    }
-}
-
 pub(crate) fn handle_stream_events(
     mut agents: Query<(&mut Agent, &mut AgentView)>,
     mut stream_events: MessageReader<AgentStreamEvent>,
@@ -2185,7 +1077,7 @@ pub(crate) fn handle_stream_events(
                         agent.streaming_text.clone(),
                     );
                 }
-                view.scroll_to_bottom = true;
+                view.scroll_tail_if_following();
             }
             StreamEvent::ThinkingDelta(text) => {
                 agent.streaming_thinking.push_str(text);
@@ -2199,7 +1091,7 @@ pub(crate) fn handle_stream_events(
                         agent.streaming_thinking.clone(),
                     );
                 }
-                view.scroll_to_bottom = true;
+                view.scroll_tail_if_following();
                 set_text(
                     &mut texts,
                     view.status,
@@ -2336,7 +1228,7 @@ pub(crate) fn handle_turn_finished(
             }
         }
 
-        view.scroll_to_bottom = true;
+        view.scroll_tail_if_following();
     }
 }
 
@@ -2679,7 +1571,7 @@ pub(crate) fn apply_tool_results(
             tool_call: message.results.clone(),
         });
 
-        view.scroll_to_bottom = true;
+        view.scroll_tail_if_following();
         set_text(&mut texts, view.status, "Tools finished; continuing...");
 
         // Force waiting user and cross-agent messages into the history now:
@@ -2804,7 +1696,7 @@ pub(crate) fn handle_agent_failed(
         agent.current_turn = None;
         agent.streaming_text.clear();
         agent.streaming_thinking.clear();
-        view.scroll_to_bottom = true;
+        view.scroll_tail_if_following();
         set_text(&mut texts, view.status, "Request failed");
     }
 }
@@ -2869,116 +1761,6 @@ pub(crate) fn rollback_pending_turn(history: &mut Vec<Entry>) -> Option<String> 
         }
     }
     retry
-}
-
-pub(crate) fn response_display_text(entries: &[Entry]) -> Option<String> {
-    let text = entries
-        .iter()
-        .filter_map(Entry::response_joined_text)
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    if !text.is_empty() {
-        return Some(text);
-    }
-
-    for entry in entries {
-        if let Entry::ResponseToolCall { tool_call, .. } = entry
-            && !tool_call.is_empty()
-        {
-            return Some(format!(
-                "Calling {}...",
-                tool_call
-                    .iter()
-                    .map(|call| format!("`{}`", call.tool_name))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
-    }
-
-    None
-}
-
-pub(crate) fn response_thinking_text(entries: &[Entry]) -> Option<String> {
-    let thinking = entries
-        .iter()
-        .flat_map(|entry| entry.response_thinking_blocks())
-        .cloned()
-        .collect::<Vec<Thinking>>();
-    thinking_joined(&thinking)
-}
-
-pub(crate) fn set_text(texts: &mut Query<&mut Text>, entity: Entity, value: impl Into<String>) {
-    if let Ok(mut text) = texts.get_mut(entity) {
-        text.0 = value.into();
-    }
-}
-
-/// Update a collapsible body, re-applying its current collapsed/expanded state
-/// and refreshing the header hint. Falls back to a plain text update for bodies
-/// that are not collapsible.
-fn set_collapsible_text(
-    texts: &mut Query<&mut Text>,
-    collapsibles: &mut Query<&mut CollapsibleText>,
-    entity: Entity,
-    value: impl Into<String>,
-) {
-    let value = value.into();
-    let Ok(mut collapsible) = collapsibles.get_mut(entity) else {
-        if let Ok(mut text) = texts.get_mut(entity) {
-            text.0 = value;
-        }
-        return;
-    };
-
-    collapsible.full = value;
-    let visible = collapsible.visible_text();
-    let hint = collapsible.hint_text();
-    let hint_entity = collapsible.hint;
-    if let Ok(mut text) = texts.get_mut(entity) {
-        text.0 = visible;
-    }
-    if let Ok(mut text) = texts.get_mut(hint_entity) {
-        text.0 = hint;
-    }
-}
-
-pub(crate) fn set_display(nodes: &mut Query<&mut Node>, entity: Entity, display: Display) {
-    if let Ok(mut node) = nodes.get_mut(entity) {
-        node.display = display;
-    }
-}
-
-/// Renders the fixed-width usage readout. Fields are padded so the text does
-/// not shift as token counts grow (Bevy's default font is monospaced).
-pub(crate) fn stats_text(usage: Option<&Usage>) -> String {
-    fn field(value: Option<u64>) -> String {
-        value.map_or_else(|| "-".to_owned(), |value| value.to_string())
-    }
-
-    let input = field(usage.and_then(|usage| usage.input_tokens));
-    let output = field(usage.and_then(|usage| usage.output_tokens));
-    let cached = field(usage.and_then(|usage| usage.cached_input_tokens));
-    format!("in {input:>6}   out {output:>6}   cached {cached:>6}")
-}
-
-pub(crate) fn auto_scroll(
-    mut views: Query<&mut AgentView>,
-    mut logs: Query<(&mut ScrollPosition, &ComputedNode)>,
-) {
-    for mut view in &mut views {
-        if !view.follow_tail || !view.scroll_to_bottom {
-            continue;
-        }
-        let Ok((mut scroll_position, computed)) = logs.get_mut(view.log) else {
-            continue;
-        };
-
-        let max_offset =
-            (computed.content_size() - computed.size()) * computed.inverse_scale_factor();
-        scroll_position.y = max_offset.y.max(0.);
-        view.scroll_to_bottom = false;
-    }
 }
 
 #[cfg(test)]
@@ -3058,7 +1840,8 @@ mod removal_tests {
                     transcript_visible: false,
                     rendered_entries: 0,
                     scroll_to_bottom: false,
-                    follow_tail: true,
+                    scroll_to_top: false,
+                    anchor: TranscriptAnchor::FollowTail,
                 },
             ))
             .id();
@@ -3322,7 +2105,8 @@ mod cancel_tests {
                     transcript_visible: true,
                     rendered_entries: 3,
                     scroll_to_bottom: false,
-                    follow_tail: true,
+                    scroll_to_top: false,
+                    anchor: TranscriptAnchor::FollowTail,
                 },
             ))
             .id();
@@ -3400,7 +2184,8 @@ mod rename_tests {
                     transcript_visible: false,
                     rendered_entries: 0,
                     scroll_to_bottom: false,
-                    follow_tail: true,
+                    scroll_to_top: false,
+                    anchor: TranscriptAnchor::FollowTail,
                 },
             ))
             .id();
@@ -3422,282 +2207,6 @@ mod rename_tests {
 
         assert_eq!(app.world().get::<Text>(tab_label).unwrap().0, "New");
         assert_eq!(app.world().get::<Text>(status).unwrap().0, "Renamed to New");
-    }
-}
-
-#[cfg(test)]
-mod transcript_tests {
-    use super::*;
-
-    fn agent_view(log: Entity, assistant: Option<AssistantView>) -> AgentView {
-        AgentView {
-            panel: Entity::PLACEHOLDER,
-            log,
-            input: Entity::PLACEHOLDER,
-            status: Entity::PLACEHOLDER,
-            stats: Entity::PLACEHOLDER,
-            tab_label: Entity::PLACEHOLDER,
-            assistant,
-            transcript_visible: true,
-            rendered_entries: 1,
-            scroll_to_bottom: false,
-            follow_tail: true,
-        }
-    }
-
-    #[test]
-    fn draft_pop_replaces_only_the_live_card() {
-        let mut app = App::new();
-
-        let log = app.world_mut().spawn((Node::default(), TranscriptLog)).id();
-        let old_card = app
-            .world_mut()
-            .spawn((Node::default(), TranscriptCard))
-            .id();
-        let live_card = app
-            .world_mut()
-            .spawn((Node::default(), TranscriptCard))
-            .id();
-        app.world_mut()
-            .entity_mut(log)
-            .add_children(&[old_card, live_card]);
-
-        let agent = app
-            .world_mut()
-            .spawn(Agent::new(
-                "Worker".to_owned(),
-                Provider::Responses,
-                "model".to_owned(),
-            ))
-            .id();
-        app.world_mut()
-            .get_mut::<Agent>(agent)
-            .unwrap()
-            .history
-            .push(Entry::response_text("final answer"));
-
-        app.world_mut().entity_mut(agent).insert(agent_view(
-            log,
-            Some(AssistantView {
-                card: live_card,
-                thinking_container: Entity::PLACEHOLDER,
-                thinking_body: Entity::PLACEHOLDER,
-                answer_body: Entity::PLACEHOLDER,
-            }),
-        ));
-        app.add_systems(Update, refresh_transcripts);
-        app.init_resource::<TextCollapseConfig>();
-        app.update();
-
-        assert!(
-            app.world().get_entity(live_card).is_err(),
-            "the old draft card should be gone"
-        );
-        assert!(
-            app.world().get_entity(old_card).is_ok(),
-            "earlier transcript cards must not be rebuilt"
-        );
-        let children = app.world().get::<Children>(log).unwrap();
-        assert_eq!(children.len(), 2);
-        assert_eq!(
-            app.world()
-                .get::<AgentView>(agent)
-                .unwrap()
-                .rendered_entries,
-            2
-        );
-    }
-}
-
-#[cfg(test)]
-mod display_tests {
-    use super::*;
-
-    fn config() -> TextCollapseConfig {
-        TextCollapseConfig {
-            max_chars: 1_000,
-            max_lines: 10,
-        }
-    }
-
-    fn numbered_lines(count: usize) -> String {
-        (0..count)
-            .map(|index| format!("line {index}"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    #[test]
-    fn short_text_is_not_collapsed() {
-        let state = CollapsibleText::new(
-            "short".to_owned(),
-            &config(),
-            CollapseMode::HeadAndTail,
-            Entity::PLACEHOLDER,
-        );
-        assert!(!state.exceeds_limit());
-        assert_eq!(state.visible_text(), "short");
-        assert_eq!(state.hint_text(), "");
-    }
-
-    #[test]
-    fn tool_output_collapses_to_the_leading_lines() {
-        let state = CollapsibleText::new(
-            numbered_lines(20),
-            &config(),
-            CollapseMode::Head,
-            Entity::PLACEHOLDER,
-        );
-        let visible = state.visible_text();
-        assert!(visible.starts_with("line 0"), "{visible}");
-        assert!(!visible.contains("line 10"), "{visible}");
-        assert!(visible.contains("more characters"), "{visible}");
-        assert!(state.hint_text().contains("Show more"));
-    }
-
-    #[test]
-    fn reasoning_shows_the_first_and_last_lines() {
-        let mut state = CollapsibleText::new(
-            numbered_lines(20),
-            &config(),
-            CollapseMode::HeadAndTail,
-            Entity::PLACEHOLDER,
-        );
-        let visible = state.visible_text();
-        for index in 0..5 {
-            assert!(visible.contains(&format!("line {index}")), "{visible}");
-        }
-        for index in 15..20 {
-            assert!(visible.contains(&format!("line {index}")), "{visible}");
-        }
-        assert!(!visible.contains("line 7"), "{visible}");
-        assert!(visible.contains("..."), "{visible}");
-        assert!(state.hint_text().contains("Show more"));
-
-        // New reasoning updates the trailing window while the body stays collapsed.
-        state.full.push_str("\nline 20");
-        let visible = state.visible_text();
-        assert!(visible.contains("line 16"), "{visible}");
-        assert!(visible.contains("line 20"), "{visible}");
-        assert!(state.collapsed);
-    }
-
-    #[test]
-    fn long_tool_result_card_starts_collapsed() {
-        let mut world = World::new();
-        let log = world.spawn_empty().id();
-        let body = {
-            let mut commands = world.commands();
-            spawn_message_card(
-                &mut commands,
-                log,
-                "Tool calls",
-                Color::srgb(0.95, 0.75, 0.40),
-                numbered_lines(20),
-                Color::srgb(0.13, 0.115, 0.09),
-                true,
-                &config(),
-            )
-        };
-        world.flush();
-
-        let state = world
-            .get::<CollapsibleText>(body)
-            .expect("tool card body is collapsible");
-        assert!(state.collapsed);
-        let rendered = &world.get::<Text>(body).unwrap().0;
-        assert!(rendered.starts_with("line 0"), "{rendered}");
-        assert!(!rendered.contains("line 10"), "{rendered}");
-    }
-
-    #[test]
-    fn clicking_a_collapsible_header_expands_the_body() {
-        use bevy::{
-            camera::NormalizedRenderTarget,
-            picking::{
-                backend::HitData,
-                events::Pointer,
-                pointer::{Location, PointerButton, PointerId},
-            },
-        };
-
-        let mut world = World::new();
-        let parts = {
-            let mut commands = world.commands();
-            spawn_collapsible_text(
-                &mut commands,
-                "Thinking",
-                12.,
-                Color::WHITE,
-                numbered_lines(20),
-                15.,
-                Color::WHITE,
-                CollapseMode::HeadAndTail,
-                &config(),
-            )
-        };
-        world.flush();
-
-        let collapsed = world.get::<Text>(parts.body).unwrap().0.clone();
-        assert!(!collapsed.contains("line 10"), "{collapsed}");
-
-        let camera = world.spawn_empty().id();
-        world.trigger(PointerClick {
-            entity: parts.header,
-            pointer: Pointer::new(
-                PointerId::Mouse,
-                Location {
-                    position: Vec2::ZERO,
-                    target: NormalizedRenderTarget::None {
-                        width: 1,
-                        height: 1,
-                    },
-                },
-            ),
-            button: PointerButton::Primary,
-            hit: HitData::new(camera, 0., None, None),
-            duration: Duration::ZERO,
-            count: 1,
-        });
-
-        let expanded = world.get::<Text>(parts.body).unwrap().0.clone();
-        assert_eq!(expanded, numbered_lines(20));
-        assert!(!world.get::<CollapsibleText>(parts.body).unwrap().collapsed);
-    }
-
-    #[test]
-    fn thinking_only_assistant_card_is_not_ellipsis() {
-        let mut world = World::new();
-        let log = world.spawn_empty().id();
-        let assistant = {
-            let mut commands = world.commands();
-            spawn_assistant_card(
-                &mut commands,
-                log,
-                "",
-                Some("reasoning"),
-                &TextCollapseConfig::default(),
-            )
-        };
-        world.flush();
-
-        assert_eq!(world.get::<Text>(assistant.answer_body).unwrap().0, "");
-        assert_eq!(
-            world.get::<Text>(assistant.thinking_body).unwrap().0,
-            "reasoning"
-        );
-    }
-
-    #[test]
-    fn tool_results_show_the_called_tool_name() {
-        let results = vec![ToolCallResult {
-            result: "file contents".to_owned(),
-            is_error: false,
-            tool_use_id: "call-1".to_owned(),
-        }];
-        let names = HashMap::from([("call-1".to_owned(), "fs_read".to_owned())]);
-        let summary = tool_result_summary(&results, &names);
-        assert!(summary.contains("fs_read"), "{summary}");
     }
 }
 
@@ -3746,7 +2255,8 @@ mod empty_response_tests {
             transcript_visible: true,
             rendered_entries: 1,
             scroll_to_bottom: false,
-            follow_tail: true,
+            scroll_to_top: false,
+            anchor: TranscriptAnchor::FollowTail,
         });
 
         app.add_message::<AgentTurnFinished>();

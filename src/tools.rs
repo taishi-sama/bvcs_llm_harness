@@ -107,6 +107,12 @@ fn optional_u64(arguments: &Value, name: &str) -> Result<Option<u64>, String> {
     }
 }
 
+/// Required counterpart to [`optional_u64`].
+fn required_u64(arguments: &Value, name: &str) -> Result<u64, String> {
+    optional_u64(arguments, name)?
+        .ok_or_else(|| format!("missing required integer parameter `{name}`"))
+}
+
 /// Like [`optional_u64`], but negative values are meaningful (relative indices).
 fn optional_i64(arguments: &Value, name: &str) -> Result<Option<i64>, String> {
     match arguments.get(name) {
@@ -267,8 +273,8 @@ pub(crate) fn tools() -> Vec<Tool> {
             name: "fs_read".into(),
             description: Some(
                 "Read a file from the shared virtual flat filesystem. Every LLM Agent sees \
-                 the same files. Paths are plain file names without directories. Use `seek` \
-                 and `len` to read a byte range instead of the whole file."
+                 the same files. Paths are plain file names without directories. Use `offset` \
+                 and the required `limit` to read a byte range instead of the whole file."
                     .into(),
             ),
             parameters: HashMap::from([
@@ -280,7 +286,7 @@ pub(crate) fn tools() -> Vec<Tool> {
                     },
                 ),
                 (
-                    "seek".to_owned(),
+                    "offset".to_owned(),
                     ParameterDescription {
                         r#type: ParameterType::Number,
                         description: "Optional byte offset to start reading from (default 0)"
@@ -288,11 +294,10 @@ pub(crate) fn tools() -> Vec<Tool> {
                     },
                 ),
                 (
-                    "len".to_owned(),
+                    "limit".to_owned(),
                     ParameterDescription {
                         r#type: ParameterType::Number,
-                        description: "Optional number of bytes to read (default: to end of file)"
-                            .into(),
+                        description: "Number of bytes to read (required)".into(),
                     },
                 ),
             ]),
@@ -760,10 +765,10 @@ pub(crate) fn execute_tool(
         },
         "fs_read" => match arguments.get("path").and_then(Value::as_str) {
             Some(path) => match (
-                optional_u64(arguments, "seek"),
-                optional_u64(arguments, "len"),
+                optional_u64(arguments, "offset"),
+                required_u64(arguments, "limit"),
             ) {
-                (Ok(seek), Ok(len)) => match fs.read_range(path, seek, len) {
+                (Ok(offset), Ok(limit)) => match fs.read_range(path, offset, Some(limit)) {
                     Ok(content) => (content, false),
                     Err(err) => (err, true),
                 },
@@ -1142,21 +1147,30 @@ mod tests {
     }
 
     #[test]
-    fn fs_read_exposes_seek_and_len() {
+    fn fs_read_exposes_offset_and_limit() {
         let tools = tools();
         let fs_read = tools
             .iter()
             .find(|tool| tool.name == "fs_read")
             .expect("fs_read should exist");
-        assert!(fs_read.parameters.contains_key("seek"));
-        assert!(fs_read.parameters.contains_key("len"));
+        assert!(fs_read.parameters.contains_key("offset"));
+        assert!(fs_read.parameters.contains_key("limit"));
+        assert!(!fs_read.parameters.contains_key("seek"));
+        assert!(!fs_read.parameters.contains_key("len"));
 
         assert_eq!(
-            optional_u64(&serde_json::json!({ "seek": 3 }), "seek").unwrap(),
+            optional_u64(&serde_json::json!({ "offset": 3 }), "offset").unwrap(),
             Some(3)
         );
-        assert!(optional_u64(&serde_json::json!({ "seek": -1 }), "seek").is_err());
-        assert_eq!(optional_u64(&serde_json::json!({}), "len").unwrap(), None);
+        assert!(optional_u64(&serde_json::json!({ "offset": -1 }), "offset").is_err());
+
+        assert_eq!(
+            required_u64(&serde_json::json!({ "limit": 3 }), "limit").unwrap(),
+            3
+        );
+        assert!(required_u64(&serde_json::json!({}), "limit").is_err());
+        assert!(required_u64(&serde_json::json!({ "limit": null }), "limit").is_err());
+        assert!(required_u64(&serde_json::json!({ "limit": -1 }), "limit").is_err());
     }
 
     #[test]
