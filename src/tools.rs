@@ -6,12 +6,13 @@
 
 use std::collections::HashMap;
 
-use bevy::prelude::{Commands, Entity, MessageWriter};
+use bevy::prelude::{Commands, Entity, MessageWriter, Query};
 use llm_api::generic_tool::{ParameterDescription, ParameterType, Tool};
+use llm_history_model::history::Entry;
 use serde_json::Value;
 
 use crate::{
-    agent::{AgentIndex, AgentLayout, MAX_AGENTS, create_agent},
+    agent::{Agent, AgentIndex, AgentLayout, MAX_AGENTS, create_agent},
     config::AppConfig,
     js_runtime::JsTask,
     messages::{RemoveAgentRequest, RenameAgentRequest, SendAgentMessage},
@@ -104,6 +105,110 @@ fn optional_u64(arguments: &Value, name: &str) -> Result<Option<u64>, String> {
             .map(Some)
             .ok_or_else(|| format!("`{name}` must be a non-negative integer")),
     }
+}
+
+/// Like [`optional_u64`], but negative values are meaningful (relative indices).
+fn optional_i64(arguments: &Value, name: &str) -> Result<Option<i64>, String> {
+    match arguments.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_i64()
+            .map(Some)
+            .ok_or_else(|| format!("`{name}` must be an integer")),
+    }
+}
+
+/// Messages returned by `get_agent_history` when `amount` is omitted.
+const DEFAULT_HISTORY_AMOUNT: usize = 20;
+/// Upper bound on `amount`, so one call cannot dump an unbounded history.
+const MAX_HISTORY_AMOUNT: usize = 1000;
+
+/// Resolve the inclusive-exclusive slice of history to return.
+///
+/// - omitted `position` starts at the last `amount` entries
+/// - a negative `position` counts back from the end (`-1` is the newest entry)
+/// - otherwise `position` is a plain zero-based index
+fn history_window(len: usize, position: Option<i64>, amount: Option<u64>) -> (usize, usize) {
+    let amount = amount
+        .unwrap_or(DEFAULT_HISTORY_AMOUNT as u64)
+        .min(MAX_HISTORY_AMOUNT as u64) as usize;
+
+    let start = match position {
+        None => len.saturating_sub(amount),
+        Some(position) if position < 0 => len.saturating_sub(position.unsigned_abs() as usize),
+        Some(position) => (position as usize).min(len),
+    };
+    let end = start.saturating_add(amount).min(len);
+    (start, end)
+}
+
+/// Snake-case name of the history entry kind, exposed to the model.
+fn entry_type(entry: &Entry) -> &'static str {
+    match entry {
+        Entry::SystemPrompt { .. } => "system_prompt",
+        Entry::SystemMessage { .. } => "system_message",
+        Entry::UserMessage { .. } => "user_message",
+        Entry::Response { .. } => "response",
+        Entry::ResponseToolCall { .. } => "response_tool_call",
+        Entry::ToolCallResult { .. } => "tool_call_result",
+        Entry::Draft { .. } => "draft",
+    }
+}
+
+/// Who produced the entry, as far as it can be recovered from its content.
+fn entry_sender(entry: &Entry, agent_name: &str) -> String {
+    match entry {
+        Entry::SystemPrompt { .. } | Entry::SystemMessage { .. } => "system".to_owned(),
+        Entry::UserMessage { content } => content
+            .text
+            .as_deref()
+            .and_then(user_message_sender)
+            .unwrap_or_else(|| "user".to_owned()),
+        Entry::Response { .. } | Entry::ResponseToolCall { .. } | Entry::Draft { .. } => {
+            agent_name.to_owned()
+        }
+        Entry::ToolCallResult { .. } => "tool".to_owned(),
+    }
+}
+
+/// Recover the sender from the envelopes used for queued user messages.
+fn user_message_sender(text: &str) -> Option<String> {
+    const AGENT_PREFIX: &str = "<system_message>[Message from ";
+    const TASK_PREFIX: &str = "You were created by ";
+    const BACKGROUND_PREFIX: &str = "<system_message>[Background task ";
+
+    let name = if let Some(rest) = text.strip_prefix(AGENT_PREFIX) {
+        rest.split(',').next()
+    } else if let Some(rest) = text.strip_prefix(TASK_PREFIX) {
+        rest.split(", your task:").next()
+    } else if text.starts_with(BACKGROUND_PREFIX) {
+        return Some("background_task".to_owned());
+    } else {
+        return None;
+    };
+
+    name.map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+}
+
+/// Look up an agent by title, with a helpful error listing what exists.
+fn history_agent<'a>(
+    name: &str,
+    index: &AgentIndex,
+    agents: &'a Query<&Agent>,
+) -> Result<&'a Agent, String> {
+    let Some(entity) = index.by_name.get(name) else {
+        let mut names = index.by_name.keys().cloned().collect::<Vec<_>>();
+        names.sort();
+        return Err(format!(
+            "No agent named `{name}`. Available agents: {}",
+            names.join(", ")
+        ));
+    };
+    agents
+        .get(*entity)
+        .map_err(|_| format!("Agent `{name}` no longer exists."))
 }
 
 /// Distinguish an omitted background flag (`None`) from an explicit falsey one
@@ -413,6 +518,66 @@ pub(crate) fn tools() -> Vec<Tool> {
             parameters: HashMap::new(),
         },
         Tool {
+            name: "get_agent_history".into(),
+            description: Some(
+                "List the messages in any agent's conversation history, including this agent's \
+                 own. Accepts an exact agent name. Each item has `type`, `sender`, and \
+                 `message_index`; read the full message with get_agent_message. By default the \
+                 last 20 messages are returned."
+                    .into(),
+            ),
+            parameters: HashMap::from([
+                (
+                    "agent".to_owned(),
+                    ParameterDescription {
+                        r#type: ParameterType::String,
+                        description: "Exact agent title, or this agent's own name".into(),
+                    },
+                ),
+                (
+                    "position".to_owned(),
+                    ParameterDescription {
+                        r#type: ParameterType::Number,
+                        description: "Optional message index to start from. Negative values \
+                                      count back from the end (-1 is the newest message); omit \
+                                      to start at the most recent messages."
+                            .into(),
+                    },
+                ),
+                (
+                    "amount".to_owned(),
+                    ParameterDescription {
+                        r#type: ParameterType::Number,
+                        description: "Optional number of messages to return (default 20)".into(),
+                    },
+                ),
+            ]),
+        },
+        Tool {
+            name: "get_agent_message".into(),
+            description: Some(
+                "Read one message from an agent's conversation history, serialized as JSON. Use \
+                 the `message_index` values from get_agent_history."
+                    .into(),
+            ),
+            parameters: HashMap::from([
+                (
+                    "agent".to_owned(),
+                    ParameterDescription {
+                        r#type: ParameterType::String,
+                        description: "Exact agent title, or this agent's own name".into(),
+                    },
+                ),
+                (
+                    "index".to_owned(),
+                    ParameterDescription {
+                        r#type: ParameterType::Number,
+                        description: "Message index from get_agent_history".into(),
+                    },
+                ),
+            ]),
+        },
+        Tool {
             name: "spawn_agent".into(),
             description: Some(
                 "Create a new LLM Agent in a new tab. Optional `name` sets its title. If \
@@ -475,6 +640,7 @@ pub(crate) fn execute_tool(
     source_entity: Entity,
     source_agent: &str,
     index: &mut AgentIndex,
+    agents: &Query<&Agent>,
     layout: &mut AgentLayout,
     fs: &mut VirtualFs,
     config: &AppConfig,
@@ -583,6 +749,74 @@ pub(crate) fn execute_tool(
                 .collect::<Vec<_>>()
                 .join(", ");
             (format!("Available agents: {available}"), false)
+        }
+        "get_agent_history" => {
+            let Some(target_name) = arguments.get("agent").and_then(Value::as_str) else {
+                return ("missing required string parameter `agent`".to_owned(), true);
+            };
+            let target = match history_agent(target_name, index, agents) {
+                Ok(target) => target,
+                Err(err) => return (err, true),
+            };
+            let position = match optional_i64(arguments, "position") {
+                Ok(position) => position,
+                Err(err) => return (err, true),
+            };
+            let amount = match optional_u64(arguments, "amount") {
+                Ok(amount) => amount,
+                Err(err) => return (err, true),
+            };
+
+            let history = target.history();
+            let (start, end) = history_window(history.len(), position, amount);
+            let items = history[start..end]
+                .iter()
+                .enumerate()
+                .map(|(offset, entry)| {
+                    serde_json::json!({
+                        "type": entry_type(entry),
+                        "sender": entry_sender(entry, target.name()),
+                        "message_index": start + offset,
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            match serde_json::to_string_pretty(&items) {
+                Ok(json) => (json, false),
+                Err(err) => (format!("could not serialize history: {err}"), true),
+            }
+        }
+        "get_agent_message" => {
+            let Some(target_name) = arguments.get("agent").and_then(Value::as_str) else {
+                return ("missing required string parameter `agent`".to_owned(), true);
+            };
+            let target = match history_agent(target_name, index, agents) {
+                Ok(target) => target,
+                Err(err) => return (err, true),
+            };
+            let Some(message_index) = arguments.get("index").and_then(Value::as_u64) else {
+                return (
+                    "missing required non-negative integer parameter `index`".to_owned(),
+                    true,
+                );
+            };
+
+            let history = target.history();
+            let Some(entry) = history.get(message_index as usize) else {
+                return (
+                    format!(
+                        "index {message_index} is out of range; `{target_name}` has {} messages (0..{})",
+                        history.len(),
+                        history.len().saturating_sub(1)
+                    ),
+                    true,
+                );
+            };
+
+            match serde_json::to_string_pretty(entry) {
+                Ok(json) => (json, false),
+                Err(err) => (format!("could not serialize message: {err}"), true),
+            }
         }
         "send_message_to_agent" => {
             let target_name = arguments.get("agent").and_then(Value::as_str);
@@ -841,5 +1075,122 @@ mod rename_tool_tests {
             .find(|tool| tool.name == "rename_self")
             .expect("rename_self should exist");
         assert!(tool.parameters.contains_key("name"));
+    }
+}
+
+#[cfg(test)]
+mod history_tool_tests {
+    use super::*;
+    use llm_history_model::history::MessageContent;
+
+    fn user_text(text: &str) -> Entry {
+        Entry::UserMessage {
+            content: MessageContent {
+                text: Some(text.to_owned()),
+                image: None,
+            },
+        }
+    }
+
+    #[test]
+    fn history_window_defaults_to_the_last_twenty_messages() {
+        assert_eq!(history_window(100, None, None), (80, 100));
+        assert_eq!(history_window(5, None, None), (0, 5));
+        assert_eq!(history_window(0, None, None), (0, 0));
+    }
+
+    #[test]
+    fn history_window_supports_negative_and_positive_positions() {
+        assert_eq!(history_window(100, Some(-3), None), (97, 100));
+        assert_eq!(history_window(100, Some(-3), Some(1)), (97, 98));
+        assert_eq!(history_window(100, Some(10), Some(5)), (10, 15));
+        assert_eq!(history_window(100, Some(98), Some(5)), (98, 100));
+        assert_eq!(history_window(100, Some(200), Some(5)), (100, 100));
+        assert_eq!(history_window(100, Some(-200), Some(5)), (0, 5));
+        assert_eq!(history_window(100, None, Some(0)), (100, 100));
+    }
+
+    #[test]
+    fn history_window_caps_the_amount() {
+        let (start, end) = history_window(10_000, Some(0), Some(u64::MAX));
+        assert_eq!((start, end), (0, MAX_HISTORY_AMOUNT));
+    }
+
+    #[test]
+    fn history_tools_are_advertised() {
+        let tools = tools();
+        let history = tools
+            .iter()
+            .find(|tool| tool.name == "get_agent_history")
+            .expect("get_agent_history should exist");
+        assert!(history.parameters.contains_key("agent"));
+        assert!(history.parameters.contains_key("position"));
+        assert!(history.parameters.contains_key("amount"));
+
+        let message = tools
+            .iter()
+            .find(|tool| tool.name == "get_agent_message")
+            .expect("get_agent_message should exist");
+        assert!(message.parameters.contains_key("agent"));
+        assert!(message.parameters.contains_key("index"));
+    }
+
+    #[test]
+    fn entry_sender_recovers_cross_agent_envelopes() {
+        assert_eq!(
+            entry_sender(
+                &user_text("<system_message>[Message from LLM Agent 2, answer with a tool]\nhi"),
+                "LLM Agent 1"
+            ),
+            "LLM Agent 2"
+        );
+        assert_eq!(
+            entry_sender(
+                &user_text("You were created by LLM Agent 1, your task:\nwork"),
+                "Researcher"
+            ),
+            "LLM Agent 1"
+        );
+        assert_eq!(
+            entry_sender(
+                &user_text("<system_message>[Background task 3 completed]\nok"),
+                "LLM Agent 1"
+            ),
+            "background_task"
+        );
+        assert_eq!(
+            entry_sender(&user_text("plain prompt"), "LLM Agent 1"),
+            "user"
+        );
+        assert_eq!(
+            entry_sender(&Entry::response_text("answer"), "LLM Agent 1"),
+            "LLM Agent 1"
+        );
+        assert_eq!(
+            entry_sender(
+                &Entry::SystemPrompt {
+                    content: "x".into()
+                },
+                "LLM Agent 1"
+            ),
+            "system"
+        );
+    }
+
+    #[test]
+    fn entry_type_uses_snake_case_names() {
+        assert_eq!(entry_type(&user_text("hi")), "user_message");
+        assert_eq!(
+            entry_type(&Entry::SystemPrompt {
+                content: "x".into()
+            }),
+            "system_prompt"
+        );
+        assert_eq!(entry_type(&Entry::response_text("answer")), "response");
+        assert_eq!(entry_type(&Entry::draft()), "draft");
+        assert_eq!(
+            entry_type(&Entry::ToolCallResult { tool_call: vec![] }),
+            "tool_call_result"
+        );
     }
 }

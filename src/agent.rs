@@ -205,8 +205,7 @@ impl Agent {
             history: vec![Entry::SystemPrompt {
                 content: format!(
                     "You are the LLM agent named {name}. Avoid using markdown and LaTeX \
-                     notation. You can list and message other agents with the list_agents and \
-                     send_message_to_agent tools."
+                     notation."
                 ),
             }],
             pending: false,
@@ -224,6 +223,16 @@ impl Agent {
             tools: crate::tools::tools(),
             max_tokens: Some(8192),
         }
+    }
+
+    /// Agent title as shown in tabs and used for cross-agent lookups.
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Full conversation history, including the system prompt.
+    pub(crate) fn history(&self) -> &[Entry] {
+        &self.history
     }
 }
 
@@ -2049,6 +2058,7 @@ pub(crate) fn execute_tool_calls(
                         request.agent,
                         &agent.name,
                         &mut index,
+                        &agents,
                         &mut layout,
                         &mut fs,
                         &config,
@@ -2284,6 +2294,7 @@ pub(crate) fn poll_js_host_requests(
                     agent_entity,
                     &agent.name,
                     &mut index,
+                    &agents,
                     &mut layout,
                     &mut fs,
                     &config,
