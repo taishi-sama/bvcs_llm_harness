@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 pub enum ParameterType {
     String,
     Number,
+    Boolean,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

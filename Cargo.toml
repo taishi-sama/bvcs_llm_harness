@@ -11,7 +11,7 @@ members = [
 
 [dependencies]
 anyhow = "1.0.104"
-bevy = { version = "0.20.0", features = ["system_font_discovery"]}
+bevy = { version = "0.20.0", features = ["system_font_discovery", "system_clipboard"]}
 boa_engine = "0.22.0"
 bevy-tokio-tasks = "0.20.0"
 futures-util = "0.3.34"
