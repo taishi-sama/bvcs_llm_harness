@@ -37,6 +37,7 @@
 //! Module layout:
 //! - `agent`: agent state, turn loop, tool rounds, and per-agent systems
 //! - `transcript`: chat-log cards, collapsible text, bounded window, scrolling
+//! - `glyph_cache`: bounds the shared font-atlas cache
 //! - `messages`: the Bevy message protocol shared by all layers
 //! - `transport`: HTTP streaming and provider request bodies
 //! - `tools`: tool definitions, routing, and execution
@@ -47,6 +48,7 @@
 
 mod agent;
 mod config;
+mod glyph_cache;
 mod js_runtime;
 mod messages;
 mod shell;
@@ -67,6 +69,7 @@ use js_runtime::{JsChannels, start_js_runtime, stop_js_runtime};
 
 use agent::*;
 use config::{AppConfig, Provider, session_id_from_env};
+use glyph_cache::{GlyphCacheLimit, limit_glyph_cache, log_glyph_cache_limit};
 use messages::*;
 use shell::setup;
 use transcript::{TextCollapseConfig, auto_scroll, refresh_transcripts};
@@ -106,6 +109,7 @@ fn main() {
         .init_resource::<ToolRounds>()
         .init_resource::<BackgroundPolicy>()
         .init_resource::<TextCollapseConfig>()
+        .init_resource::<GlyphCacheLimit>()
         .add_observer(attach_js_runtime)
         .add_observer(index_agent_on_insert)
         .add_observer(index_agent_on_discard)
@@ -128,7 +132,8 @@ fn main() {
         .add_message::<RemoveAgentRequest>()
         .add_message::<RenameAgentRequest>()
         .add_message::<TaskResult>()
-        .add_systems(Startup, setup)
+        .add_systems(Startup, (setup, log_glyph_cache_limit))
+        .add_systems(Update, limit_glyph_cache)
         .add_systems(
             Update,
             (
