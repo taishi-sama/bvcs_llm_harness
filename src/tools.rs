@@ -118,6 +118,19 @@ fn optional_i64(arguments: &Value, name: &str) -> Result<Option<i64>, String> {
     }
 }
 
+/// Boolean option with a default when the argument is omitted or null.
+fn bool_option(arguments: &Value, name: &str, default: bool) -> bool {
+    match arguments.get(name) {
+        None | Some(Value::Null) => default,
+        Some(value) => is_truthy(Some(value)),
+    }
+}
+
+/// Default and upper bounds for `fs_grep` output.
+const DEFAULT_GREP_MATCHES: u64 = 200;
+const MAX_GREP_MATCHES: u64 = 5_000;
+const MAX_GREP_CONTEXT: u64 = 100;
+
 /// Messages returned by `get_agent_history` when `amount` is omitted.
 const DEFAULT_HISTORY_AMOUNT: usize = 20;
 /// Upper bound on `amount`, so one call cannot dump an unbounded history.
@@ -279,6 +292,97 @@ pub(crate) fn tools() -> Vec<Tool> {
                     ParameterDescription {
                         r#type: ParameterType::Number,
                         description: "Optional number of bytes to read (default: to end of file)"
+                            .into(),
+                    },
+                ),
+            ]),
+        },
+        Tool {
+            name: "fs_grep".into(),
+            description: Some(
+                "Search the shared virtual files for a literal substring, like grep/rg. Prints \
+                 `file:line:text` for matches and `file-line-text` for context lines. Omit `path` \
+                 to search every file, use `context` to include lines around each match, set \
+                 `ignore_case` for a case-insensitive search, and `max_matches` to bound the \
+                 number of matching lines (default 200, max 5000)."
+                    .into(),
+            ),
+            parameters: HashMap::from([
+                (
+                    "pattern".to_owned(),
+                    ParameterDescription {
+                        r#type: ParameterType::String,
+                        description: "Literal substring to find".into(),
+                    },
+                ),
+                (
+                    "path".to_owned(),
+                    ParameterDescription {
+                        r#type: ParameterType::String,
+                        description: "Optional file name; omit to search all files".into(),
+                    },
+                ),
+                (
+                    "context".to_owned(),
+                    ParameterDescription {
+                        r#type: ParameterType::Number,
+                        description: "Optional number of lines before and after each match (default 0, max 100)"
+                            .into(),
+                    },
+                ),
+                (
+                    "ignore_case".to_owned(),
+                    ParameterDescription {
+                        r#type: ParameterType::Boolean,
+                        description: "Match without regard to case (default false)".into(),
+                    },
+                ),
+                (
+                    "max_matches".to_owned(),
+                    ParameterDescription {
+                        r#type: ParameterType::Number,
+                        description: "Optional maximum number of matching lines to report (default 200)"
+                            .into(),
+                    },
+                ),
+            ]),
+        },
+        Tool {
+            name: "fs_sed".into(),
+            description: Some(
+                "Print an inclusive 1-based line range from a shared virtual file, like \
+                 `sed -n 'START,ENDp'`. `start_line` defaults to 1; omit `end_line` to print \
+                 through the end of the file. Lines are prefixed with their 1-based line number \
+                 unless `line_numbers` is false."
+                    .into(),
+            ),
+            parameters: HashMap::from([
+                (
+                    "path".to_owned(),
+                    ParameterDescription {
+                        r#type: ParameterType::String,
+                        description: "File name".into(),
+                    },
+                ),
+                (
+                    "start_line".to_owned(),
+                    ParameterDescription {
+                        r#type: ParameterType::Number,
+                        description: "First line to print (1-based, default 1)".into(),
+                    },
+                ),
+                (
+                    "end_line".to_owned(),
+                    ParameterDescription {
+                        r#type: ParameterType::Number,
+                        description: "Last line to print (inclusive, default: end of file)".into(),
+                    },
+                ),
+                (
+                    "line_numbers".to_owned(),
+                    ParameterDescription {
+                        r#type: ParameterType::Boolean,
+                        description: "Prefix each line with its 1-based line number (default true)"
                             .into(),
                     },
                 ),
@@ -667,6 +771,60 @@ pub(crate) fn execute_tool(
             },
             None => ("missing required string parameter `path`".to_owned(), true),
         },
+        "fs_grep" => {
+            let Some(pattern) = arguments.get("pattern").and_then(Value::as_str) else {
+                return (
+                    "missing required string parameter `pattern`".to_owned(),
+                    true,
+                );
+            };
+            let path = arguments
+                .get("path")
+                .and_then(Value::as_str)
+                .filter(|path| !path.is_empty());
+            let context = match optional_u64(arguments, "context") {
+                Ok(context) => context.unwrap_or(0).min(MAX_GREP_CONTEXT) as usize,
+                Err(err) => return (err, true),
+            };
+            let max_matches = match optional_u64(arguments, "max_matches") {
+                Ok(max_matches) => max_matches
+                    .unwrap_or(DEFAULT_GREP_MATCHES)
+                    .min(MAX_GREP_MATCHES) as usize,
+                Err(err) => return (err, true),
+            };
+            match fs.grep(
+                pattern,
+                path,
+                context,
+                bool_option(arguments, "ignore_case", false),
+                max_matches,
+            ) {
+                Ok(output) => (output, false),
+                Err(err) => (err, true),
+            }
+        }
+        "fs_sed" => match arguments.get("path").and_then(Value::as_str) {
+            Some(path) => {
+                let start = match optional_u64(arguments, "start_line") {
+                    Ok(start) => start,
+                    Err(err) => return (err, true),
+                };
+                let end = match optional_u64(arguments, "end_line") {
+                    Ok(end) => end,
+                    Err(err) => return (err, true),
+                };
+                match fs.line_range(
+                    path,
+                    start,
+                    end,
+                    bool_option(arguments, "line_numbers", true),
+                ) {
+                    Ok(output) => (output, false),
+                    Err(err) => (err, true),
+                }
+            }
+            None => ("missing required string parameter `path`".to_owned(), true),
+        },
         "fs_ls" => (fs.list(), false),
         "fs_write" => match (
             arguments.get("path").and_then(Value::as_str),
@@ -1014,6 +1172,35 @@ mod tests {
                 "{name} should expose run_in_background"
             );
         }
+    }
+
+    #[test]
+    fn grep_and_sed_tools_are_advertised() {
+        let tools = tools();
+        let grep = tools
+            .iter()
+            .find(|tool| tool.name == "fs_grep")
+            .expect("fs_grep should exist");
+        for parameter in ["pattern", "path", "context", "ignore_case", "max_matches"] {
+            assert!(
+                grep.parameters.contains_key(parameter),
+                "fs_grep is missing `{parameter}`"
+            );
+        }
+
+        let sed = tools
+            .iter()
+            .find(|tool| tool.name == "fs_sed")
+            .expect("fs_sed should exist");
+        for parameter in ["path", "start_line", "end_line", "line_numbers"] {
+            assert!(
+                sed.parameters.contains_key(parameter),
+                "fs_sed is missing `{parameter}`"
+            );
+        }
+
+        assert_eq!(classify_tool_call("fs_grep"), ToolTarget::Agent);
+        assert_eq!(classify_tool_call("fs_sed"), ToolTarget::Agent);
     }
 
     #[test]

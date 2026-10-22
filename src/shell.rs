@@ -10,9 +10,45 @@ use crate::{
     agent::{ActiveAgent, AgentLayout, create_agent},
     config::AppConfig,
     messages::NewAgentRequested,
+    virtual_fs::{VfsStateDir, VirtualFs},
 };
 
-pub(crate) fn setup(mut commands: Commands, config: Res<AppConfig>) {
+fn spawn_action_button(
+    commands: &mut Commands,
+    label: &str,
+    background: Color,
+    border: Color,
+) -> Entity {
+    commands
+        .spawn((
+            Button,
+            Node {
+                min_width: px(92.),
+                height: px(30.),
+                padding: UiRect::horizontal(px(10.)),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                border: px(1.).all(),
+                border_radius: BorderRadius::all(px(8.)),
+                ..default()
+            },
+            BackgroundColor(background),
+            BorderColor::all(border),
+        ))
+        .with_children(|parent| {
+            parent.spawn((
+                Text::new(label.to_owned()),
+                TextFont {
+                    font_size: FontSize::Px(13.),
+                    ..default()
+                },
+                TextColor(Color::srgb(0.88, 0.92, 0.98)),
+            ));
+        })
+        .id()
+}
+
+pub(crate) fn setup(mut commands: Commands, config: Res<AppConfig>, storage: Res<VfsStateDir>) {
     commands.spawn((Camera2d, IsDefaultUiCamera));
 
     let root = commands
@@ -29,6 +65,107 @@ pub(crate) fn setup(mut commands: Commands, config: Res<AppConfig>) {
         ))
         .id();
 
+    let title = commands
+        .spawn((
+            Text::new("LLM Agents"),
+            TextFont {
+                font_size: FontSize::Px(24.),
+                ..default()
+            },
+            TextColor(Color::srgb(0.92, 0.94, 0.98)),
+        ))
+        .id();
+
+    let save = spawn_action_button(
+        &mut commands,
+        "Save VFS",
+        Color::srgb(0.10, 0.22, 0.15),
+        Color::srgb(0.35, 0.66, 0.43),
+    );
+    let load = spawn_action_button(
+        &mut commands,
+        "Load VFS",
+        Color::srgb(0.11, 0.17, 0.27),
+        Color::srgb(0.36, 0.55, 0.82),
+    );
+
+    let vfs_status = commands
+        .spawn((
+            Text::new(format!("VFS: {}", storage.path.display())),
+            TextFont {
+                font_size: FontSize::Px(12.),
+                ..default()
+            },
+            TextColor(Color::srgb(0.50, 0.56, 0.66)),
+        ))
+        .id();
+
+    commands.entity(save).observe(
+        move |_: On<Activate>,
+              fs: Res<VirtualFs>,
+              storage: Res<VfsStateDir>,
+              mut texts: Query<&mut Text>| {
+            let message = match fs.save_to_dir(&storage.path) {
+                Ok(message) => message,
+                Err(err) => format!("Save failed: {err}"),
+            };
+            if let Ok(mut text) = texts.get_mut(vfs_status) {
+                text.0 = message;
+            }
+        },
+    );
+
+    commands.entity(load).observe(
+        move |_: On<Activate>,
+              mut fs: ResMut<VirtualFs>,
+              storage: Res<VfsStateDir>,
+              mut texts: Query<&mut Text>| {
+            let message = match fs.load_from_dir(&storage.path) {
+                Ok(message) => message,
+                Err(err) => format!("Load failed: {err}"),
+            };
+            if let Ok(mut text) = texts.get_mut(vfs_status) {
+                text.0 = message;
+            }
+        },
+    );
+
+    let title_row = commands
+        .spawn(Node {
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::Center,
+            column_gap: px(8.),
+            ..default()
+        })
+        .add_children(&[title, save, load])
+        .id();
+
+    let title_block = commands
+        .spawn(Node {
+            flex_direction: FlexDirection::Column,
+            align_items: AlignItems::Start,
+            row_gap: px(4.),
+            ..default()
+        })
+        .add_children(&[title_row, vfs_status])
+        .id();
+
+    let config_text = commands
+        .spawn((
+            Text::new(format!(
+                "{} | {} | {}",
+                config.provider.label(),
+                config.model_name,
+                config.endpoint
+            )),
+            TextFont {
+                font_size: FontSize::Px(13.),
+                ..default()
+            },
+            TextColor(Color::srgb(0.55, 0.60, 0.70)),
+        ))
+        .id();
+
     let header = commands
         .spawn(Node {
             width: percent(100.),
@@ -37,29 +174,7 @@ pub(crate) fn setup(mut commands: Commands, config: Res<AppConfig>) {
             align_items: AlignItems::Center,
             ..default()
         })
-        .with_children(|parent| {
-            parent.spawn((
-                Text::new("LLM Agents"),
-                TextFont {
-                    font_size: FontSize::Px(24.),
-                    ..default()
-                },
-                TextColor(Color::srgb(0.92, 0.94, 0.98)),
-            ));
-            parent.spawn((
-                Text::new(format!(
-                    "{} | {} | {}",
-                    config.provider.label(),
-                    config.model_name,
-                    config.endpoint
-                )),
-                TextFont {
-                    font_size: FontSize::Px(13.),
-                    ..default()
-                },
-                TextColor(Color::srgb(0.55, 0.60, 0.70)),
-            ));
-        })
+        .add_children(&[title_block, config_text])
         .id();
 
     let tabs = commands

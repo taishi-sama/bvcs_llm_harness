@@ -67,7 +67,7 @@ use agent::*;
 use config::{AppConfig, Provider, session_id_from_env};
 use messages::*;
 use shell::setup;
-use virtual_fs::VirtualFs;
+use virtual_fs::{VfsStateDir, VirtualFs};
 
 fn main() {
     let provider = Provider::from_env();
@@ -98,9 +98,11 @@ fn main() {
         .init_resource::<AgentRuntime>()
         .init_resource::<AgentIndex>()
         .init_resource::<VirtualFs>()
+        .init_resource::<VfsStateDir>()
         .init_resource::<JsChannels>()
         .init_resource::<ToolRounds>()
         .init_resource::<BackgroundPolicy>()
+        .init_resource::<TextCollapseConfig>()
         .add_observer(attach_js_runtime)
         .add_observer(index_agent_on_insert)
         .add_observer(index_agent_on_discard)
