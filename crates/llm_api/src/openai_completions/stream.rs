@@ -20,7 +20,20 @@ use crate::sse::SseDecoder;
 use crate::stream::{RawStreamBytes, StreamError, StreamEvent, append_text, tool_call_position};
 use crate::usage::{Usage, UsageProvider};
 use llm_history_model::history::DraftBlock;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
+
+/// Treat JSON `null` like a missing field for collections and nested objects.
+///
+/// Some compatible servers send `choices: null` on usage-only chunks and
+/// `delta: null` / `tool_calls: null` on terminal chunks. `#[serde(default)]`
+/// only covers absent keys, not explicit nulls.
+fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
 
 /// Incremental Chat Completions stream decoder.
 #[derive(Debug, Default)]
@@ -221,7 +234,7 @@ impl StreamDecoder {
 
 #[derive(Debug, Deserialize)]
 struct Chunk {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     choices: Vec<Choice>,
     #[serde(default)]
     usage: Option<ChatUsage>,
@@ -231,7 +244,7 @@ struct Chunk {
 struct Choice {
     #[serde(default)]
     index: Option<u32>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     delta: Delta,
     #[serde(default)]
     finish_reason: Option<String>,
@@ -245,17 +258,17 @@ struct Delta {
     reasoning_content: Option<String>,
     #[serde(default)]
     reasoning: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     tool_calls: Vec<CallDelta>,
 }
 
 #[derive(Debug, Deserialize)]
 struct CallDelta {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     index: u32,
     #[serde(default)]
     id: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     function: FunctionDelta,
 }
 
@@ -412,6 +425,36 @@ mod tests {
             Some(StreamEvent::Usage(usage))
                 if usage.input_tokens == Some(1) && usage.output_tokens == Some(2)
         ));
+    }
+
+    #[test]
+    fn explicit_nulls_are_tolerated() {
+        // Compatible servers sometimes emit null instead of omitting these
+        // fields (usage-only chunks and terminal deltas).
+        let raw = concat!(
+            "data: {\"choices\":null,\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2}}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":null,\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":null}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":null,\"function\":null}]}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let mut decoder = StreamDecoder::new();
+        let blocks = feed(&mut decoder, raw);
+        // The final null-bearing tool-call fragment is accepted but still has
+        // no id or name; `finish_draft` would reject it.
+        assert!(matches!(
+            blocks.as_slice(),
+            [DraftBlock::ToolCall {
+                tool_use_id: None,
+                tool_name: None,
+                ..
+            }]
+        ));
+        assert_eq!(
+            decoder.usage().expect("usage captured").cached_input_tokens,
+            None
+        );
+        assert!(decoder.is_completed());
     }
 
     #[test]

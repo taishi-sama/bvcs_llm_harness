@@ -199,27 +199,81 @@ pub(crate) struct Agent {
     /// Last unanswered user message, kept so Retry can resend it after a
     /// failure or cancellation.
     retry_message: Option<String>,
+    /// History immediately before the most recent applied change.
+    ///
+    /// Diagnostics dump both snapshots when a request fails or the prompt
+    /// cache regresses, so the exact step that caused the problem is visible.
+    previous_history: Vec<Entry>,
+    /// Short label of the most recent applied history change.
+    last_history_change: &'static str,
+    /// Usage reported by the previous completed request.
+    last_usage: Option<Usage>,
+    /// Whether a turn was rolled back since the last usage report. Rollback is
+    /// the most common legitimate reason for a prompt-cache regression.
+    rolled_back_since_last_usage: bool,
+    /// Serialized body of the most recent request, kept for error dumps.
+    last_request_body: Option<String>,
+    /// Serialized body of the request before `last_request_body`.
+    ///
+    /// Comparing the two bodies distinguishes a provider-side cache eviction
+    /// from the harness changing a committed prefix between requests.
+    previous_request_body: Option<String>,
 }
 
 impl Agent {
     pub(crate) fn new(name: String, provider: Provider, model_name: String) -> Self {
+        let history = vec![Entry::SystemPrompt {
+            content: format!(
+                "You are the LLM agent named {name}. Avoid using markdown and LaTeX \
+                 notation."
+            ),
+        }];
         Self {
             name: name.clone(),
             provider,
             model_name,
-            history: vec![Entry::SystemPrompt {
-                content: format!(
-                    "You are the LLM agent named {name}. Avoid using markdown and LaTeX \
-                     notation."
-                ),
-            }],
+            previous_history: history.clone(),
+            history,
             pending: false,
             current_turn: None,
             streaming_text: String::new(),
             streaming_thinking: String::new(),
             pending_messages: VecDeque::new(),
             retry_message: None,
+            last_history_change: "initial",
+            last_usage: None,
+            rolled_back_since_last_usage: false,
+            last_request_body: None,
+            previous_request_body: None,
         }
+    }
+
+    /// Snapshot the current history before a mutation is applied.
+    fn note_history_change(&mut self, change: &'static str) {
+        self.previous_history = self.history.clone();
+        self.last_history_change = change;
+    }
+
+    /// Append one entry while preserving the previous history step.
+    fn push_history(&mut self, change: &'static str, entry: Entry) {
+        self.note_history_change(change);
+        self.history.push(entry);
+    }
+
+    /// Append several entries while preserving the previous history step.
+    fn extend_history(&mut self, change: &'static str, entries: Vec<Entry>) {
+        if entries.is_empty() {
+            return;
+        }
+        self.note_history_change(change);
+        self.history.extend(entries);
+    }
+
+    /// Remove the pending user turn while preserving the pre-rollback history.
+    fn rollback_pending_turn(&mut self) -> Option<String> {
+        self.note_history_change("turn_rollback");
+        self.rolled_back_since_last_usage = true;
+        rollback_pending_turn(&mut self.history)
     }
 
     fn model_config(&self) -> ModelConfig {
@@ -258,7 +312,7 @@ impl Agent {
     /// Append a history entry from display-layer tests.
     #[cfg(test)]
     pub(crate) fn push_entry_for_test(&mut self, entry: Entry) {
-        self.history.push(entry);
+        self.push_history("test", entry);
     }
 
     /// Pretend a response is in flight from display-layer tests.
@@ -266,6 +320,163 @@ impl Agent {
     pub(crate) fn mark_active_turn_for_test(&mut self) {
         self.current_turn = Some(1);
     }
+}
+
+/// Append-only JSONL file under the process working directory. Kept separate
+/// from the normal log stream so a full history can be inspected without
+/// digging through unrelated output.
+const HISTORY_DUMP_FILE: &str = "history_dumps.jsonl";
+
+/// Whether the previous request body is an exact prefix (all non-message
+/// fields equal, messages a prefix) of the current one.
+///
+/// `None` when either body is unavailable or not JSON.
+fn request_prefix_append_only(previous: Option<&str>, current: Option<&str>) -> Option<bool> {
+    let previous: Value = serde_json::from_str(previous?).ok()?;
+    let current: Value = serde_json::from_str(current?).ok()?;
+    let previous = previous.as_object()?;
+    let current = current.as_object()?;
+
+    if previous
+        .iter()
+        .any(|(key, value)| key != "messages" && current.get(key) != Some(value))
+    {
+        return Some(false);
+    }
+
+    let previous_messages = previous.get("messages")?.as_array()?;
+    let current_messages = current.get("messages")?.as_array()?;
+    Some(
+        previous_messages.len() <= current_messages.len()
+            && previous_messages
+                .iter()
+                .zip(current_messages)
+                .all(|(before, after)| before == after),
+    )
+}
+
+/// Emit the current and previous history as one parseable JSON record.
+///
+/// The dump deliberately contains both snapshots: `previous_history` is the
+/// state before the last applied change and `current_history` is what is about
+/// to be (or was just) sent. `request_body` is the exact body of the most
+/// recent request, so a missing `reasoning_content` can be confirmed directly.
+fn log_history_dump(agent: &Agent, reason: &str, details: Value) {
+    let request_body = agent
+        .last_request_body
+        .as_deref()
+        .and_then(|body| serde_json::from_str::<Value>(body).ok());
+    let previous_request_body = agent
+        .previous_request_body
+        .as_deref()
+        .and_then(|body| serde_json::from_str::<Value>(body).ok());
+    let payload = serde_json::json!({
+        "event": "history_dump",
+        "reason": reason,
+        "timestamp_unix_ms": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis() as u64)
+            .unwrap_or(0),
+        "agent": agent.name,
+        "provider": agent.provider.label(),
+        "model": agent.model_name,
+        "last_history_change": agent.last_history_change,
+        "previous_history": &agent.previous_history,
+        "current_history": &agent.history,
+        "request_prefix_append_only": request_prefix_append_only(
+            agent.previous_request_body.as_deref(),
+            agent.last_request_body.as_deref(),
+        ),
+        "previous_request_body": previous_request_body,
+        "request_body": request_body,
+        "details": details,
+    });
+
+    error!("{payload}");
+    if let Err(err) = append_history_dump(&payload.to_string()) {
+        error!("could not append to {HISTORY_DUMP_FILE}: {err}");
+    }
+}
+
+fn append_history_dump(line: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(HISTORY_DUMP_FILE)?;
+    writeln!(file, "{line}")
+}
+
+/// DeepSeek-style prompt caches are reported in fixed 128-token blocks, so a
+/// one-block decrease is accounting granularity rather than a real regression.
+const CACHE_BLOCK_TOKENS: u64 = 128;
+
+/// Whether `previous` is an append-only prefix of `current`.
+///
+/// A cache regression that is not append-only means a committed entry was
+/// rewritten or removed, which is the harness-side failure we want to catch.
+fn history_is_append_only(previous: &[Entry], current: &[Entry]) -> bool {
+    previous.len() <= current.len()
+        && previous.iter().zip(current).all(|(before, after)| {
+            serde_json::to_value(before).ok() == serde_json::to_value(after).ok()
+        })
+}
+
+/// Classify a cached-token regression. `None` means a known benign cause (one
+/// cache block of rounding noise) that should not be dumped.
+fn classify_cache_drop(before: u64, after: u64, rolled_back: bool) -> Option<&'static str> {
+    if rolled_back {
+        // Rollback is expected but worth recording: it explains the miss.
+        return Some("turn_rollback");
+    }
+    if after == 0 {
+        return Some("full_cache_miss");
+    }
+    if before.saturating_sub(after) <= CACHE_BLOCK_TOKENS {
+        return None;
+    }
+    Some("unexplained")
+}
+
+/// Track usage between requests and dump both history snapshots when the
+/// cached prompt prefix shrinks unexpectedly.
+fn record_usage(agent: &mut Agent, usage: &Usage) {
+    let previous = agent.last_usage.clone();
+    let previous_cached = previous
+        .as_ref()
+        .and_then(|usage| usage.cached_input_tokens);
+    let current_cached = usage.cached_input_tokens;
+
+    if let (Some(previous_cached), Some(current_cached)) = (previous_cached, current_cached)
+        && current_cached < previous_cached
+        && let Some(likely_reason) = classify_cache_drop(
+            previous_cached,
+            current_cached,
+            agent.rolled_back_since_last_usage,
+        )
+    {
+        log_history_dump(
+            agent,
+            "cache_miss",
+            serde_json::json!({
+                "previous_usage": previous,
+                "current_usage": usage,
+                "cached_input_tokens_before": previous_cached,
+                "cached_input_tokens_after": current_cached,
+                "cached_input_tokens_delta": previous_cached - current_cached,
+                "history_change": agent.last_history_change,
+                "history_append_only": history_is_append_only(
+                    &agent.previous_history,
+                    &agent.history,
+                ),
+                "likely_reason": likely_reason,
+            }),
+        );
+    }
+
+    agent.last_usage = Some(usage.clone());
+    agent.rolled_back_since_last_usage = false;
 }
 
 /// A message waiting for the next legal insertion point in an agent's history.
@@ -612,12 +823,15 @@ pub(crate) fn retry_agent_turn(
 
         // The failed/canceled user card is already visible; only re-add the
         // history entry and let start_agent_turn create the next assistant card.
-        agent.history.push(Entry::UserMessage {
-            content: MessageContent {
-                text: Some(text),
-                image: None,
+        agent.push_history(
+            "retry_user_message",
+            Entry::UserMessage {
+                content: MessageContent {
+                    text: Some(text),
+                    image: None,
+                },
             },
-        });
+        );
         agent.pending = true;
         agent.streaming_text.clear();
         agent.streaming_thinking.clear();
@@ -793,12 +1007,15 @@ pub(crate) fn flush_pending_messages(
 
     // Consecutive user turns are rejected by history validation, so one batch
     // of pending messages becomes a single user entry in arrival order.
-    agent.history.push(Entry::UserMessage {
-        content: MessageContent {
-            text: Some(combined.join("\n\n")),
-            image: None,
+    agent.push_history(
+        "pending_messages",
+        Entry::UserMessage {
+            content: MessageContent {
+                text: Some(combined.join("\n\n")),
+                image: None,
+            },
         },
-    });
+    );
     view.follow_tail();
     if let Some(status) = status {
         set_text(texts, view.status, status);
@@ -852,13 +1069,19 @@ pub(crate) fn start_agent_turn(
         };
 
         agent.retry_message = None;
+        agent.previous_request_body = agent.last_request_body.take();
         let config = agent.model_config();
         let body = match request_body(agent.provider, &agent.history, &config) {
             Ok(body) => body,
             Err(err) => {
                 error!("could not build request for {}: {err:#}", agent.name);
-                agent.retry_message = rollback_pending_turn(&mut agent.history);
+                agent.retry_message = agent.rollback_pending_turn();
                 agent.pending = false;
+                log_history_dump(
+                    &agent,
+                    "request_build_error",
+                    serde_json::json!({ "error": format!("{err:#}") }),
+                );
                 set_text(
                     &mut texts,
                     view.status,
@@ -867,6 +1090,7 @@ pub(crate) fn start_agent_turn(
                 continue;
             }
         };
+        agent.last_request_body = Some(body.clone());
 
         let provider = agent.provider;
         let kind = config.kind.clone();
@@ -1142,8 +1366,9 @@ pub(crate) fn handle_turn_finished(
             continue;
         }
 
-        if message.usage.is_some() {
-            set_text(&mut texts, view.stats, stats_text(message.usage.as_ref()));
+        if let Some(usage) = &message.usage {
+            record_usage(&mut agent, usage);
+            set_text(&mut texts, view.stats, stats_text(Some(usage)));
         }
 
         let answer = if !agent.streaming_text.is_empty() {
@@ -1180,7 +1405,7 @@ pub(crate) fn handle_turn_finished(
         };
 
         if message.entries.is_empty() {
-            agent.retry_message = rollback_pending_turn(&mut agent.history);
+            agent.retry_message = agent.rollback_pending_turn();
             agent.pending = false;
             agent.current_turn = None;
             if let Some(assistant) = view.assistant.take() {
@@ -1188,7 +1413,7 @@ pub(crate) fn handle_turn_finished(
             }
             set_text(&mut texts, view.status, "Empty response");
         } else {
-            agent.history.extend(message.entries.iter().cloned());
+            agent.extend_history("assistant_response", message.entries.clone());
             agent.streaming_text.clear();
             agent.streaming_thinking.clear();
 
@@ -1567,9 +1792,12 @@ pub(crate) fn apply_tool_results(
             continue;
         }
 
-        agent.history.push(Entry::ToolCallResult {
-            tool_call: message.results.clone(),
-        });
+        agent.push_history(
+            "tool_results",
+            Entry::ToolCallResult {
+                tool_call: message.results.clone(),
+            },
+        );
 
         view.scroll_tail_if_following();
         set_text(&mut texts, view.status, "Tools finished; continuing...");
@@ -1691,7 +1919,17 @@ pub(crate) fn handle_agent_failed(
                 format!("Request failed: {}", failure.message),
             );
         }
-        agent.retry_message = rollback_pending_turn(&mut agent.history);
+        let reason = if failure.message.starts_with("HTTP ") {
+            "endpoint_error"
+        } else {
+            "agent_error"
+        };
+        agent.retry_message = agent.rollback_pending_turn();
+        log_history_dump(
+            &agent,
+            reason,
+            serde_json::json!({ "error": &failure.message }),
+        );
         agent.pending = false;
         agent.current_turn = None;
         agent.streaming_text.clear();
@@ -1815,6 +2053,101 @@ mod tests {
         let retry = rollback_pending_turn(&mut history);
         assert_eq!(retry.as_deref(), Some("hello"));
         assert_eq!(history.len(), 1);
+    }
+
+    #[test]
+    fn cache_drops_are_classified_before_dumping() {
+        // One 128-token block of rounding noise is not a real regression.
+        assert_eq!(classify_cache_drop(3584, 3456, false), None);
+        assert_eq!(classify_cache_drop(5120, 4864, false), Some("unexplained"));
+        // A complete miss is always worth recording.
+        assert_eq!(classify_cache_drop(2688, 0, false), Some("full_cache_miss"));
+        // Rollback explains a drop, but is still recorded.
+        assert_eq!(classify_cache_drop(500, 0, true), Some("turn_rollback"));
+    }
+
+    #[test]
+    fn request_prefix_detects_body_rewrites() {
+        let first = r#"{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+        let appended = r#"{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"yo"}]}"#;
+        assert_eq!(
+            request_prefix_append_only(Some(first), Some(appended)),
+            Some(true)
+        );
+
+        // A changed top-level field invalidates the whole prefix.
+        let model_changed = r#"{"model":"m2","stream":true,"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"yo"}]}"#;
+        assert_eq!(
+            request_prefix_append_only(Some(first), Some(model_changed)),
+            Some(false)
+        );
+
+        // A rewritten committed message is not append-only either.
+        let rewritten = r#"{"model":"m","stream":true,"messages":[{"role":"user","content":"bye"},{"role":"assistant","content":"yo"}]}"#;
+        assert_eq!(
+            request_prefix_append_only(Some(first), Some(rewritten)),
+            Some(false)
+        );
+
+        assert_eq!(request_prefix_append_only(None, Some(appended)), None);
+    }
+
+    #[test]
+    fn append_only_detection_finds_rewritten_history() {
+        let first = vec![Entry::SystemPrompt {
+            content: "sys".into(),
+        }];
+        let mut appended = first.clone();
+        appended.push(Entry::response_text("answer"));
+
+        assert!(history_is_append_only(&first, &appended));
+        assert!(!history_is_append_only(&appended, &first));
+
+        let mut rewritten = appended.clone();
+        rewritten[0] = Entry::SystemPrompt {
+            content: "different".into(),
+        };
+        assert!(!history_is_append_only(&appended, &rewritten));
+    }
+
+    #[test]
+    fn history_changes_preserve_the_previous_step() {
+        let mut agent = Agent::new(
+            "Worker".to_owned(),
+            Provider::Completions,
+            "test-model".to_owned(),
+        );
+        agent.push_history(
+            "user_message",
+            Entry::UserMessage {
+                content: MessageContent {
+                    text: Some("hello".into()),
+                    image: None,
+                },
+            },
+        );
+        let before_assistant = agent.history.clone();
+
+        agent.push_history("assistant_response", Entry::response_text("partial"));
+        assert_eq!(
+            serde_json::to_value(&agent.previous_history).unwrap(),
+            serde_json::to_value(&before_assistant).unwrap()
+        );
+
+        let retry = agent.rollback_pending_turn();
+        assert_eq!(retry.as_deref(), Some("hello"));
+        assert!(agent.rolled_back_since_last_usage);
+        assert_eq!(agent.last_history_change, "turn_rollback");
+        // `previous_history` is the pre-rollback state, so an error dump can
+        // show exactly what was removed.
+        assert!(matches!(
+            agent.previous_history.last(),
+            Some(Entry::Response { .. })
+        ));
+        assert!(matches!(
+            agent.history.last(),
+            Some(Entry::SystemPrompt { .. })
+        ));
     }
 }
 

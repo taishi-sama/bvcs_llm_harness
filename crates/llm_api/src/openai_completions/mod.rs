@@ -17,11 +17,14 @@
 //!
 //! Notes:
 //! - Plaintext `Thinking` is preserved as `reasoning_content` on assistant
-//!   messages (both plain and tool-call ones). `Reasoning` content is a
-//!   compatible-server extension, not part of the OpenAI schema.
-//! - OpenAI `Thinking::Encrypted` has no Chat Completions field. It is skipped
-//!   when plaintext reasoning is also available and rejected by
-//!   [`to_completions_input`] when it is the only content of a turn.
+//!   messages (both plain and tool-call ones). When tools are present the
+//!   field is emitted even for turns without reasoning (as an empty string):
+//!   DeepSeek thinking mode requires every assistant message to carry it.
+//!   `Reasoning` content is a compatible-server extension, not part of the
+//!   OpenAI schema.
+//! - OpenAI `Thinking::Encrypted` has no Chat Completions field and is
+//!   rejected by [`to_completions_input`] instead of being silently dropped,
+//!   because replay would otherwise lose required `reasoning_content`.
 //! - `is_error` has no native flag; errors are prefixed `"ERROR: "`.
 //! - When `streaming` is enabled, `stream_options.include_usage` is sent
 //!   (unless `include_usage` is disabled in `ModelKind`) so the server emits a
@@ -147,6 +150,32 @@ fn flatten_blocks(blocks: &[ResponseBlock]) -> (Option<String>, String) {
     (thinking_joined(&thinking), text)
 }
 
+/// Chat Completions cannot replay OpenAI's opaque `encrypted_content`
+/// reasoning. Returning an error is safer than silently dropping the field,
+/// which makes DeepSeek-style endpoints reject the next request.
+fn has_unreplayable_encrypted_thinking(blocks: &[ResponseBlock]) -> bool {
+    blocks.iter().any(|block| {
+        matches!(
+            block,
+            ResponseBlock::Thinking(Thinking::Encrypted { thinking }) if !thinking.is_empty()
+        )
+    })
+}
+
+/// `reasoning_content` value for an assistant message.
+///
+/// DeepSeek's thinking mode requires `reasoning_content` to be replayed on
+/// every assistant message whenever the request carries tools — including
+/// turns where the model produced no reasoning. Omitting the field is
+/// indistinguishable from dropping it, so emit an empty string instead.
+fn reasoning_content(reasoning: Option<String>, tools_present: bool) -> Option<String> {
+    match (reasoning, tools_present) {
+        (Some(reasoning), _) => Some(reasoning),
+        (None, true) => Some(String::new()),
+        (None, false) => None,
+    }
+}
+
 fn user_content(content: &MessageContent) -> Content {
     match (&content.text, &content.image) {
         (Some(text), None) => Content::Text(text.clone()),
@@ -197,6 +226,7 @@ pub fn to_completions_input(
     };
 
     let mut messages: Vec<Message> = Vec::new();
+    let tools_present = !config.tools.is_empty();
 
     for (i, entry) in entries.iter().enumerate() {
         match entry {
@@ -235,6 +265,15 @@ pub fn to_completions_input(
             }),
 
             Entry::Response { blocks } => {
+                if has_unreplayable_encrypted_thinking(blocks) {
+                    return Err(vec![
+                        crate::validation::ValidationError::IncompatibleThinking {
+                            index: i,
+                            provider: "openai_chat_completions",
+                            kind: "encrypted",
+                        },
+                    ]);
+                }
                 let (reasoning, text) = flatten_blocks(blocks);
 
                 if text.is_empty() {
@@ -254,7 +293,7 @@ pub fn to_completions_input(
                         // Chat Completions requires `content` unless tool calls
                         // are present; an empty string keeps it schema-valid.
                         content: Some(Content::Text(String::new())),
-                        reasoning_content: Some(reasoning),
+                        reasoning_content: reasoning_content(Some(reasoning), tools_present),
                         tool_calls: Vec::new(),
                         tool_call_id: None,
                     });
@@ -262,7 +301,7 @@ pub fn to_completions_input(
                     messages.push(Message {
                         role: Role::Assistant,
                         content: Some(Content::Text(text)),
-                        reasoning_content: reasoning,
+                        reasoning_content: reasoning_content(reasoning, tools_present),
                         tool_calls: Vec::new(),
                         tool_call_id: None,
                     });
@@ -270,6 +309,15 @@ pub fn to_completions_input(
             }
 
             Entry::ResponseToolCall { blocks, tool_call } => {
+                if has_unreplayable_encrypted_thinking(blocks) {
+                    return Err(vec![
+                        crate::validation::ValidationError::IncompatibleThinking {
+                            index: i,
+                            provider: "openai_chat_completions",
+                            kind: "encrypted",
+                        },
+                    ]);
+                }
                 let (reasoning, text) = flatten_blocks(blocks);
                 let tool_calls = tool_call
                     .iter()
@@ -285,7 +333,7 @@ pub fn to_completions_input(
                 messages.push(Message {
                     role: Role::Assistant,
                     content: (!text.is_empty()).then_some(Content::Text(text)),
-                    reasoning_content: reasoning,
+                    reasoning_content: reasoning_content(reasoning, tools_present),
                     tool_calls,
                     tool_call_id: None,
                 });
@@ -531,6 +579,37 @@ mod tests {
     }
 
     #[test]
+    fn tools_require_reasoning_content_on_every_assistant_message() {
+        // DeepSeek thinking mode with tools rejects requests where any
+        // assistant message omits `reasoning_content`, even when the model
+        // produced no reasoning for that turn.
+        let cfg = ModelConfig {
+            tools: vec![crate::generic_tool::Tool {
+                name: "noop".to_owned(),
+                description: None,
+                parameters: Default::default(),
+            }],
+            ..config()
+        };
+        let v = serde_json::to_value(
+            to_completions_input(
+                &[
+                    text_user("first"),
+                    Entry::response_text("no reasoning here"),
+                    text_user("second"),
+                    Entry::response_text("answer"),
+                ],
+                &cfg,
+            )
+            .expect("valid history"),
+        )
+        .unwrap();
+
+        assert_eq!(v["messages"][1]["reasoning_content"], "");
+        assert_eq!(v["messages"][3]["reasoning_content"], "");
+    }
+
+    #[test]
     fn system_and_environment_messages_are_forwarded() {
         let v = serialize(&[
             Entry::SystemPrompt {
@@ -589,7 +668,34 @@ mod tests {
             err.contains(&crate::validation::ValidationError::IncompatibleThinking {
                 index: 1,
                 provider: "openai_chat_completions",
-                kind: "opaque",
+                kind: "encrypted",
+            })
+        );
+    }
+
+    #[test]
+    fn encrypted_thinking_is_rejected_even_when_text_is_present() {
+        // Silently dropping the opaque reasoning here is what makes a later
+        // request fail with "reasoning_content must be passed back".
+        let err = to_completions_input(
+            &[
+                text_user("q"),
+                Entry::response(vec![
+                    ResponseBlock::Thinking(llm_history_model::history::Thinking::Encrypted {
+                        thinking: "opaque".into(),
+                    }),
+                    ResponseBlock::Text("answer".into()),
+                ]),
+            ],
+            &config(),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.contains(&crate::validation::ValidationError::IncompatibleThinking {
+                index: 1,
+                provider: "openai_chat_completions",
+                kind: "encrypted",
             })
         );
     }
