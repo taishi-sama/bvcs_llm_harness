@@ -122,5 +122,6 @@ const fn type_name(parameter: &ParameterType) -> &'static str {
         ParameterType::String => "string",
         ParameterType::Number => "number",
         ParameterType::Boolean => "boolean",
+        ParameterType::Object => "object",
     }
 }

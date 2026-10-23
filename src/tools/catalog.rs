@@ -63,6 +63,7 @@ const fn manual(order: u32, tags: &'static [&'static str]) -> Policy {
 /// single reviewable diff.
 fn policy(name: &str) -> Policy {
     match name {
+        "execute" => advertises(2, &["dispatch"]),
         "search_tools" => advertises(1, &["search"]),
 
         "fs_read" => advertises(10, &["fs"]),
@@ -93,6 +94,9 @@ fn policy(name: &str) -> Policy {
 }
 
 fn execution(name: &str) -> Execution {
+    if name == "execute" {
+        return Execution::Gateway;
+    }
     if let Some(handler) = crate::tools::fs::handler(name) {
         return Execution::Inline(handler);
     }
@@ -128,7 +132,12 @@ pub(crate) fn auto_background(name: &str) -> bool {
 pub(crate) fn model_only(name: &str) -> bool {
     matches!(
         name,
-        "spawn_agent" | "rename_self" | "end_agent" | "eval_javascript" | "run_javascript"
+        "spawn_agent"
+            | "rename_self"
+            | "end_agent"
+            | "eval_javascript"
+            | "run_javascript"
+            | "execute"
     )
 }
 
@@ -141,6 +150,7 @@ pub(crate) fn is_implemented(name: &str) -> bool {
     crate::tools::fs::handler(name).is_some()
         || crate::tools::agent_tools::handler(name).is_some()
         || name == "search_tools"
+        || name == "execute"
         || crate::tools::is_js_tool(name)
 }
 
@@ -175,7 +185,6 @@ pub(crate) fn register_script_tools(vfs: Res<VirtualFs>, mut commands: Commands)
             crate::tools::script::ScriptTool {
                 entry: spec.entry,
                 export: spec.export,
-                timeout_ms: spec.timeout_ms,
             },
             Advertised,
         ));

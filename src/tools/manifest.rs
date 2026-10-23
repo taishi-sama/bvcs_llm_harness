@@ -61,8 +61,6 @@ struct RawTool {
     export: String,
     #[serde(default = "default_order")]
     order: u32,
-    #[serde(default)]
-    timeout_ms: Option<u64>,
 }
 
 fn default_entry() -> String {
@@ -96,8 +94,6 @@ pub(crate) struct ScriptToolSpec {
     #[allow(dead_code, reason = "consumed by the script executor in phase 3")]
     pub export: String,
     pub order: u32,
-    #[allow(dead_code, reason = "consumed by the script executor in phase 3")]
-    pub timeout_ms: Option<u64>,
 }
 
 /// An importable library declared by `library.json`.
@@ -202,7 +198,6 @@ pub(crate) fn scan_tools(tree: &ToolsTree, warnings: &mut Vec<String>) -> Vec<Sc
             entry,
             export: parsed.export,
             order: parsed.order,
-            timeout_ms: parsed.timeout_ms,
         });
     }
 

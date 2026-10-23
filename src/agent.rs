@@ -41,7 +41,6 @@ use crate::{
             complete_tool_request, finish_round_if_ready, parse_background_after,
             resolve_auto_background, send_nested_reply,
         },
-        script::DEFAULT_SCRIPT_TIMEOUT,
     },
     transcript::{
         AgentTab, AgentView, CollapsibleText, RetryAgentButton, TextCollapseConfig,
@@ -1441,6 +1440,40 @@ pub(crate) fn execute_tool_calls(
                         }
                     }
                 }
+                Some(found) if matches!(found.execution, Execution::Gateway) => {
+                    match dispatch_gateway(
+                        &mut world,
+                        &js_handles,
+                        &script,
+                        &sources,
+                        &policy,
+                        &mut rounds,
+                        request.agent,
+                        &source_name,
+                        &arguments,
+                        root,
+                    ) {
+                        GatewayDispatch::Done { message, is_error } => {
+                            results[call_index] = Some(ToolCallResult {
+                                result: message,
+                                is_error,
+                                tool_use_id: call.tool_use_id.clone(),
+                            });
+                            remaining -= 1;
+                        }
+                        GatewayDispatch::Pending {
+                            request: target,
+                            auto_background,
+                        } => rounds.track(
+                            target,
+                            PendingCallFields {
+                                round_id,
+                                call_index,
+                                auto_background,
+                            },
+                        ),
+                    }
+                }
                 Some(found) if matches!(found.execution, Execution::Script) => {
                     let auto = resolve_auto_background(
                         AutoBackground::Default,
@@ -1450,10 +1483,6 @@ pub(crate) fn execute_tool_calls(
                     let spec = world.scripts.get(found.entity).cloned();
                     match spec {
                         Ok(spec) => {
-                            let timeout = spec
-                                .timeout_ms
-                                .map(Duration::from_millis)
-                                .unwrap_or(DEFAULT_SCRIPT_TIMEOUT);
                             if !rounds.spend_budget(root) {
                                 results[call_index] = Some(ToolCallResult {
                                     result: budget_exhausted_message(),
@@ -1470,7 +1499,6 @@ pub(crate) fn execute_tool_calls(
                                     entry: spec.entry,
                                     export: spec.export,
                                     arguments: arguments.clone(),
-                                    timeout,
                                     depth: 1,
                                     root,
                                 },
@@ -1643,6 +1671,163 @@ pub(crate) fn poll_script_events(
     }
 }
 
+/// Result of calling the model-facing `execute` gateway.
+enum GatewayDispatch {
+    Done {
+        message: String,
+        is_error: bool,
+    },
+    /// An async target was submitted; its result fills the gateway's round slot.
+    Pending {
+        request: u64,
+        auto_background: Option<Duration>,
+    },
+}
+
+fn gateway_error(message: impl Into<String>) -> GatewayDispatch {
+    GatewayDispatch::Done {
+        message: message.into(),
+        is_error: true,
+    }
+}
+
+/// Parse `execute(tool_name, args, background_after)`.
+fn parse_gateway_arguments(arguments: &Value) -> Result<(String, Value, AutoBackground), String> {
+    let Some(target) = arguments.get("tool_name").and_then(Value::as_str) else {
+        return Err("`execute` requires a `tool_name` string".to_owned());
+    };
+    let target_arguments = arguments.get("args").cloned().unwrap_or(Value::Null);
+    let background = match arguments.get("background_after") {
+        None | Some(Value::Null) => AutoBackground::Default,
+        Some(value) => {
+            let Some(seconds) = value.as_f64() else {
+                return Err("`background_after` must be a number of seconds".to_owned());
+            };
+            parse_background_after(Some(seconds))?
+        }
+    };
+    Ok((target.to_owned(), target_arguments, background))
+}
+
+/// Call another tool by name on behalf of the model.
+///
+/// This is the model-facing twin of the JavaScript `execute()` global: same
+/// argument shape, same background semantics, same depth/budget rules.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_gateway(
+    world: &mut ToolWorld<'_, '_>,
+    js_handles: &Query<&JsRuntimeHandle>,
+    script: &ScriptRuntime,
+    sources: &ToolSourceCache,
+    policy: &AutoBackgroundPolicy,
+    rounds: &mut ToolRounds,
+    agent: Entity,
+    source_name: &str,
+    arguments: &Value,
+    root: u64,
+) -> GatewayDispatch {
+    let (target_name, target_arguments, background) = match parse_gateway_arguments(arguments) {
+        Ok(parsed) => parsed,
+        Err(err) => return gateway_error(err),
+    };
+
+    let context = CallContext {
+        source_entity: agent,
+        source_agent: source_name,
+        depth: 1,
+        root,
+    };
+
+    let Some(found) = find(world, &target_name) else {
+        return gateway_error(format!("Unknown tool: {target_name}"));
+    };
+    if let Some(reason) = found.disabled {
+        return gateway_error(format!("Tool `{target_name}` is disabled: {reason}"));
+    }
+    if matches!(found.execution, Execution::Gateway) {
+        return gateway_error("`execute` cannot call `execute`");
+    }
+    if !rounds.spend_budget(root) {
+        return gateway_error(budget_exhausted_message());
+    }
+
+    let auto = resolve_auto_background(background, found.auto_background, policy.auto_after);
+    match found.execution {
+        Execution::Inline(_) => {
+            if !matches!(background, AutoBackground::Default | AutoBackground::Never) {
+                rounds.refund_budget(root);
+                return gateway_error(format!("tool `{target_name}` cannot run in the background"));
+            }
+            let (message, is_error) =
+                execute_tool(world, &target_name, &target_arguments, &context);
+            GatewayDispatch::Done { message, is_error }
+        }
+        Execution::Interpreter => {
+            let submitted = interpreter_task(&target_name, &target_arguments, &world.fs, 2, root)
+                .and_then(|task| {
+                    js_handles
+                        .get(agent)
+                        .map_err(|_| format!("agent {agent} has no JavaScript runtime"))?
+                        .submit(task)
+                });
+            match submitted {
+                Err(err) => {
+                    rounds.refund_budget(root);
+                    gateway_error(err)
+                }
+                Ok(request) if auto == Some(Duration::ZERO) => {
+                    let task_id = rounds.detach(request, agent);
+                    GatewayDispatch::Done {
+                        message: background_started_message(task_id),
+                        is_error: false,
+                    }
+                }
+                Ok(request) => GatewayDispatch::Pending {
+                    request,
+                    auto_background: auto,
+                },
+            }
+        }
+        Execution::Script => {
+            let Ok(spec) = world.scripts.get(found.entity).cloned() else {
+                rounds.refund_budget(root);
+                return gateway_error(format!(
+                    "script tool `{target_name}` is missing its execution data"
+                ));
+            };
+            let submitted = script.submit(
+                agent,
+                ScriptTask {
+                    sources: sources.0.clone(),
+                    entry: spec.entry,
+                    export: spec.export,
+                    arguments: target_arguments,
+                    depth: 2,
+                    root,
+                },
+            );
+            match submitted {
+                Err(err) => {
+                    rounds.refund_budget(root);
+                    gateway_error(err)
+                }
+                Ok(request) if auto == Some(Duration::ZERO) => {
+                    let task_id = rounds.detach(request, agent);
+                    GatewayDispatch::Done {
+                        message: background_started_message(task_id),
+                        is_error: false,
+                    }
+                }
+                Ok(request) => GatewayDispatch::Pending {
+                    request,
+                    auto_background: auto,
+                },
+            }
+        }
+        Execution::Gateway => unreachable!("checked above"),
+    }
+}
+
 /// Which context is asking the main loop to run a tool.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum HostOrigin {
@@ -1791,6 +1976,11 @@ fn handle_host_tool(
                 }
             }
         }
+        Execution::Gateway => reply_now(
+            js_handles,
+            reply,
+            Err(format!("tool `{name}` can only be called by the model")),
+        ),
         Execution::Script => {
             let Ok(spec) = world.scripts.get(found.entity).cloned() else {
                 return reply_now(
@@ -1801,10 +1991,6 @@ fn handle_host_tool(
                     )),
                 );
             };
-            let timeout = spec
-                .timeout_ms
-                .map(Duration::from_millis)
-                .unwrap_or(DEFAULT_SCRIPT_TIMEOUT);
             if !rounds.spend_budget(root) {
                 return reply_now(js_handles, reply, Err(budget_exhausted_message()));
             }
@@ -1815,7 +2001,6 @@ fn handle_host_tool(
                     entry: spec.entry,
                     export: spec.export,
                     arguments: arguments.clone(),
-                    timeout,
                     depth: depth + 1,
                     root,
                 },
@@ -2511,6 +2696,43 @@ mod background_tests {
         let rounds = app.world().resource::<ToolRounds>();
         assert!(rounds.has_pending(request));
         assert!(!rounds.has_detached(request));
+    }
+
+    #[test]
+    fn gateway_arguments_follow_execute_semantics() {
+        let (name, args, background) =
+            parse_gateway_arguments(&serde_json::json!({ "tool_name": "fs_ls" })).unwrap();
+        assert_eq!(name, "fs_ls");
+        assert_eq!(args, Value::Null);
+        assert_eq!(background, AutoBackground::Default);
+
+        let (_, args, _) = parse_gateway_arguments(&serde_json::json!({
+            "tool_name": "demo",
+            "args": { "message": "hi" }
+        }))
+        .unwrap();
+        assert_eq!(args["message"], "hi");
+
+        for (value, expected) in [
+            (-1.0, AutoBackground::Never),
+            (0.0, AutoBackground::Immediately),
+        ] {
+            let (_, _, background) = parse_gateway_arguments(&serde_json::json!({
+                "tool_name": "x",
+                "background_after": value
+            }))
+            .unwrap();
+            assert_eq!(background, expected);
+        }
+
+        assert!(parse_gateway_arguments(&serde_json::json!({})).is_err());
+        assert!(
+            parse_gateway_arguments(&serde_json::json!({
+                "tool_name": "x",
+                "background_after": "soon"
+            }))
+            .is_err()
+        );
     }
 
     #[test]

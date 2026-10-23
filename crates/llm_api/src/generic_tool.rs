@@ -7,6 +7,7 @@ pub enum ParameterType {
     String,
     Number,
     Boolean,
+    Object,
 }
 
 const fn default_true() -> bool {

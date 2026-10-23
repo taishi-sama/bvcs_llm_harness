@@ -48,6 +48,8 @@ pub(crate) enum Execution {
     Interpreter,
     /// Submitted to a fresh `.tools` context and completed later.
     Script,
+    /// The model-facing `execute` tool: dispatches another tool by name.
+    Gateway,
 }
 
 /// Whether a tool may only be reached by naming it explicitly.

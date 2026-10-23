@@ -13,10 +13,9 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-        mpsc::{self, Receiver, RecvTimeoutError, Sender},
+        mpsc::{self, Receiver, Sender},
     },
     thread,
-    time::Duration,
 };
 
 use bevy::prelude::{Component, Entity, Res, ResMut, Resource};
@@ -28,8 +27,6 @@ use crate::{
     virtual_fs::VirtualFs,
 };
 
-/// Deadline for a script call when the manifest does not set `timeout_ms`.
-pub(crate) const DEFAULT_SCRIPT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Concurrent script calls; beyond this, calls fail fast instead of queueing.
 const MAX_CONCURRENT_SCRIPTS: usize = 32;
 /// Keeps script request ids disjoint from agent-interpreter ids.
@@ -183,7 +180,6 @@ pub(crate) struct ScriptTool {
     pub entry: String,
     /// Exported function the host calls with the parsed arguments object.
     pub export: String,
-    pub timeout_ms: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -195,7 +191,6 @@ pub(crate) struct ScriptTask {
     pub entry: String,
     pub export: String,
     pub arguments: Value,
-    pub timeout: Duration,
     /// Nesting below the model's root call; script nested calls add one.
     pub depth: u32,
     pub root: u64,
@@ -274,18 +269,9 @@ impl ScriptRuntime {
 
         let request = SCRIPT_REQUEST_TAG | self.next_request.fetch_add(1, Ordering::Relaxed);
         let done = Arc::new(AtomicBool::new(false));
-        let deadline_done = done.clone();
-        // Set when the deadline fires; blocked host calls notice and unwind.
-        let expired = Arc::new(AtomicBool::new(false));
-        let expired_worker = expired.clone();
-        let expired_watchdog = expired.clone();
-        // Signals the watchdog that the worker finished; dropping it (panic or
-        // return) also counts as finished.
-        let (finished_tx, finished_rx) = mpsc::channel::<()>();
         let event_tx = self.event_tx.clone();
         let host_tx = self.host_tx.clone();
         let live_counter = self.live.clone();
-        let timeout = task.timeout;
 
         let _ = self.event_tx.send(ScriptEvent::Started {
             request,
@@ -298,7 +284,6 @@ impl ScriptRuntime {
                 let dispatch = ScriptHost {
                     agent,
                     host: host_tx,
-                    expired: expired_worker,
                 };
                 // A Boa panic must not strand the round or consume a slot.
                 let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -323,59 +308,12 @@ impl ScriptRuntime {
                         result,
                     });
                 }
-                let _ = finished_tx.send(());
                 live_counter.fetch_sub(1, Ordering::SeqCst);
             });
 
         if let Err(err) = spawned {
             self.live.fetch_sub(1, Ordering::SeqCst);
             return Err(format!("could not start a script worker: {err}"));
-        }
-
-        // Deadline watchdog: the worker keeps its slot until Boa's loop limit
-        // or the host call returns, so a runaway script cannot be reused but
-        // also cannot silently hold the round forever.
-        let done = deadline_done;
-        let event_tx = self.event_tx.clone();
-        let deadline = thread::Builder::new()
-            .name(format!("tool-script-deadline-{request:x}"))
-            .spawn(move || {
-                // Exits as soon as the call finishes, so at most the number of
-                // in-flight scripts (not the number of calls) have watchdogs.
-                match finished_rx.recv_timeout(timeout) {
-                    Err(RecvTimeoutError::Timeout) => {}
-                    Err(RecvTimeoutError::Disconnected) => {
-                        if done
-                            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                            .is_ok()
-                        {
-                            let _ = event_tx.send(ScriptEvent::Done {
-                                agent,
-                                request,
-                                result: Err("script tool stopped unexpectedly".to_owned()),
-                            });
-                        }
-                        return;
-                    }
-                    Ok(()) => return,
-                }
-                expired_watchdog.store(true, Ordering::SeqCst);
-                if done
-                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_ok()
-                {
-                    let _ = event_tx.send(ScriptEvent::Done {
-                        agent,
-                        request,
-                        result: Err(format!(
-                            "script tool timed out after {} ms",
-                            timeout.as_millis()
-                        )),
-                    });
-                }
-            });
-        if let Err(err) = deadline {
-            bevy::log::warn!("could not start a script deadline watchdog: {err}");
         }
 
         Ok(request)
@@ -387,14 +325,10 @@ impl ScriptRuntime {
 struct ScriptHost {
     agent: Entity,
     host: Sender<ScriptHostRequest>,
-    expired: Arc<AtomicBool>,
 }
 
 impl HostDispatch for ScriptHost {
     fn call(&self, command: HostCommand) -> Result<String, String> {
-        if self.expired.load(Ordering::SeqCst) {
-            return Err("script tool timed out".to_owned());
-        }
         let (reply, wait) = mpsc::channel();
         self.host
             .send(ScriptHostRequest {
@@ -403,20 +337,8 @@ impl HostDispatch for ScriptHost {
                 reply,
             })
             .map_err(|_| "the harness stopped accepting tool calls".to_owned())?;
-        // Poll the deadline so a timed-out worker cannot block here forever.
-        loop {
-            match wait.recv_timeout(Duration::from_millis(100)) {
-                Ok(result) => return result,
-                Err(RecvTimeoutError::Timeout) => {
-                    if self.expired.load(Ordering::SeqCst) {
-                        return Err("script tool timed out".to_owned());
-                    }
-                }
-                Err(RecvTimeoutError::Disconnected) => {
-                    return Err("the harness stopped before answering the tool call".to_owned());
-                }
-            }
-        }
+        wait.recv()
+            .map_err(|_| "the harness stopped before answering the tool call".to_owned())?
     }
 }
 

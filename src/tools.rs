@@ -263,6 +263,46 @@ pub(crate) fn is_truthy(value: Option<&Value>) -> bool {
 pub(crate) fn definitions() -> Vec<Tool> {
     vec![
         Tool {
+            name: "execute".into(),
+            description: Some(
+                "Call any registered tool by name. Use search_tools to find names. \
+                 `args` is the argument object for the target tool. Optional \
+                 `background_after` is seconds until the call detaches: 0 detaches \
+                 immediately, a negative value never detaches, and omitting it uses \
+                 the target tool's default. A detached call returns a task id and \
+                 reports its result later as a message."
+                    .into(),
+            ),
+            parameters: HashMap::from([
+                (
+                    "tool_name".to_owned(),
+                    ParameterDescription {
+                        r#type: ParameterType::String,
+                        description: "Name of the tool to call".into(),
+                        required: true,
+                    },
+                ),
+                (
+                    "args".to_owned(),
+                    ParameterDescription {
+                        r#type: ParameterType::Object,
+                        description: "Arguments object passed to the target tool (default empty)"
+                            .into(),
+                        required: false,
+                    },
+                ),
+                (
+                    "background_after".to_owned(),
+                    ParameterDescription {
+                        r#type: ParameterType::Number,
+                        description: "Optional seconds until the call detaches; 0 = now,                                       negative = never"
+                            .into(),
+                        required: false,
+                    },
+                ),
+            ]),
+        },
+        Tool {
             name: "search_tools".into(),
             description: Some(
                 "Search registered tools by name and/or description and return a compact \
@@ -846,6 +886,10 @@ pub(crate) fn execute_tool(
             format!("tool `{name}` must run as a script tool call"),
             true,
         ),
+        Execution::Gateway => (
+            format!("tool `{name}` can only be called by the model"),
+            true,
+        ),
     }
 }
 
@@ -923,6 +967,7 @@ mod tests {
         };
 
         for name in [
+            "execute",
             "search_tools",
             "fs_read",
             "fs_write",

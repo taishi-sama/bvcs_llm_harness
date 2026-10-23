@@ -14,6 +14,7 @@ const fn parameter_type_str(t: &ParameterType) -> &'static str {
         ParameterType::String => "string",
         ParameterType::Number => "number",
         ParameterType::Boolean => "boolean",
+        ParameterType::Object => "object",
     }
 }
 
