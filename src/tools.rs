@@ -9,6 +9,7 @@
 
 pub(crate) mod manifest;
 pub(crate) mod mirror;
+pub(crate) mod schedule;
 pub(crate) mod script;
 pub(crate) mod tree;
 
@@ -21,7 +22,7 @@ mod world;
 
 use std::collections::HashMap;
 
-use bevy::prelude::{Entity, Query};
+use bevy::prelude::Query;
 use llm_api::generic_tool::{ParameterDescription, ParameterType, Tool};
 use llm_history_model::history::Entry;
 use serde_json::Value;
@@ -37,6 +38,7 @@ pub(crate) use mirror::{
     MirrorDebounce, MirrorStatus, ToolsDir, flush_tool_mirror, seed_tool_tree,
 };
 pub(crate) use registry::{CallContext, Execution, find, register_static_tools};
+pub(crate) use schedule::background_started_message;
 pub(crate) use script::{ScriptHostRequest, ScriptRuntime, ScriptTask, ToolSourceCache};
 pub(crate) use world::ToolWorld;
 
@@ -45,6 +47,8 @@ pub(crate) fn interpreter_task(
     name: &str,
     arguments: &Value,
     fs: &VirtualFs,
+    depth: u32,
+    root: u64,
 ) -> Result<JsTask, String> {
     match name {
         "run_javascript" => {
@@ -53,7 +57,11 @@ pub(crate) fn interpreter_task(
                 .and_then(Value::as_str)
                 .ok_or_else(|| "missing required string parameter `file`".to_owned())?;
             let source = fs.read(file)?;
-            Ok(JsTask::Eval { source })
+            Ok(JsTask::Eval {
+                source,
+                depth,
+                root,
+            })
         }
         "eval_javascript" => {
             let code = arguments
@@ -62,6 +70,8 @@ pub(crate) fn interpreter_task(
                 .ok_or_else(|| "missing required string parameter `code`".to_owned())?;
             Ok(JsTask::Eval {
                 source: code.to_owned(),
+                depth,
+                root,
             })
         }
         "eval_javascript_reset_context" => {
@@ -231,15 +241,6 @@ fn history_agent<'a>(
     agents
         .get(*entity)
         .map_err(|_| format!("Agent `{name}` no longer exists."))
-}
-
-/// Distinguish an omitted background flag (`None`) from an explicit falsey one
-/// (`Some(false)`), so callers can opt out of automatic backgrounding.
-pub(crate) fn background_setting(value: Option<&Value>) -> Option<bool> {
-    match value {
-        None | Some(Value::Null) => None,
-        Some(value) => Some(is_truthy(Some(value))),
-    }
 }
 
 /// Treat common model-generated spellings as boolean true.
@@ -818,21 +819,25 @@ pub(crate) fn execute_tool(
     world: &mut ToolWorld<'_, '_>,
     name: &str,
     arguments: &Value,
-    source_entity: Entity,
-    source_agent: &str,
+    call: &CallContext<'_>,
 ) -> (String, bool) {
+    if call.depth > crate::tools::schedule::MAX_TOOL_DEPTH {
+        return (
+            format!(
+                "tool call nesting limit ({}) reached",
+                crate::tools::schedule::MAX_TOOL_DEPTH
+            ),
+            true,
+        );
+    }
     let Some(tool) = registry::find(world, name) else {
         return (format!("Unknown tool: {name}"), true);
     };
     if let Some(reason) = tool.disabled {
         return (format!("Tool `{name}` is disabled: {reason}"), true);
     }
-    let call = CallContext {
-        source_entity,
-        source_agent,
-    };
     match tool.execution {
-        Execution::Inline(handler) => handler(world, arguments, &call),
+        Execution::Inline(handler) => handler(world, arguments, call),
         Execution::Interpreter => (
             format!("tool `{name}` must run in the JavaScript interpreter"),
             true,
@@ -969,6 +974,15 @@ mod tests {
         }
     }
 
+    fn smoke_context() -> CallContext<'static> {
+        CallContext {
+            source_entity: Entity::PLACEHOLDER,
+            source_agent: "Smoke",
+            depth: 0,
+            root: 0,
+        }
+    }
+
     #[derive(Resource, Default)]
     struct SmokeOutput(String);
 
@@ -977,30 +991,14 @@ mod tests {
             &mut world,
             "search_tools",
             &serde_json::json!({ "filter": "^fs_read$" }),
-            Entity::PLACEHOLDER,
-            "Smoke",
+            &smoke_context(),
         );
-        let (legacy_message, legacy_error) = execute_tool(
-            &mut world,
-            "fs_ls",
-            &Value::Null,
-            Entity::PLACEHOLDER,
-            "Smoke",
-        );
-        let (unknown_message, unknown_error) = execute_tool(
-            &mut world,
-            "no_such_tool",
-            &Value::Null,
-            Entity::PLACEHOLDER,
-            "Smoke",
-        );
-        let (agents_message, agents_error) = execute_tool(
-            &mut world,
-            "list_agents",
-            &Value::Null,
-            Entity::PLACEHOLDER,
-            "Smoke",
-        );
+        let (legacy_message, legacy_error) =
+            execute_tool(&mut world, "fs_ls", &Value::Null, &smoke_context());
+        let (unknown_message, unknown_error) =
+            execute_tool(&mut world, "no_such_tool", &Value::Null, &smoke_context());
+        let (agents_message, agents_error) =
+            execute_tool(&mut world, "list_agents", &Value::Null, &smoke_context());
         out.0 = format!(
             "{inline_error}|{inline_message}\n{legacy_error}|{legacy_message}\n{unknown_error}|{unknown_message}\n{agents_error}|{agents_message}"
         );
@@ -1131,26 +1129,17 @@ mod tests {
     }
 
     #[test]
-    fn background_setting_distinguishes_absent_from_false() {
-        assert_eq!(background_setting(None), None);
-        assert_eq!(background_setting(Some(&Value::Bool(true))), Some(true));
-        assert_eq!(background_setting(Some(&Value::Bool(false))), Some(false));
-        assert_eq!(
-            background_setting(Some(&serde_json::json!("false"))),
-            Some(false)
-        );
-    }
-
-    #[test]
     fn interpreter_tasks_only_accept_javascript_tools() {
         let fs = VirtualFs::default();
 
-        assert!(interpreter_task("fs_read", &Value::Null, &fs).is_err());
+        assert!(interpreter_task("fs_read", &Value::Null, &fs, 0, 0).is_err());
         assert!(matches!(
             interpreter_task(
                 "eval_javascript",
                 &serde_json::json!({ "code": "1 + 1" }),
-                &fs
+                &fs,
+                0,
+                0
             ),
             Ok(JsTask::Eval { .. })
         ));
@@ -1158,7 +1147,9 @@ mod tests {
             interpreter_task(
                 "eval_javascript_reset_context",
                 &serde_json::json!({ "symbol": "" }),
-                &fs
+                &fs,
+                0,
+                0
             ),
             Ok(JsTask::Reset { symbol: None })
         ));

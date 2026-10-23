@@ -25,6 +25,14 @@ pub(crate) struct CallContext<'a> {
     /// Its name at dispatch time (owned by `execute_tool` so the `Agent`
     /// borrow can end before the handler gets `&mut ToolWorld`).
     pub source_agent: &'a str,
+    /// Nesting below the model's root call; 0 for the root itself.
+    pub depth: u32,
+    /// Root call id shared by everything below one model tool call.
+    #[allow(
+        dead_code,
+        reason = "budget accounting keys on this in the host bridge"
+    )]
+    pub root: u64,
 }
 
 /// Handler signature for tools executed synchronously on the main loop.
@@ -68,6 +76,8 @@ pub(crate) struct ToolEntry {
     /// Coarse grouping ("fs", "js", "agent") for filtering and diagnostics.
     #[allow(dead_code, reason = "consumed by tag filters and diagnostics")]
     pub tags: &'static [&'static str],
+    /// Whether the tool opts into the global auto-background grace period.
+    pub auto_background: bool,
 }
 
 /// Include this tool in the model-facing tool schema.
@@ -100,6 +110,7 @@ pub(crate) struct Found {
     pub disabled: Option<&'static str>,
     #[allow(dead_code, reason = "consumed by the script-origin checks")]
     pub model_only: bool,
+    pub auto_background: bool,
 }
 
 /// Locate a tool by the name the model or JavaScript used.
@@ -115,6 +126,7 @@ pub(crate) fn find(world: &ToolWorld<'_, '_>, name: &str) -> Option<Found> {
                 advertised,
                 disabled: disabled.map(|disabled| disabled.reason),
                 model_only,
+                auto_background: entry.auto_background,
             })
         })
 }
@@ -131,6 +143,7 @@ pub(crate) fn register_static_tools(mut commands: Commands) {
         advertised,
         order,
         tags,
+        auto_background,
     } in static_tools()
     {
         let mut entity = commands.spawn(ToolEntry {
@@ -139,6 +152,7 @@ pub(crate) fn register_static_tools(mut commands: Commands) {
             availability,
             order,
             tags,
+            auto_background,
         });
         if advertised {
             entity.insert(Advertised);

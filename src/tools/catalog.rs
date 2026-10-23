@@ -26,6 +26,7 @@ pub(crate) struct StaticTool {
     pub advertised: bool,
     pub order: u32,
     pub tags: &'static [&'static str],
+    pub auto_background: bool,
 }
 
 /// Advertisement query used to build a request's tool list.
@@ -116,6 +117,11 @@ fn no_handler(
     ("tool has no registered handler".to_owned(), true)
 }
 
+/// Tools that opt into the global auto-background grace period by default.
+pub(crate) fn auto_background(name: &str) -> bool {
+    matches!(name, "run_javascript" | "eval_javascript")
+}
+
 /// Whether a definition has a real handler.
 ///
 /// Tests use this to catch a tool added to `definitions` but never wired into
@@ -154,6 +160,7 @@ pub(crate) fn register_script_tools(vfs: Res<VirtualFs>, mut commands: Commands)
                 availability: Availability::AnyWay,
                 order: 1000 + spec.order,
                 tags: &["script"],
+                auto_background: false,
             },
             crate::tools::script::ScriptTool {
                 entry: spec.entry,
@@ -185,6 +192,7 @@ pub(crate) fn static_tools() -> Vec<StaticTool> {
             } = policy(&definition.name);
             StaticTool {
                 execution: execution(&definition.name),
+                auto_background: auto_background(&definition.name),
                 definition,
                 availability,
                 advertised,

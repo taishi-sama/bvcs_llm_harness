@@ -195,6 +195,9 @@ pub(crate) struct ScriptTask {
     pub export: String,
     pub arguments: Value,
     pub timeout: Duration,
+    /// Nesting below the model's root call; script nested calls add one.
+    pub depth: u32,
+    pub root: u64,
 }
 
 pub(crate) struct ScriptHostRequest {
@@ -203,10 +206,16 @@ pub(crate) struct ScriptHostRequest {
     pub reply: Sender<Result<String, String>>,
 }
 
-pub(crate) struct ScriptEvent {
-    pub agent: Entity,
-    pub request: u64,
-    pub result: Result<String, String>,
+pub(crate) enum ScriptEvent {
+    Started {
+        request: u64,
+        at: std::time::Instant,
+    },
+    Done {
+        agent: Entity,
+        request: u64,
+        result: Result<String, String>,
+    },
 }
 
 /// Owns the script workers' channels and the concurrency budget.
@@ -273,6 +282,11 @@ impl ScriptRuntime {
         let live_counter = self.live.clone();
         let timeout = task.timeout;
 
+        let _ = self.event_tx.send(ScriptEvent::Started {
+            request,
+            at: std::time::Instant::now(),
+        });
+
         let spawned = thread::Builder::new()
             .name(format!("tool-script-{request:x}"))
             .spawn(move || {
@@ -280,15 +294,20 @@ impl ScriptRuntime {
                     agent,
                     host: host_tx,
                 };
-                let result = JsSession::new_tools(std::rc::Rc::new(dispatch), task.sources)
-                    .and_then(|mut session| {
-                        session.eval_module_call(&task.entry, &task.export, &task.arguments)
-                    });
+                let result = JsSession::new_tools(
+                    std::rc::Rc::new(dispatch),
+                    task.sources,
+                    task.depth,
+                    task.root,
+                )
+                .and_then(|mut session| {
+                    session.eval_module_call(&task.entry, &task.export, &task.arguments)
+                });
                 if done
                     .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                     .is_ok()
                 {
-                    let _ = event_tx.send(ScriptEvent {
+                    let _ = event_tx.send(ScriptEvent::Done {
                         agent,
                         request,
                         result,
@@ -323,7 +342,7 @@ impl ScriptRuntime {
                     .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                     .is_ok()
                 {
-                    let _ = event_tx.send(ScriptEvent {
+                    let _ = event_tx.send(ScriptEvent::Done {
                         agent,
                         request,
                         result: Err(format!(

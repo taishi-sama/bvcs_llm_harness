@@ -18,8 +18,9 @@ use llm_api::{usage::Usage, wire_common::thinking_joined};
 use llm_history_model::history::{Entry, Thinking, ToolCallResult};
 
 use crate::{
-    agent::{ActiveAgent, Agent, AgentLayout, ToolRounds},
+    agent::{ActiveAgent, Agent, AgentLayout},
     messages::{CancelAgentRequest, RemoveAgentRequest, RetryAgentTurn},
+    tools::schedule::ToolRounds,
 };
 
 /// Truncation limits for long reasoning and tool-call bodies. A body collapses

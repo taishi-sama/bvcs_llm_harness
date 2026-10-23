@@ -5,7 +5,6 @@
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    env,
     time::{Duration, Instant},
 };
 
@@ -24,7 +23,7 @@ use llm_api::{
     stream::{RawStreamBytes, StreamEvent, finish_draft_for},
     usage::{Usage, UsageProvider},
 };
-use llm_history_model::history::{DraftBlock, Entry, MessageContent, ToolCall, ToolCallResult};
+use llm_history_model::history::{DraftBlock, Entry, MessageContent, ToolCallResult};
 use serde_json::Value;
 use tokio::sync::watch;
 
@@ -33,8 +32,15 @@ use crate::{
     js_runtime::{HostCommand, HostRequest, JsChannels, JsEvent, JsRuntimeHandle},
     messages::*,
     tools::{
-        AdvertisedTools, Execution, ScriptHostRequest, ScriptRuntime, ScriptTask, ToolSourceCache,
-        ToolWorld, advertised_tools, background_setting, execute_tool, find, interpreter_task,
+        AdvertisedTools, CallContext, Execution, ScriptHostRequest, ScriptRuntime, ScriptTask,
+        ToolSourceCache, ToolWorld, advertised_tools, background_started_message, execute_tool,
+        find, interpreter_task,
+        schedule::{
+            AutoBackground, AutoBackgroundPolicy, MAX_TOOL_DEPTH, NestedCall, NestedReply,
+            PendingCallFields, PendingToolRound, ToolRounds, background_from_flag,
+            complete_tool_request, finish_round_if_ready, parse_background_after,
+            resolve_auto_background, send_nested_reply,
+        },
         script::DEFAULT_SCRIPT_TIMEOUT,
     },
     transcript::{
@@ -52,152 +58,6 @@ use crate::transcript::{
 
 /// Prevent accidental runaway agent spawning from exhausting UI/VRAM.
 pub(crate) const MAX_AGENTS: usize = 64;
-
-// ---------------------------------------------------------------------------
-// Tool rounds
-// ---------------------------------------------------------------------------
-
-/// One in-flight tool round. Results are stored by call index so asynchronous
-/// JavaScript completions cannot reorder the history entry.
-pub(crate) struct PendingToolRound {
-    agent: Entity,
-    turn_id: u64,
-    calls: Vec<ToolCall>,
-    results: Vec<Option<ToolCallResult>>,
-    remaining: usize,
-}
-
-/// A detached interpreter task whose result arrives as an agent message.
-struct BackgroundTask {
-    task_id: u64,
-    agent: Entity,
-}
-
-/// A normal (non-detached) interpreter request inside a tool round.
-struct PendingJsRequest {
-    round_id: u64,
-    call_index: usize,
-    started_at: Option<Instant>,
-    /// False when the model explicitly passed `run_in_background: false`.
-    auto_background: bool,
-}
-
-/// Detaches long-running interpreter tasks after a grace period.
-#[derive(Resource)]
-pub(crate) struct BackgroundPolicy {
-    auto_after: Option<Duration>,
-}
-
-impl Default for BackgroundPolicy {
-    fn default() -> Self {
-        const DEFAULT_MS: u64 = 5_000;
-        let millis = env::var("JS_AUTO_BACKGROUND_MS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(DEFAULT_MS);
-        Self {
-            auto_after: (millis > 0).then(|| Duration::from_millis(millis)),
-        }
-    }
-}
-
-/// Tracks tool rounds that are waiting for one or more JS contexts.
-#[derive(Resource, Default)]
-pub(crate) struct ToolRounds {
-    active: HashMap<u64, PendingToolRound>,
-    /// Request id returned by [`JsRuntimeHandle::submit`] -> pending round slot.
-    js_requests: HashMap<u64, PendingJsRequest>,
-    /// Detached requests are deliberately not part of a round.
-    background: HashMap<u64, BackgroundTask>,
-    next_round: u64,
-    next_task_id: u64,
-}
-
-impl ToolRounds {
-    /// Stop tracking a round (used by cancellation and failures).
-    fn cancel_rounds(&mut self, agent: Entity) {
-        let rounds = self
-            .active
-            .iter()
-            .filter_map(|(id, round)| (round.agent == agent).then_some(*id))
-            .collect::<Vec<_>>();
-        for round_id in rounds {
-            self.active.remove(&round_id);
-        }
-        self.js_requests
-            .retain(|_, pending| self.active.contains_key(&pending.round_id));
-    }
-
-    /// Drop everything belonging to an agent, including detached tasks.
-    fn remove_agent(&mut self, agent: Entity) {
-        self.cancel_rounds(agent);
-        self.background.retain(|_, task| task.agent != agent);
-    }
-
-    /// Register a detached interpreter request and return its user-visible id.
-    fn start_background(&mut self, request: u64, agent: Entity) -> u64 {
-        self.next_task_id = self.next_task_id.wrapping_add(1);
-        let task_id = self.next_task_id;
-        self.background
-            .insert(request, BackgroundTask { task_id, agent });
-        task_id
-    }
-
-    fn take_background(&mut self, request: u64) -> Option<BackgroundTask> {
-        self.background.remove(&request)
-    }
-
-    /// Tool calls still in flight for `agent`: unresolved round slots plus
-    /// detached tasks that outlived their round.
-    pub(crate) fn running_for(&self, agent: Entity) -> usize {
-        let pending = self
-            .active
-            .values()
-            .filter(|round| round.agent == agent)
-            .map(|round| round.remaining)
-            .sum::<usize>();
-        let detached = self
-            .background
-            .values()
-            .filter(|task| task.agent == agent)
-            .count();
-        pending + detached
-    }
-}
-
-fn background_started_message(task_id: u64) -> String {
-    format!(
-        "Task {task_id} running in background, do not poll for it, continue your task or end turn to await result."
-    )
-}
-
-fn finish_round_if_ready(
-    rounds: &mut ToolRounds,
-    round_id: u64,
-    finished: &mut MessageWriter<ToolRoundFinished>,
-) {
-    let Some(round) = rounds.active.get(&round_id) else {
-        return;
-    };
-    if round.remaining != 0 {
-        return;
-    }
-
-    let round = rounds
-        .active
-        .remove(&round_id)
-        .expect("the round was checked above");
-    finished.write(ToolRoundFinished {
-        agent: round.agent,
-        turn_id: round.turn_id,
-        calls: round.calls,
-        results: round
-            .results
-            .into_iter()
-            .map(|result| result.expect("all tool results are available"))
-            .collect(),
-    });
-}
 
 // ---------------------------------------------------------------------------
 // Agent components
@@ -1454,12 +1314,14 @@ pub(crate) fn handle_turn_finished(
 /// World tools run immediately. JavaScript tools become [`JsTask`]s on the
 /// owning context thread, so this system never blocks on a Boa heap. Results
 /// are collected by [`poll_js_events`] and committed by [`apply_tool_results`].
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_tool_calls(
     mut requests: MessageReader<RunToolCalls>,
     mut world: ToolWorld,
     js_handles: Query<&JsRuntimeHandle>,
     script: Res<ScriptRuntime>,
     sources: Res<ToolSourceCache>,
+    policy: Res<AutoBackgroundPolicy>,
     mut rounds: ResMut<ToolRounds>,
     mut finished: MessageWriter<ToolRoundFinished>,
 ) {
@@ -1482,35 +1344,37 @@ pub(crate) fn execute_tool_calls(
         for (call_index, call) in request.tool_call.iter().enumerate() {
             let arguments =
                 serde_json::from_str::<Value>(&call.toolcall_params).unwrap_or(Value::Null);
+            let root = (round_id << 32) | call_index as u64;
+            rounds.open_budget(root);
+            let context = CallContext {
+                source_entity: request.agent,
+                source_agent: &source_name,
+                depth: 0,
+                root,
+            };
 
             let found = find(&world, &call.tool_name);
             match found {
                 Some(found) if matches!(found.execution, Execution::Interpreter) => {
-                    // JavaScript tools run on the agent's own context thread.
-                    let supports_background = matches!(
-                        call.tool_name.as_str(),
-                        "run_javascript" | "eval_javascript"
+                    let auto = resolve_auto_background(
+                        background_from_flag(arguments.get("run_in_background")),
+                        found.auto_background,
+                        policy.auto_after,
                     );
-                    let background = if supports_background {
-                        background_setting(arguments.get("run_in_background"))
-                    } else {
-                        None
-                    };
-                    let immediate_background = background == Some(true);
-                    let auto_background = supports_background && background != Some(false);
-
-                    let submitted = interpreter_task(&call.tool_name, &arguments, &world.fs)
-                        .and_then(|task| {
-                            js_handles
-                                .get(request.agent)
-                                .map_err(|_| {
-                                    format!("agent {} has no JavaScript runtime", request.agent)
-                                })?
-                                .submit(task)
-                        });
+                    let submitted =
+                        interpreter_task(&call.tool_name, &arguments, &world.fs, 1, root).and_then(
+                            |task| {
+                                js_handles
+                                    .get(request.agent)
+                                    .map_err(|_| {
+                                        format!("agent {} has no JavaScript runtime", request.agent)
+                                    })?
+                                    .submit(task)
+                            },
+                        );
                     match submitted {
-                        Ok(request_id) if immediate_background => {
-                            let task_id = rounds.start_background(request_id, request.agent);
+                        Ok(request_id) if auto == Some(Duration::ZERO) => {
+                            let task_id = rounds.detach(request_id, request.agent);
                             results[call_index] = Some(ToolCallResult {
                                 result: background_started_message(task_id),
                                 is_error: false,
@@ -1518,17 +1382,14 @@ pub(crate) fn execute_tool_calls(
                             });
                             remaining -= 1;
                         }
-                        Ok(request_id) => {
-                            rounds.js_requests.insert(
-                                request_id,
-                                PendingJsRequest {
-                                    round_id,
-                                    call_index,
-                                    started_at: None,
-                                    auto_background,
-                                },
-                            );
-                        }
+                        Ok(request_id) => rounds.track(
+                            request_id,
+                            PendingCallFields {
+                                round_id,
+                                call_index,
+                                auto_background: auto,
+                            },
+                        ),
                         Err(err) => {
                             results[call_index] = Some(ToolCallResult {
                                 result: err,
@@ -1540,6 +1401,11 @@ pub(crate) fn execute_tool_calls(
                     }
                 }
                 Some(found) if matches!(found.execution, Execution::Script) => {
+                    let auto = resolve_auto_background(
+                        AutoBackground::Default,
+                        found.auto_background,
+                        policy.auto_after,
+                    );
                     let spec = world.scripts.get(found.entity).cloned();
                     match spec {
                         Ok(spec) => {
@@ -1555,20 +1421,28 @@ pub(crate) fn execute_tool_calls(
                                     export: spec.export,
                                     arguments: arguments.clone(),
                                     timeout,
+                                    depth: 1,
+                                    root,
                                 },
                             );
                             match submitted {
-                                Ok(request_id) => {
-                                    rounds.js_requests.insert(
-                                        request_id,
-                                        PendingJsRequest {
-                                            round_id,
-                                            call_index,
-                                            started_at: None,
-                                            auto_background: false,
-                                        },
-                                    );
+                                Ok(request_id) if auto == Some(Duration::ZERO) => {
+                                    let task_id = rounds.detach(request_id, request.agent);
+                                    results[call_index] = Some(ToolCallResult {
+                                        result: background_started_message(task_id),
+                                        is_error: false,
+                                        tool_use_id: call.tool_use_id.clone(),
+                                    });
+                                    remaining -= 1;
                                 }
+                                Ok(request_id) => rounds.track(
+                                    request_id,
+                                    PendingCallFields {
+                                        round_id,
+                                        call_index,
+                                        auto_background: auto,
+                                    },
+                                ),
                                 Err(err) => {
                                     results[call_index] = Some(ToolCallResult {
                                         result: err,
@@ -1593,13 +1467,8 @@ pub(crate) fn execute_tool_calls(
                     }
                 }
                 _ => {
-                    let (result, is_error) = execute_tool(
-                        &mut world,
-                        &call.tool_name,
-                        &arguments,
-                        request.agent,
-                        &source_name,
-                    );
+                    let (result, is_error) =
+                        execute_tool(&mut world, &call.tool_name, &arguments, &context);
                     results[call_index] = Some(ToolCallResult {
                         result,
                         is_error,
@@ -1610,7 +1479,7 @@ pub(crate) fn execute_tool_calls(
             }
         }
 
-        rounds.active.insert(
+        rounds.insert_round(
             round_id,
             PendingToolRound {
                 agent: request.agent,
@@ -1628,6 +1497,7 @@ pub(crate) fn execute_tool_calls(
 /// has every result.
 pub(crate) fn poll_js_events(
     channels: Res<JsChannels>,
+    js_handles: Query<&JsRuntimeHandle>,
     mut rounds: ResMut<ToolRounds>,
     mut finished: MessageWriter<ToolRoundFinished>,
     mut task_results: MessageWriter<TaskResult>,
@@ -1635,9 +1505,7 @@ pub(crate) fn poll_js_events(
     for event in channels.drain_events() {
         let (agent, request, result) = match event {
             JsEvent::Started { request, at } => {
-                if let Some(pending) = rounds.js_requests.get_mut(&request) {
-                    pending.started_at = Some(at);
-                }
+                rounds.mark_started(request, at);
                 continue;
             }
             JsEvent::Done {
@@ -1647,162 +1515,298 @@ pub(crate) fn poll_js_events(
             } => (agent, request, result),
         };
 
-        if let Some(task) = rounds.take_background(request) {
-            let (text, is_error) = match result {
-                Ok(text) => (text, false),
-                Err(err) => (err, true),
-            };
-            task_results.write(TaskResult {
-                agent: task.agent,
-                task_id: task.task_id,
-                result: text,
-                is_error,
-            });
-            continue;
-        }
-
-        complete_tool_request(&mut rounds, request, agent, result, &mut finished);
-    }
-}
-
-/// Apply one finished tool request to its round, if the round still exists.
-///
-/// Shared by the agent interpreter and script workers so both complete through
-/// exactly the same bookkeeping.
-pub(crate) fn complete_tool_request(
-    rounds: &mut ToolRounds,
-    request: u64,
-    agent: Entity,
-    result: Result<String, String>,
-    finished: &mut MessageWriter<ToolRoundFinished>,
-) {
-    let Some(pending) = rounds.js_requests.remove(&request) else {
-        // The round was cancelled (or the agent failed) while the call was
-        // still running. Nothing to apply.
-        return;
-    };
-    let round_id = pending.round_id;
-
-    {
-        let Some(round) = rounds.active.get_mut(&round_id) else {
-            return;
-        };
-        if round.agent != agent {
-            return;
-        }
-
-        let (text, is_error) = match result {
-            Ok(text) => (text, false),
-            Err(err) => (err, true),
-        };
-        round.results[pending.call_index] = Some(ToolCallResult {
-            result: text,
-            is_error,
-            tool_use_id: round.calls[pending.call_index].tool_use_id.clone(),
-        });
-        round.remaining -= 1;
-    }
-
-    finish_round_if_ready(rounds, round_id, finished);
-}
-
-/// Drain completions from script workers.
-pub(crate) fn poll_script_events(
-    runtime: Res<ScriptRuntime>,
-    mut rounds: ResMut<ToolRounds>,
-    mut finished: MessageWriter<ToolRoundFinished>,
-) {
-    for event in runtime.drain_events() {
-        complete_tool_request(
+        route_async_result(
             &mut rounds,
-            event.request,
-            event.agent,
-            event.result,
+            request,
+            agent,
+            result,
+            &js_handles,
+            &mut task_results,
             &mut finished,
         );
     }
 }
 
+/// Route one completed async request: detached task, blocked nested caller, or
+/// a slot in an active round.
+fn route_async_result(
+    rounds: &mut ToolRounds,
+    request: u64,
+    agent: Entity,
+    result: Result<String, String>,
+    js_handles: &Query<&JsRuntimeHandle>,
+    task_results: &mut MessageWriter<TaskResult>,
+    finished: &mut MessageWriter<ToolRoundFinished>,
+) {
+    if let Some(task) = rounds.take_detached(request) {
+        let (text, is_error) = match result {
+            Ok(text) => (text, false),
+            Err(err) => (err, true),
+        };
+        task_results.write(TaskResult {
+            agent: task.agent,
+            task_id: task.task_id,
+            result: text,
+            is_error,
+        });
+        return;
+    }
+
+    if let Some(mut nested) = rounds.take_nested(request) {
+        if let Some(reply) = nested.take_reply() {
+            send_nested_reply(js_handles, reply, result);
+        }
+        return;
+    }
+
+    complete_tool_request(rounds, request, agent, result, finished);
+}
+
+/// Drain completions from script workers.
+pub(crate) fn poll_script_events(
+    runtime: Res<ScriptRuntime>,
+    js_handles: Query<&JsRuntimeHandle>,
+    mut rounds: ResMut<ToolRounds>,
+    mut finished: MessageWriter<ToolRoundFinished>,
+    mut task_results: MessageWriter<TaskResult>,
+) {
+    for event in runtime.drain_events() {
+        match event {
+            crate::tools::script::ScriptEvent::Started { request, at } => {
+                rounds.mark_started(request, at);
+            }
+            crate::tools::script::ScriptEvent::Done {
+                agent,
+                request,
+                result,
+            } => route_async_result(
+                &mut rounds,
+                request,
+                agent,
+                result,
+                &js_handles,
+                &mut task_results,
+                &mut finished,
+            ),
+        }
+    }
+}
+
+/// Outcome of a host tool call.
+enum HostOutcome {
+    /// The reply was already sent.
+    Immediate,
+    /// Registered as a nested/detached call; the reply is sent on completion.
+    Pending,
+}
+
+/// Send an immediate host reply to whichever caller is waiting.
+fn reply_now(
+    js_handles: &Query<&JsRuntimeHandle>,
+    reply: NestedReply,
+    result: Result<String, String>,
+) -> HostOutcome {
+    send_nested_reply(js_handles, reply, result);
+    HostOutcome::Immediate
+}
+
+/// Shared handling for `execute(...)` from JavaScript and script workers.
+#[allow(clippy::too_many_arguments)]
+fn handle_host_tool(
+    world: &mut ToolWorld<'_, '_>,
+    rounds: &mut ToolRounds,
+    js_handles: &Query<&JsRuntimeHandle>,
+    script: &ScriptRuntime,
+    sources: &ToolSourceCache,
+    policy: &AutoBackgroundPolicy,
+    agent: Entity,
+    name: &str,
+    arguments: &Value,
+    depth: u32,
+    root: u64,
+    background: Option<f64>,
+    reply: NestedReply,
+) -> HostOutcome {
+    if depth > MAX_TOOL_DEPTH {
+        return reply_now(
+            js_handles,
+            reply,
+            Err(format!(
+                "tool call nesting limit ({MAX_TOOL_DEPTH}) reached"
+            )),
+        );
+    }
+    let request = match parse_background_after(background) {
+        Ok(request) => request,
+        Err(err) => return reply_now(js_handles, reply, Err(err)),
+    };
+    let source_name = world
+        .agents
+        .get(agent)
+        .map(|agent| agent.name().to_owned())
+        .unwrap_or_else(|_| "agent".to_owned());
+    let context = CallContext {
+        source_entity: agent,
+        source_agent: &source_name,
+        depth,
+        root,
+    };
+
+    let Some(found) = find(world, name) else {
+        return reply_now(js_handles, reply, Err(format!("Unknown tool: {name}")));
+    };
+    if let Some(disabled) = found.disabled {
+        return reply_now(
+            js_handles,
+            reply,
+            Err(format!("Tool `{name}` is disabled: {disabled}")),
+        );
+    }
+
+    let auto = resolve_auto_background(request, found.auto_background, policy.auto_after);
+    match found.execution {
+        Execution::Inline(_) => {
+            if !matches!(request, AutoBackground::Default | AutoBackground::Never) {
+                return reply_now(
+                    js_handles,
+                    reply,
+                    Err(format!("tool `{name}` cannot run in the background")),
+                );
+            }
+            if !rounds.spend_budget(root) {
+                return reply_now(
+                    js_handles,
+                    reply,
+                    Err(format!(
+                        "tool call budget for this root call is exhausted ({})",
+                        crate::tools::schedule::MAX_CALLS_PER_ROOT
+                    )),
+                );
+            }
+            let (text, is_error) = execute_tool(world, name, arguments, &context);
+            let result = if is_error { Err(text) } else { Ok(text) };
+            reply_now(js_handles, reply, result)
+        }
+        Execution::Interpreter => {
+            let submitted =
+                interpreter_task(name, arguments, &world.fs, depth + 1, root).and_then(|task| {
+                    js_handles
+                        .get(agent)
+                        .map_err(|_| format!("agent {agent} has no JavaScript runtime"))?
+                        .submit(task)
+                });
+            match submitted {
+                Err(err) => reply_now(js_handles, reply, Err(err)),
+                Ok(request_id) => {
+                    if !rounds.spend_budget(root) {
+                        return reply_now(
+                            js_handles,
+                            reply,
+                            Err(format!(
+                                "tool call budget for this root call is exhausted ({})",
+                                crate::tools::schedule::MAX_CALLS_PER_ROOT
+                            )),
+                        );
+                    }
+                    let deadline = auto.map(|grace| Instant::now() + grace);
+                    rounds.add_nested(NestedCall::new(agent, request_id, deadline, reply));
+                    HostOutcome::Pending
+                }
+            }
+        }
+        Execution::Script => {
+            let Ok(spec) = world.scripts.get(found.entity).cloned() else {
+                return reply_now(
+                    js_handles,
+                    reply,
+                    Err(format!(
+                        "script tool `{name}` is missing its execution data"
+                    )),
+                );
+            };
+            let timeout = spec
+                .timeout_ms
+                .map(Duration::from_millis)
+                .unwrap_or(DEFAULT_SCRIPT_TIMEOUT);
+            let submitted = script.submit(
+                agent,
+                ScriptTask {
+                    sources: sources.0.clone(),
+                    entry: spec.entry,
+                    export: spec.export,
+                    arguments: arguments.clone(),
+                    timeout,
+                    depth: depth + 1,
+                    root,
+                },
+            );
+            match submitted {
+                Err(err) => reply_now(js_handles, reply, Err(err)),
+                Ok(request_id) => {
+                    if !rounds.spend_budget(root) {
+                        return reply_now(
+                            js_handles,
+                            reply,
+                            Err(format!(
+                                "tool call budget for this root call is exhausted ({})",
+                                crate::tools::schedule::MAX_CALLS_PER_ROOT
+                            )),
+                        );
+                    }
+                    let deadline = auto.map(|grace| Instant::now() + grace);
+                    rounds.add_nested(NestedCall::new(agent, request_id, deadline, reply));
+                    HostOutcome::Pending
+                }
+            }
+        }
+    }
+}
+
 /// Handle `execute(...)` and module reads coming from script workers.
-pub(crate) fn poll_script_host_requests(runtime: Res<ScriptRuntime>, mut world: ToolWorld) {
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn poll_script_host_requests(
+    runtime: Res<ScriptRuntime>,
+    mut world: ToolWorld,
+    js_handles: Query<&JsRuntimeHandle>,
+    sources: Res<ToolSourceCache>,
+    policy: Res<AutoBackgroundPolicy>,
+    mut rounds: ResMut<ToolRounds>,
+) {
     for request in runtime.drain_host_requests() {
         let ScriptHostRequest {
-            agent: agent_entity,
+            agent,
             command,
             reply,
         } = request;
 
-        let (result, is_error) = match world.agents.get(agent_entity) {
-            Ok(agent) => {
-                let source_name = agent.name().to_owned();
-                match command {
-                    HostCommand::Tool { name, arguments } => {
-                        execute_tool(&mut world, &name, &arguments, agent_entity, &source_name)
-                    }
-                    HostCommand::ReadFile { path } => match world.fs.read(&path) {
-                        Ok(content) => (content, false),
-                        Err(err) => (err, true),
-                    },
-                }
+        match command {
+            HostCommand::Tool {
+                name,
+                arguments,
+                depth,
+                root,
+                background,
+            } => {
+                let _ = handle_host_tool(
+                    &mut world,
+                    &mut rounds,
+                    &js_handles,
+                    &runtime,
+                    &sources,
+                    &policy,
+                    agent,
+                    &name,
+                    &arguments,
+                    depth,
+                    root,
+                    background,
+                    NestedReply::Channel(reply),
+                );
             }
-            Err(_) => (
-                format!("agent entity {agent_entity} no longer exists"),
-                true,
-            ),
-        };
-
-        let _ = reply.send(if is_error { Err(result) } else { Ok(result) });
-    }
-}
-
-/// Detach normal interpreter requests that have been running longer than the
-/// configured grace period.
-pub(crate) fn auto_background_long_js_tasks(
-    policy: Res<BackgroundPolicy>,
-    mut rounds: ResMut<ToolRounds>,
-    mut finished: MessageWriter<ToolRoundFinished>,
-) {
-    let Some(after) = policy.auto_after else {
-        return;
-    };
-
-    let now = Instant::now();
-    let due = rounds
-        .js_requests
-        .iter()
-        .filter(|(_, pending)| {
-            pending.auto_background
-                && pending
-                    .started_at
-                    .is_some_and(|started| now.saturating_duration_since(started) >= after)
-        })
-        .map(|(request, _)| *request)
-        .collect::<Vec<_>>();
-
-    for request in due {
-        let Some(pending) = rounds.js_requests.remove(&request) else {
-            continue;
-        };
-        let Some(agent) = rounds
-            .active
-            .get(&pending.round_id)
-            .map(|round| round.agent)
-        else {
-            continue;
-        };
-
-        let task_id = rounds.start_background(request, agent);
-        let Some(round) = rounds.active.get_mut(&pending.round_id) else {
-            continue;
-        };
-        round.results[pending.call_index] = Some(ToolCallResult {
-            result: background_started_message(task_id),
-            is_error: false,
-            tool_use_id: round.calls[pending.call_index].tool_use_id.clone(),
-        });
-        round.remaining -= 1;
-
-        finish_round_if_ready(&mut rounds, pending.round_id, &mut finished);
+            HostCommand::ReadFile { path } => {
+                let _ = reply.send(world.fs.read(&path));
+            }
+        }
     }
 }
 
@@ -1813,33 +1817,49 @@ pub(crate) fn poll_js_host_requests(
     channels: Res<JsChannels>,
     mut world: ToolWorld,
     js_handles: Query<&JsRuntimeHandle>,
+    script: Res<ScriptRuntime>,
+    sources: Res<ToolSourceCache>,
+    policy: Res<AutoBackgroundPolicy>,
+    mut rounds: ResMut<ToolRounds>,
 ) {
     for request in channels.drain_host_requests() {
         let HostRequest {
-            agent: agent_entity,
+            agent,
             token,
             command,
         } = request;
 
-        let (result, is_error) = match command {
-            HostCommand::Tool { name, arguments } => match world.agents.get(agent_entity) {
-                Ok(agent) => {
-                    let source_name = agent.name().to_owned();
-                    execute_tool(&mut world, &name, &arguments, agent_entity, &source_name)
+        match command {
+            HostCommand::Tool {
+                name,
+                arguments,
+                depth,
+                root,
+                background,
+            } => {
+                // The reply is delivered now or when the nested call completes;
+                // the agent's interpreter stays blocked on `token`.
+                let _ = handle_host_tool(
+                    &mut world,
+                    &mut rounds,
+                    &js_handles,
+                    &script,
+                    &sources,
+                    &policy,
+                    agent,
+                    &name,
+                    &arguments,
+                    depth,
+                    root,
+                    background,
+                    NestedReply::Agent { agent, token },
+                );
+            }
+            HostCommand::ReadFile { path } => {
+                if let Ok(handle) = js_handles.get(agent) {
+                    handle.respond(token, world.fs.read(&path));
                 }
-                Err(_) => (
-                    format!("agent entity {agent_entity} no longer exists"),
-                    true,
-                ),
-            },
-            HostCommand::ReadFile { path } => match world.fs.read(&path) {
-                Ok(content) => (content, false),
-                Err(err) => (err, true),
-            },
-        };
-
-        if let Ok(handle) = js_handles.get(agent_entity) {
-            handle.respond(token, if is_error { Err(result) } else { Ok(result) });
+            }
         }
     }
 }
@@ -2305,15 +2325,17 @@ mod removal_tests {
 mod background_tests {
     use super::*;
     use crate::js_runtime::{JsTask, start_js_runtime};
+    use crate::tools::schedule::{PendingCallFields, PendingToolRound};
+    use llm_history_model::history::ToolCall;
     use std::time::{Duration, Instant};
 
     #[test]
     fn removing_agent_drops_background_tasks() {
         let mut rounds = ToolRounds::default();
         let agent = Entity::PLACEHOLDER;
-        rounds.start_background(7, agent);
+        rounds.detach(7, agent);
         rounds.remove_agent(agent);
-        assert!(rounds.take_background(7).is_none());
+        assert!(rounds.take_detached(7).is_none());
     }
 
     #[test]
@@ -2323,7 +2345,7 @@ mod background_tests {
         let round_id = 10;
         let request = 20;
 
-        rounds.active.insert(
+        rounds.insert_round(
             round_id,
             PendingToolRound {
                 agent,
@@ -2337,29 +2359,26 @@ mod background_tests {
                 remaining: 1,
             },
         );
-        rounds.js_requests.insert(
+        rounds.track(
             request,
-            PendingJsRequest {
+            PendingCallFields {
                 round_id,
                 call_index: 0,
-                started_at: Some(Instant::now() - Duration::from_secs(10)),
-                auto_background: true,
+                auto_background: Some(Duration::from_secs(5)),
             },
         );
+        rounds.mark_started(request, Instant::now() - Duration::from_secs(10));
 
         let mut app = App::new();
         app.insert_resource(rounds);
-        app.insert_resource(BackgroundPolicy {
-            auto_after: Some(Duration::from_secs(5)),
-        });
         app.add_message::<ToolRoundFinished>();
-        app.add_systems(Update, auto_background_long_js_tasks);
+        app.add_systems(Update, crate::tools::schedule::auto_background_long_calls);
         app.update();
 
         let rounds = app.world().resource::<ToolRounds>();
-        assert!(rounds.js_requests.is_empty());
-        assert!(rounds.background.contains_key(&request));
-        assert!(!rounds.active.contains_key(&round_id));
+        assert_eq!(rounds.pending_len(), 0);
+        assert!(rounds.has_detached(request));
+        assert!(!rounds.has_active(round_id));
     }
 
     #[test]
@@ -2369,7 +2388,7 @@ mod background_tests {
         let round_id = 10;
         let request = 20;
 
-        rounds.active.insert(
+        rounds.insert_round(
             round_id,
             PendingToolRound {
                 agent,
@@ -2383,28 +2402,25 @@ mod background_tests {
                 remaining: 1,
             },
         );
-        rounds.js_requests.insert(
+        rounds.track(
             request,
-            PendingJsRequest {
+            PendingCallFields {
                 round_id,
                 call_index: 0,
-                started_at: Some(Instant::now() - Duration::from_secs(10)),
-                auto_background: false,
+                auto_background: None,
             },
         );
+        rounds.mark_started(request, Instant::now() - Duration::from_secs(10));
 
         let mut app = App::new();
         app.insert_resource(rounds);
-        app.insert_resource(BackgroundPolicy {
-            auto_after: Some(Duration::from_secs(5)),
-        });
         app.add_message::<ToolRoundFinished>();
-        app.add_systems(Update, auto_background_long_js_tasks);
+        app.add_systems(Update, crate::tools::schedule::auto_background_long_calls);
         app.update();
 
         let rounds = app.world().resource::<ToolRounds>();
-        assert!(rounds.js_requests.contains_key(&request));
-        assert!(!rounds.background.contains_key(&request));
+        assert!(rounds.has_pending(request));
+        assert!(!rounds.has_detached(request));
     }
 
     #[test]
@@ -2449,11 +2465,13 @@ mod background_tests {
             .expect("handle attached by observer")
             .submit(JsTask::Eval {
                 source: "6 * 7".to_owned(),
+                depth: 0,
+                root: 0,
             })
             .unwrap();
         app.world_mut()
             .resource_mut::<ToolRounds>()
-            .start_background(request, agent);
+            .detach(request, agent);
 
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {

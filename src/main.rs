@@ -116,8 +116,8 @@ fn main() {
         .init_resource::<tools::MirrorDebounce>()
         .init_resource::<tools::script::ScriptRuntime>()
         .init_resource::<tools::script::ToolSourceCache>()
-        .init_resource::<ToolRounds>()
-        .init_resource::<BackgroundPolicy>()
+        .init_resource::<tools::schedule::ToolRounds>()
+        .init_resource::<tools::schedule::AutoBackgroundPolicy>()
         .init_resource::<TextCollapseConfig>()
         .init_resource::<GlyphCacheLimit>()
         .add_observer(attach_js_runtime)
@@ -178,7 +178,8 @@ fn main() {
                     poll_js_host_requests,
                     poll_script_host_requests,
                     execute_tool_calls,
-                    auto_background_long_js_tasks,
+                    tools::schedule::auto_background_long_calls,
+                    tools::schedule::auto_background_nested_calls,
                     apply_tool_results,
                     update_tool_activity,
                     tools::flush_tool_mirror,

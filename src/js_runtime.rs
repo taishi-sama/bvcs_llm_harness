@@ -61,8 +61,15 @@ pub(crate) enum ModuleRoot {
 /// returned request id so it can match the eventual [`JsEvent::Done`].
 #[derive(Debug)]
 pub(crate) enum JsTask {
-    Eval { source: String },
-    Reset { symbol: Option<String> },
+    Eval {
+        source: String,
+        /// Nesting below the model's root call.
+        depth: u32,
+        root: u64,
+    },
+    Reset {
+        symbol: Option<String>,
+    },
 }
 
 /// Work entering a context thread.
@@ -90,8 +97,15 @@ pub(crate) enum JsEvent {
 /// (virtual filesystem, agent index, UI commands, ...).
 #[derive(Debug)]
 pub(crate) enum HostCommand {
-    /// `execute(name, arguments)` from JavaScript.
-    Tool { name: String, arguments: Value },
+    /// `execute(name, arguments, background_after)` from JavaScript.
+    Tool {
+        name: String,
+        arguments: Value,
+        depth: u32,
+        root: u64,
+        /// Third argument: seconds until detach; validated on the main loop.
+        background: Option<f64>,
+    },
     /// Source load for `import`/`require`-style access to the virtual FS.
     ReadFile { path: String },
 }
@@ -284,29 +298,45 @@ pub(crate) struct JsSession {
     output: Receiver<String>,
     dispatch: Rc<dyn HostDispatch>,
     root: ModuleRoot,
+    /// Current (depth, root) read by `execute()`; updated per task.
+    origin: Rc<Cell<(u32, u64)>>,
 }
 
 impl JsSession {
     pub(crate) fn new(dispatch: Rc<dyn HostDispatch>) -> Result<Self, String> {
-        Self::new_with(dispatch, ModuleRoot::Vfs)
+        Self::new_with(dispatch, ModuleRoot::Vfs, 0, 0)
     }
 
     /// Fresh session whose imports resolve inside `.tools`.
     pub(crate) fn new_tools(
         dispatch: Rc<dyn HostDispatch>,
         sources: Arc<ToolSources>,
+        depth: u32,
+        root_call: u64,
     ) -> Result<Self, String> {
-        Self::new_with(dispatch, ModuleRoot::Tools(sources))
+        Self::new_with(dispatch, ModuleRoot::Tools(sources), depth, root_call)
     }
 
-    fn new_with(dispatch: Rc<dyn HostDispatch>, root: ModuleRoot) -> Result<Self, String> {
-        let (context, output) = build_context_with(dispatch.clone(), root.clone())?;
+    fn new_with(
+        dispatch: Rc<dyn HostDispatch>,
+        root: ModuleRoot,
+        depth: u32,
+        root_call: u64,
+    ) -> Result<Self, String> {
+        let (context, output, origin) =
+            build_context_with(dispatch.clone(), root.clone(), depth, root_call)?;
         Ok(Self {
             context,
             output,
             dispatch,
             root,
+            origin,
         })
+    }
+
+    /// Depth and root call used by `execute()` during the next evaluation.
+    pub(crate) fn set_origin(&self, depth: u32, root: u64) {
+        self.origin.set((depth, root));
     }
 
     /// Convenience constructor for unit tests that never call `execute`.
@@ -317,7 +347,7 @@ impl JsSession {
 
     #[cfg(test)]
     pub(crate) fn new_tools_isolated(sources: Arc<ToolSources>) -> Result<Self, String> {
-        Self::new_tools(Rc::new(NoHost), sources)
+        Self::new_tools(Rc::new(NoHost), sources, 0, 0)
     }
 
     pub(crate) fn eval(&mut self, code: &str) -> Result<String, String> {
@@ -416,9 +446,11 @@ impl JsSession {
     }
 
     pub(crate) fn reset(&mut self) -> Result<String, String> {
-        let (context, output) = build_context_with(self.dispatch.clone(), self.root.clone())?;
+        let (context, output, origin) =
+            build_context_with(self.dispatch.clone(), self.root.clone(), 0, 0)?;
         self.context = context;
         self.output = output;
+        self.origin = origin;
         Ok("Dropped the whole JavaScript context for this agent. The next evaluation starts fresh."
             .to_owned())
     }
@@ -463,10 +495,15 @@ fn is_js_identifier(value: &str) -> bool {
     chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '$')
 }
 
+/// A fresh context, its print channel, and the shared `execute` origin cell.
+type BuiltContext = (JsContext, Receiver<String>, Rc<Cell<(u32, u64)>>);
+
 fn build_context_with(
     dispatch: Rc<dyn HostDispatch>,
     root: ModuleRoot,
-) -> Result<(JsContext, Receiver<String>), String> {
+    depth: u32,
+    root_call: u64,
+) -> Result<BuiltContext, String> {
     let (tx, rx) = mpsc::channel();
 
     // SAFETY: the closure only captures an `mpsc::Sender<String>`, which is not
@@ -489,6 +526,8 @@ fn build_context_with(
     };
 
     let execute_dispatch = dispatch.clone();
+    let origin = Rc::new(Cell::new((depth, root_call)));
+    let execute_origin = origin.clone();
     // SAFETY: the closure captures an `Rc<dyn HostDispatch>`. It contains no
     // Boa GC-managed values; all JavaScript values are converted to
     // `serde_json::Value` before crossing the channel.
@@ -510,7 +549,26 @@ fn build_context_with(
                 _ => Value::Object(JsonMap::new()),
             };
 
-            match execute_dispatch.call(HostCommand::Tool { name, arguments }) {
+            // Read the number directly: `to_json` maps NaN/infinity to null,
+            // which would silently look like "use the default".
+            let background = match args.get(2) {
+                None => None,
+                Some(value) if value.is_undefined() || value.is_null() => None,
+                Some(value) => Some(value.as_number().ok_or_else(|| {
+                    JsNativeError::typ().with_message(
+                        "background_after must be a number of seconds (0 = now, negative = never)",
+                    )
+                })?),
+            };
+            let (depth, root) = execute_origin.get();
+
+            match execute_dispatch.call(HostCommand::Tool {
+                name,
+                arguments,
+                depth,
+                root,
+                background,
+            }) {
                 Ok(result) => Ok(JsValue::from(js_string!(result))),
                 Err(err) => Err(JsNativeError::error().with_message(err).into()),
             }
@@ -533,7 +591,7 @@ fn build_context_with(
         .register_global_builtin_callable("print".into(), 1, print)
         .map_err(|err| format!("failed to initialize JavaScript runtime: {err}"))?;
     context
-        .register_global_builtin_callable("execute".into(), 2, execute)
+        .register_global_builtin_callable("execute".into(), 3, execute)
         .map_err(|err| format!("failed to initialize JavaScript execute(): {err}"))?;
     context
         .eval(Source::from_bytes(
@@ -541,7 +599,7 @@ fn build_context_with(
         ))
         .map_err(|err| format!("failed to initialize JavaScript console: {err}"))?;
 
-    Ok((context, rx))
+    Ok((context, rx, origin))
 }
 
 // ---------------------------------------------------------------------------
@@ -774,7 +832,14 @@ fn run_context_thread(start: JsThreadStart) {
 
 fn run_task(session: &mut JsSession, task: JsTask) -> Result<String, String> {
     match task {
-        JsTask::Eval { source } => session.eval(&source),
+        JsTask::Eval {
+            source,
+            depth,
+            root,
+        } => {
+            session.set_origin(depth, root);
+            session.eval(&source)
+        }
         JsTask::Reset { symbol } => match symbol.as_deref().map(str::trim) {
             Some(symbol) if !symbol.is_empty() => session.drop_symbol(symbol),
             _ => session.reset(),
@@ -855,6 +920,8 @@ mod tests {
         let request = handle
             .submit(JsTask::Eval {
                 source: "6 * 7".to_owned(),
+                depth: 0,
+                root: 0,
             })
             .unwrap();
 
@@ -876,6 +943,8 @@ mod tests {
             .unwrap()
             .submit(JsTask::Eval {
                 source: "40 + 2".to_owned(),
+                depth: 0,
+                root: 0,
             })
             .unwrap();
 
@@ -899,6 +968,8 @@ mod tests {
             .unwrap()
             .submit(JsTask::Eval {
                 source: "var value = 7; value".to_owned(),
+                depth: 0,
+                root: 0,
             })
             .unwrap();
         let channels = world.resource::<JsChannels>();
@@ -914,6 +985,8 @@ mod tests {
             .unwrap()
             .submit(JsTask::Eval {
                 source: "typeof value".to_owned(),
+                depth: 0,
+                root: 0,
             })
             .unwrap();
         let channels = world.resource::<JsChannels>();
@@ -933,6 +1006,8 @@ mod tests {
         let request = handle
             .submit(JsTask::Eval {
                 source: "execute('get_weather', { city: 'Paris' })".to_owned(),
+                depth: 0,
+                root: 0,
             })
             .unwrap();
 
@@ -942,7 +1017,9 @@ mod tests {
             for host_request in channels.drain_host_requests() {
                 assert_eq!(host_request.agent, agent);
                 match host_request.command {
-                    HostCommand::Tool { name, arguments } => {
+                    HostCommand::Tool {
+                        name, arguments, ..
+                    } => {
                         assert_eq!(name, "get_weather");
                         assert_eq!(arguments["city"], "Paris");
                         handle.respond(host_request.token, Ok("Paris: sunny".to_owned()));
@@ -1053,11 +1130,15 @@ mod id_tests {
         let first_id = first
             .submit(JsTask::Eval {
                 source: "1".to_owned(),
+                depth: 0,
+                root: 0,
             })
             .unwrap();
         let second_id = second
             .submit(JsTask::Eval {
                 source: "2".to_owned(),
+                depth: 0,
+                root: 0,
             })
             .unwrap();
 
