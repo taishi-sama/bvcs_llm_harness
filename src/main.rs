@@ -179,7 +179,6 @@ fn main() {
                     poll_script_host_requests,
                     execute_tool_calls,
                     tools::schedule::auto_background_long_calls,
-                    tools::schedule::auto_background_nested_calls,
                     apply_tool_results,
                     update_tool_activity,
                     tools::flush_tool_mirror,

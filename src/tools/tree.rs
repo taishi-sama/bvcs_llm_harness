@@ -173,8 +173,14 @@ fn mirror_one(root: &Path, relative: &str, content: Option<&String>) -> Result<(
     match content {
         Some(content) => write_atomic(&target, content),
         None => match fs::remove_file(&target) {
-            Ok(()) => Ok(()),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Ok(()) => {
+                prune_empty_parents(root, relative);
+                Ok(())
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                prune_empty_parents(root, relative);
+                Ok(())
+            }
             Err(err) => Err(format!("could not remove `{}`: {err}", target.display())),
         },
     }
@@ -223,6 +229,27 @@ fn safe_parent(root: &Path, relative: &str) -> Result<PathBuf, String> {
         return Err(format!("refusing to mirror `{relative}` outside `.tools`"));
     }
     Ok(current)
+}
+
+/// Remove empty parent directories after a deletion, up to the mount root.
+fn prune_empty_parents(root: &Path, relative: &str) {
+    let Some((parent, _)) = relative.rsplit_once('/') else {
+        return;
+    };
+    let mut current = root.to_path_buf();
+    let mut chain = Vec::new();
+    for segment in parent.split('/') {
+        current.push(segment);
+        chain.push(current.clone());
+    }
+    for directory in chain.into_iter().rev() {
+        if !directory.starts_with(root) || directory == root {
+            break;
+        }
+        if fs::remove_dir(&directory).is_err() {
+            break;
+        }
+    }
 }
 
 /// Write through a temporary file in the same directory, then rename.

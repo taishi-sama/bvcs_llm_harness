@@ -5,7 +5,7 @@
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use bevy::{
@@ -1333,10 +1333,6 @@ pub(crate) fn execute_tool_calls(
         }
         let source_name = agent.name().to_owned();
 
-        // Budgets from the previous batch are only closed once that turn's work
-        // has had a chance to finish.
-        rounds.close_agent_budgets(request.agent);
-
         let round_id = rounds.next_round;
         rounds.next_round += 1;
 
@@ -1413,7 +1409,7 @@ pub(crate) fn execute_tool_calls(
                         );
                     match submitted {
                         Ok(request_id) if auto == Some(Duration::ZERO) => {
-                            let task_id = rounds.detach(request_id, request.agent);
+                            let task_id = rounds.detach(request_id, request.agent, root);
                             results[call_index] = Some(ToolCallResult {
                                 result: background_started_message(task_id),
                                 is_error: false,
@@ -1505,7 +1501,7 @@ pub(crate) fn execute_tool_calls(
                             );
                             match submitted {
                                 Ok(request_id) if auto == Some(Duration::ZERO) => {
-                                    let task_id = rounds.detach(request_id, request.agent);
+                                    let task_id = rounds.detach(request_id, request.agent, root);
                                     results[call_index] = Some(ToolCallResult {
                                         result: background_started_message(task_id),
                                         is_error: false,
@@ -1618,6 +1614,7 @@ fn route_async_result(
     finished: &mut MessageWriter<ToolRoundFinished>,
 ) {
     if let Some(task) = rounds.take_detached(request) {
+        rounds.release_budget(task.root);
         let (text, is_error) = match result {
             Ok(text) => (text, false),
             Err(err) => (err, true),
@@ -1776,7 +1773,7 @@ fn dispatch_gateway(
                     gateway_error(err)
                 }
                 Ok(request) if auto == Some(Duration::ZERO) => {
-                    let task_id = rounds.detach(request, agent);
+                    let task_id = rounds.detach(request, agent, root);
                     GatewayDispatch::Done {
                         message: background_started_message(task_id),
                         is_error: false,
@@ -1812,7 +1809,7 @@ fn dispatch_gateway(
                     gateway_error(err)
                 }
                 Ok(request) if auto == Some(Duration::ZERO) => {
-                    let task_id = rounds.detach(request, agent);
+                    let task_id = rounds.detach(request, agent, root);
                     GatewayDispatch::Done {
                         message: background_started_message(task_id),
                         is_error: false,
@@ -1886,6 +1883,13 @@ fn handle_host_tool(
         Ok(request) => request,
         Err(err) => return reply_now(js_handles, reply, Err(err)),
     };
+    if !matches!(request, AutoBackground::Default | AutoBackground::Never) {
+        return reply_now(
+            js_handles,
+            reply,
+            Err("only a model-level tool call can detach into the background".to_owned()),
+        );
+    }
     let source_name = world
         .agents
         .get(agent)
@@ -1918,7 +1922,8 @@ fn handle_host_tool(
         );
     }
 
-    let auto = resolve_auto_background(request, found.auto_background, policy.auto_after);
+    // Nested calls always run synchronously from the caller's point of view.
+    let _ = policy;
     match found.execution {
         Execution::Inline(_) => {
             if !matches!(request, AutoBackground::Default | AutoBackground::Never) {
@@ -1970,8 +1975,7 @@ fn handle_host_tool(
                     reply_now(js_handles, reply, Err(err))
                 }
                 Ok(request_id) => {
-                    let deadline = auto.map(|grace| Instant::now() + grace);
-                    rounds.add_nested(NestedCall::new(agent, request_id, deadline, reply));
+                    rounds.add_nested(NestedCall::new(agent, request_id, reply));
                     HostOutcome::Pending
                 }
             }
@@ -2011,8 +2015,7 @@ fn handle_host_tool(
                     reply_now(js_handles, reply, Err(err))
                 }
                 Ok(request_id) => {
-                    let deadline = auto.map(|grace| Instant::now() + grace);
-                    rounds.add_nested(NestedCall::new(agent, request_id, deadline, reply));
+                    rounds.add_nested(NestedCall::new(agent, request_id, reply));
                     HostOutcome::Pending
                 }
             }
@@ -2606,7 +2609,7 @@ mod background_tests {
     fn removing_agent_drops_background_tasks() {
         let mut rounds = ToolRounds::default();
         let agent = Entity::PLACEHOLDER;
-        rounds.detach(7, agent);
+        rounds.detach(7, agent, 7);
         rounds.remove_agent(agent);
         assert!(rounds.take_detached(7).is_none());
     }
@@ -2783,7 +2786,7 @@ mod background_tests {
             .unwrap();
         app.world_mut()
             .resource_mut::<ToolRounds>()
-            .detach(request, agent);
+            .detach(request, agent, request);
 
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {

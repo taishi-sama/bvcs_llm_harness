@@ -153,6 +153,13 @@ pub(crate) fn scan_tools(tree: &ToolsTree, warnings: &mut Vec<String>) -> Vec<Sc
             ));
             continue;
         }
+        if !parsed.entry.ends_with(".js") {
+            warnings.push(format!(
+                "`{manifest_path}` entry `{}` is not a `.js` module; skipped",
+                parsed.entry
+            ));
+            continue;
+        }
         let entry = format!("{directory}/{}", parsed.entry);
         if tree.read(&entry).is_err() {
             warnings.push(format!(

@@ -133,12 +133,15 @@ impl VirtualFs {
             if !listing.is_empty() {
                 listing.push('\n');
             }
-            listing.push_str(&format!(
-                "{}/ - {} tool file(s), use a `{}/<path>` file name to read or edit",
-                crate::vfs_path::TOOLS_MOUNT,
-                self.tools.len(),
-                crate::vfs_path::TOOLS_MOUNT
-            ));
+            let mount = crate::vfs_path::TOOLS_MOUNT;
+            listing.push_str(&format!("{mount}/ ({} file(s)):", self.tools.len()));
+            for (path, content) in self.tools.iter() {
+                listing.push_str(&format!(
+                    "\n{mount}/{path} - {} bytes, {} line(s)",
+                    content.len(),
+                    content.lines().count()
+                ));
+            }
         }
         listing
     }
@@ -550,7 +553,7 @@ mod tests {
         );
         assert!(fs.read("tool1/main.js").is_err());
         assert!(
-            fs.list().contains(".tools/ - 1 tool file(s)"),
+            fs.list().contains(".tools/tool1/main.js - 19 bytes"),
             "{}",
             fs.list()
         );

@@ -24,6 +24,9 @@ pub(crate) const MAX_CALLS_PER_ROOT: u32 = 2_000;
 struct Budget {
     agent: Entity,
     remaining: u32,
+    /// One reference for the round slot, plus one for each detached task that
+    /// still belongs to this root call.
+    refs: u32,
 }
 
 /// One in-flight tool round. Results are stored by call index so asynchronous
@@ -40,6 +43,7 @@ pub(crate) struct PendingToolRound {
 pub(crate) struct DetachedTask {
     pub(crate) task_id: u64,
     pub(crate) agent: Entity,
+    pub(crate) root: u64,
 }
 
 /// A non-detached async call inside a round.
@@ -63,7 +67,6 @@ pub(crate) enum NestedReply {
 pub(crate) struct NestedCall {
     pub(crate) agent: Entity,
     pub(crate) request: u64,
-    deadline: Option<Instant>,
     reply: Option<NestedReply>,
 }
 
@@ -211,11 +214,20 @@ impl ToolRounds {
     }
 
     /// Register a detached request and return its user-visible id.
-    pub(crate) fn detach(&mut self, request: u64, agent: Entity) -> u64 {
+    pub(crate) fn detach(&mut self, request: u64, agent: Entity, root: u64) -> u64 {
         self.next_task_id = self.next_task_id.wrapping_add(1);
         let task_id = self.next_task_id;
-        self.detached
-            .insert(request, DetachedTask { task_id, agent });
+        if let Some(budget) = self.budgets.get_mut(&root) {
+            budget.refs = budget.refs.saturating_add(1);
+        }
+        self.detached.insert(
+            request,
+            DetachedTask {
+                task_id,
+                agent,
+                root,
+            },
+        );
         task_id
     }
 
@@ -229,19 +241,6 @@ impl ToolRounds {
 
     pub(crate) fn take_nested(&mut self, request: u64) -> Option<NestedCall> {
         self.nested.remove(&request)
-    }
-
-    /// Nested calls whose grace period expired; returns their request ids.
-    pub(crate) fn nested_due(&self, now: Instant) -> Vec<u64> {
-        self.nested
-            .iter()
-            .filter(|(_, call)| {
-                call.deadline.is_some_and(|deadline| {
-                    now.saturating_duration_since(deadline) > Duration::ZERO
-                })
-            })
-            .map(|(request, _)| *request)
-            .collect()
     }
 
     /// Tool calls still in flight for `agent`: unresolved round slots, nested
@@ -273,6 +272,7 @@ impl ToolRounds {
             Budget {
                 agent,
                 remaining: MAX_CALLS_PER_ROOT,
+                refs: 1,
             },
         );
     }
@@ -295,11 +295,17 @@ impl ToolRounds {
         }
     }
 
-    /// Close every budget belonging to one agent (called when its next tool
-    /// batch starts, so detached work from the previous turn keeps its budget
-    /// for that turn's lifetime).
-    pub(crate) fn close_agent_budgets(&mut self, agent: Entity) {
-        self.budgets.retain(|_, budget| budget.agent != agent);
+    /// Drop one reference to a root call's budget. It survives while a detached
+    /// task still uses it, so background work can keep calling tools after its
+    /// round has finished.
+    pub(crate) fn release_budget(&mut self, root: u64) {
+        let Some(budget) = self.budgets.get_mut(&root) else {
+            return;
+        };
+        budget.refs = budget.refs.saturating_sub(1);
+        if budget.refs == 0 {
+            self.budgets.remove(&root);
+        }
     }
 
     #[cfg(test)]
@@ -331,16 +337,10 @@ pub(crate) struct PendingCallFields {
 }
 
 impl NestedCall {
-    pub(crate) fn new(
-        agent: Entity,
-        request: u64,
-        deadline: Option<Instant>,
-        reply: NestedReply,
-    ) -> Self {
+    pub(crate) fn new(agent: Entity, request: u64, reply: NestedReply) -> Self {
         Self {
             agent,
             request,
-            deadline,
             reply: Some(reply),
         }
     }
@@ -374,6 +374,9 @@ pub(crate) fn finish_round_if_ready(
         .active
         .remove(&round_id)
         .expect("the round was checked above");
+    for index in 0..round.calls.len() {
+        rounds.release_budget((round_id << 32) | index as u64);
+    }
     finished.write(ToolRoundFinished {
         agent: round.agent,
         turn_id: round.turn_id,
@@ -453,7 +456,8 @@ pub(crate) fn auto_background_long_calls(
             continue;
         };
 
-        let task_id = rounds.detach(request, agent);
+        let root = (pending.round_id << 32) | pending.call_index as u64;
+        let task_id = rounds.detach(request, agent, root);
         let Some(round) = rounds.active.get_mut(&pending.round_id) else {
             continue;
         };
@@ -465,25 +469,6 @@ pub(crate) fn auto_background_long_calls(
         round.remaining -= 1;
 
         finish_round_if_ready(&mut rounds, pending.round_id, &mut finished);
-    }
-}
-
-/// Release nested callers whose grace period elapsed; their task keeps running
-/// and reports through `TaskResult`.
-pub(crate) fn auto_background_nested_calls(
-    mut rounds: ResMut<ToolRounds>,
-    js_handles: Query<&crate::js_runtime::JsRuntimeHandle>,
-) {
-    let now = Instant::now();
-    for request in rounds.nested_due(now) {
-        let Some(mut call) = rounds.take_nested(request) else {
-            continue;
-        };
-        let Some(reply) = call.take_reply() else {
-            continue;
-        };
-        let task_id = rounds.detach(request, call.agent);
-        send_nested_reply(&js_handles, reply, Ok(background_started_message(task_id)));
     }
 }
 
@@ -548,17 +533,48 @@ mod tests {
 
     #[test]
     fn budgets_are_closed_per_agent() {
+        use llm_history_model::history::ToolCall;
+
         let mut world = bevy::prelude::World::new();
         let first = world.spawn_empty().id();
         let second = world.spawn_empty().id();
         let mut rounds = ToolRounds::default();
         rounds.open_budget(1, first);
         rounds.open_budget(2, second);
+        rounds.insert_round(
+            0,
+            PendingToolRound {
+                agent: first,
+                turn_id: 1,
+                calls: vec![ToolCall {
+                    tool_name: "fs_ls".to_owned(),
+                    toolcall_params: "{}".to_owned(),
+                    tool_use_id: "c1".to_owned(),
+                }],
+                results: vec![None],
+                remaining: 1,
+            },
+        );
 
-        rounds.close_agent_budgets(first);
+        rounds.cancel_rounds(first);
 
         assert!(!rounds.spend_budget(1));
         assert!(rounds.spend_budget(2));
+    }
+
+    #[test]
+    fn detached_tasks_keep_their_root_budget_alive() {
+        let agent = bevy::prelude::Entity::PLACEHOLDER;
+        let mut rounds = ToolRounds::default();
+        let root = 42;
+        rounds.open_budget(root, agent);
+        rounds.detach(7, agent, root);
+        // Round slot released; the detached task still holds a reference.
+        rounds.release_budget(root);
+        assert!(rounds.spend_budget(root));
+        // Task completion releases the last reference.
+        rounds.release_budget(root);
+        assert!(!rounds.spend_budget(root));
     }
 
     #[test]
