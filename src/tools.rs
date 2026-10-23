@@ -9,6 +9,7 @@
 
 pub(crate) mod manifest;
 pub(crate) mod mirror;
+pub(crate) mod rescan;
 pub(crate) mod schedule;
 pub(crate) mod script;
 pub(crate) mod tree;
@@ -38,6 +39,7 @@ pub(crate) use mirror::{
     MirrorDebounce, MirrorStatus, ToolsDir, flush_tool_mirror, seed_tool_tree,
 };
 pub(crate) use registry::{CallContext, Execution, find, register_static_tools};
+pub(crate) use rescan::{ToolRegistryStatus, reconcile_script_tools};
 pub(crate) use schedule::background_started_message;
 pub(crate) use script::{ScriptHostRequest, ScriptRuntime, ScriptTask, ToolSourceCache};
 pub(crate) use world::ToolWorld;
@@ -262,6 +264,7 @@ pub(crate) fn is_truthy(value: Option<&Value>) -> bool {
 /// descriptions, and parameter schemas; exposure is decided by `catalog`.
 pub(crate) fn definitions() -> Vec<Tool> {
     vec![
+        crate::tools::rescan::rescan_tool_definition(),
         Tool {
             name: "execute".into(),
             description: Some(
@@ -968,6 +971,7 @@ mod tests {
 
         for name in [
             "execute",
+            "rescan_tools",
             "search_tools",
             "fs_read",
             "fs_write",
@@ -1117,6 +1121,8 @@ mod tests {
                 session_id: "ses_test".into(),
             })
             .init_resource::<SmokeOutput>()
+            .init_resource::<crate::tools::ToolRegistryStatus>()
+            .init_resource::<crate::tools::ToolsDir>()
             .add_message::<SendAgentMessage>()
             .add_message::<RemoveAgentRequest>()
             .add_message::<RenameAgentRequest>()

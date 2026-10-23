@@ -12,7 +12,9 @@ use crate::{
     config::AppConfig,
     messages::{RemoveAgentRequest, RenameAgentRequest, SendAgentMessage},
     tools::{
+        ToolsDir,
         registry::{Advertised, DisabledTool, ModelOnly, ToolEntry},
+        rescan::ToolRegistryStatus,
         script::ScriptTool,
     },
     virtual_fs::VirtualFs,
@@ -42,6 +44,8 @@ pub(crate) struct ToolWorld<'w, 's> {
     pub tools: Query<'w, 's, ToolRow>,
     /// Script-tool execution data, keyed by tool entity.
     pub scripts: Query<'w, 's, &'static ScriptTool>,
+    pub tools_dir: Res<'w, ToolsDir>,
+    pub registry_status: ResMut<'w, ToolRegistryStatus>,
     pub commands: Commands<'w, 's>,
     pub send_agent_message: MessageWriter<'w, SendAgentMessage>,
     pub remove_agent: MessageWriter<'w, RemoveAgentRequest>,

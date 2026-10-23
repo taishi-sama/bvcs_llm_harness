@@ -180,6 +180,8 @@ pub(crate) struct ScriptTool {
     pub entry: String,
     /// Exported function the host calls with the parsed arguments object.
     pub export: String,
+    /// Manifest fingerprint used by the reconciler to detect definition drift.
+    pub fingerprint: u64,
 }
 
 // ---------------------------------------------------------------------------

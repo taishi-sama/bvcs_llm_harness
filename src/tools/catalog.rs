@@ -64,6 +64,7 @@ const fn manual(order: u32, tags: &'static [&'static str]) -> Policy {
 fn policy(name: &str) -> Policy {
     match name {
         "execute" => advertises(2, &["dispatch"]),
+        "rescan_tools" => advertises(3, &["dispatch", "tools"]),
         "search_tools" => advertises(1, &["search"]),
 
         "fs_read" => advertises(10, &["fs"]),
@@ -96,6 +97,9 @@ fn policy(name: &str) -> Policy {
 fn execution(name: &str) -> Execution {
     if name == "execute" {
         return Execution::Gateway;
+    }
+    if name == "rescan_tools" {
+        return Execution::Inline(crate::tools::rescan::rescan_tools);
     }
     if let Some(handler) = crate::tools::fs::handler(name) {
         return Execution::Inline(handler);
@@ -151,6 +155,7 @@ pub(crate) fn is_implemented(name: &str) -> bool {
         || crate::tools::agent_tools::handler(name).is_some()
         || name == "search_tools"
         || name == "execute"
+        || name == "rescan_tools"
         || crate::tools::is_js_tool(name)
 }
 
@@ -173,21 +178,7 @@ pub(crate) fn register_script_tools(vfs: Res<VirtualFs>, mut commands: Commands)
             "registered script tool `{}` from `{}`",
             spec.name, spec.entry
         );
-        commands.spawn((
-            ToolEntry {
-                definition: spec.definition,
-                execution: Execution::Script,
-                availability: Availability::AnyWay,
-                order: 1000u32.saturating_add(spec.order),
-                tags: &["script"],
-                auto_background: false,
-            },
-            crate::tools::script::ScriptTool {
-                entry: spec.entry,
-                export: spec.export,
-            },
-            Advertised,
-        ));
+        crate::tools::rescan::spawn_script_tool(&mut commands, spec);
     }
 
     if !libraries.is_empty() {
