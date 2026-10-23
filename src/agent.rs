@@ -35,9 +35,9 @@ use crate::{
     tools::{ToolTarget, background_setting, classify_tool_call, execute_tool, interpreter_task},
     transcript::{
         AgentTab, AgentView, CollapsibleText, RetryAgentButton, TextCollapseConfig,
-        TranscriptAnchor, begin_live_assistant, create_agent_panel, create_agent_tab,
-        ensure_live_assistant, render_transcript, response_display_text, response_thinking_text,
-        set_collapsible_text, set_display, set_text, stats_text,
+        begin_live_assistant, create_agent_panel, create_agent_tab, ensure_live_assistant,
+        render_transcript, response_display_text, response_thinking_text, set_collapsible_text,
+        set_display, set_text, stats_text,
     },
     transport::{request_body, stream_transport},
     virtual_fs::VirtualFs,
@@ -633,8 +633,7 @@ pub(crate) fn create_agent(
         transcript_visible: false,
         rendered_entries: 0,
         scroll_to_bottom: false,
-        scroll_to_top: false,
-        anchor: TranscriptAnchor::FollowTail,
+        follow_tail: true,
     });
 
     // Select this tab when clicked.
@@ -835,7 +834,8 @@ pub(crate) fn retry_agent_turn(
         agent.pending = true;
         agent.streaming_text.clear();
         agent.streaming_thinking.clear();
-        view.follow_tail();
+        view.follow_tail = true;
+        view.scroll_to_bottom = true;
         set_text(&mut texts, view.status, "Retrying...");
 
         start_turn.write(StartAgentTurn {
@@ -884,7 +884,7 @@ pub(crate) fn cancel_agent_turn(
         if let Some(assistant) = view.assistant.take() {
             commands.entity(assistant.card).despawn();
         }
-        view.scroll_tail_if_following();
+        view.scroll_to_bottom = true;
         set_text(&mut texts, view.status, "Interrupted");
     }
 }
@@ -1016,7 +1016,8 @@ pub(crate) fn flush_pending_messages(
             },
         },
     );
-    view.follow_tail();
+    view.follow_tail = true;
+    view.scroll_to_bottom = true;
     if let Some(status) = status {
         set_text(texts, view.status, status);
     }
@@ -1106,7 +1107,7 @@ pub(crate) fn start_agent_turn(
         } else {
             view.assistant = None;
         }
-        view.scroll_tail_if_following();
+        view.scroll_to_bottom = true;
         set_text(&mut texts, view.status, "Connecting...");
 
         let agent_entity = request.agent;
@@ -1301,7 +1302,7 @@ pub(crate) fn handle_stream_events(
                         agent.streaming_text.clone(),
                     );
                 }
-                view.scroll_tail_if_following();
+                view.scroll_to_bottom = true;
             }
             StreamEvent::ThinkingDelta(text) => {
                 agent.streaming_thinking.push_str(text);
@@ -1315,7 +1316,7 @@ pub(crate) fn handle_stream_events(
                         agent.streaming_thinking.clone(),
                     );
                 }
-                view.scroll_tail_if_following();
+                view.scroll_to_bottom = true;
                 set_text(
                     &mut texts,
                     view.status,
@@ -1453,7 +1454,7 @@ pub(crate) fn handle_turn_finished(
             }
         }
 
-        view.scroll_tail_if_following();
+        view.scroll_to_bottom = true;
     }
 }
 
@@ -1799,7 +1800,7 @@ pub(crate) fn apply_tool_results(
             },
         );
 
-        view.scroll_tail_if_following();
+        view.scroll_to_bottom = true;
         set_text(&mut texts, view.status, "Tools finished; continuing...");
 
         // Force waiting user and cross-agent messages into the history now:
@@ -1934,7 +1935,7 @@ pub(crate) fn handle_agent_failed(
         agent.current_turn = None;
         agent.streaming_text.clear();
         agent.streaming_thinking.clear();
-        view.scroll_tail_if_following();
+        view.scroll_to_bottom = true;
         set_text(&mut texts, view.status, "Request failed");
     }
 }
@@ -2173,8 +2174,7 @@ mod removal_tests {
                     transcript_visible: false,
                     rendered_entries: 0,
                     scroll_to_bottom: false,
-                    scroll_to_top: false,
-                    anchor: TranscriptAnchor::FollowTail,
+                    follow_tail: true,
                 },
             ))
             .id();
@@ -2438,8 +2438,7 @@ mod cancel_tests {
                     transcript_visible: true,
                     rendered_entries: 3,
                     scroll_to_bottom: false,
-                    scroll_to_top: false,
-                    anchor: TranscriptAnchor::FollowTail,
+                    follow_tail: true,
                 },
             ))
             .id();
@@ -2517,8 +2516,7 @@ mod rename_tests {
                     transcript_visible: false,
                     rendered_entries: 0,
                     scroll_to_bottom: false,
-                    scroll_to_top: false,
-                    anchor: TranscriptAnchor::FollowTail,
+                    follow_tail: true,
                 },
             ))
             .id();
@@ -2588,8 +2586,7 @@ mod empty_response_tests {
             transcript_visible: true,
             rendered_entries: 1,
             scroll_to_bottom: false,
-            scroll_to_top: false,
-            anchor: TranscriptAnchor::FollowTail,
+            follow_tail: true,
         });
 
         app.add_message::<AgentTurnFinished>();

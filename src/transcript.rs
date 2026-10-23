@@ -1,13 +1,13 @@
-//! Chat transcript display: cards, collapsibles, bounded window, and scrolling.
+//! Chat transcript display: cards, collapsibles, and scrolling.
 //!
 //! This module owns everything the user sees inside an agent's chat log. Agent
 //! state and the LLM loop stay in [`crate::agent`]; the display layer only reads
-//! history through accessors and keeps at most [`MAX_TRANSCRIPT_CARDS`] cards
-//! alive, so offscreen conversations cannot grow VRAM usage.
+//! history through accessors and renders the whole conversation.
 
 use std::{collections::HashMap, env};
 
 use bevy::{
+    input::mouse::MouseScrollUnit,
     input_focus::tab_navigation::TabIndex,
     picking::events::{PointerClick, PointerScroll},
     prelude::*,
@@ -21,23 +21,6 @@ use crate::{
     agent::Agent,
     messages::{CancelAgentRequest, RemoveAgentRequest, RetryAgentTurn},
 };
-
-/// Maximum number of message cards kept alive per transcript. Rendering only
-/// this window keeps offscreen text from consuming VRAM.
-pub(crate) const MAX_TRANSCRIPT_CARDS: usize = 20;
-
-/// Where the visible transcript window starts.
-///
-/// The log never keeps more than [`MAX_TRANSCRIPT_CARDS`] cards. Scrolling moves
-/// the window one entry at a time instead of moving through a long smooth list.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum TranscriptAnchor {
-    /// Show the newest entries at the bottom and keep the window pinned as the
-    /// dialogue grows.
-    FollowTail,
-    /// Show this history entry as the first card at the top of the viewport.
-    Entry(usize),
-}
 
 /// Truncation limits for long reasoning and tool-call bodies. A body collapses
 /// when it exceeds either limit.
@@ -82,33 +65,9 @@ pub(crate) struct AgentView {
     pub(crate) rendered_entries: usize,
     /// Set when the scroll container should jump to the bottom after layout.
     pub(crate) scroll_to_bottom: bool,
-    /// Set when an entry-anchored window should start at the top after layout.
-    pub(crate) scroll_to_top: bool,
-    /// Start of the visible card window; [`TranscriptAnchor::FollowTail`] keeps
-    /// it pinned to the newest dialogue.
-    pub(crate) anchor: TranscriptAnchor,
-}
-
-impl AgentView {
-    /// Pin the window to the newest entry again.
-    pub(crate) fn follow_tail(&mut self) {
-        self.anchor = TranscriptAnchor::FollowTail;
-        self.scroll_to_bottom = true;
-        self.scroll_to_top = false;
-    }
-
-    /// Whether the transcript currently follows newly appended dialogue.
-    pub(crate) fn is_following_tail(&self) -> bool {
-        matches!(self.anchor, TranscriptAnchor::FollowTail)
-    }
-
-    /// Keep the viewport pinned to the newest card only while following tail.
-    /// Entry-anchored windows must stay at their selected top card.
-    pub(crate) fn scroll_tail_if_following(&mut self) {
-        if self.is_following_tail() {
-            self.scroll_to_bottom = true;
-        }
-    }
+    /// Whether streaming should keep the transcript pinned to the newest text.
+    /// Cleared when the user scrolls away from the bottom.
+    pub(crate) follow_tail: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -369,39 +328,30 @@ pub(crate) fn create_agent_panel(
         ))
         .id();
 
-    // Discrete scrolling. The observer is attached to the scroll container so
-    // wheel events that hit child message cards bubble up to it. Each notch
-    // shifts the rendered window by one history entry instead of moving the
-    // scroll offset smoothly through a long list.
+    // Manual smooth scrolling. The observer is attached to the scroll container
+    // so wheel events that hit child message cards bubble up to it.
     commands.entity(log).observe(
         move |on_scroll: On<PointerScroll>,
-              mut views: Query<&mut AgentView>,
-              agents: Query<&Agent>,
-              children: Query<&Children>,
-              nodes: Query<&Node>,
-              computed: Query<&ComputedNode>,
-              scroll_positions: Query<&ScrollPosition>,
-              collapse: Res<TextCollapseConfig>,
-              mut commands: Commands| {
-            if on_scroll.y == 0. {
-                return;
-            }
+              mut logs: Query<(&mut ScrollPosition, &ComputedNode)>,
+              mut views: Query<&mut AgentView>| {
             let Ok(mut view) = views.get_mut(agent) else {
                 return;
             };
-            let Ok(agent_ref) = agents.get(agent) else {
+            let Ok((mut scroll_position, computed)) = logs.get_mut(view.log) else {
                 return;
             };
 
-            let visible_top = if view.is_following_tail() {
-                visible_top_card(view.log, &children, &nodes, &computed, &scroll_positions)
-            } else {
-                0
+            let dy = match on_scroll.unit {
+                MouseScrollUnit::Line => on_scroll.y * 20.,
+                MouseScrollUnit::Pixel => on_scroll.y,
             };
-            let older = on_scroll.y > 0.;
-            if scroll_transcript(&mut view, agent_ref, older, visible_top) {
-                render_transcript_with_live(&mut commands, &mut view, agent_ref, &collapse, false);
-            }
+            let max_offset = ((computed.content_size().y - computed.size().y).max(0.))
+                * computed.inverse_scale_factor();
+            let next = (scroll_position.y - dy).clamp(0., max_offset);
+            scroll_position.y = next;
+
+            view.follow_tail = next >= max_offset - 1.;
+            view.scroll_to_bottom = false;
         },
     );
 
@@ -589,7 +539,8 @@ pub(crate) fn create_agent_panel(
             let Ok(agent_ref) = agents.get(agent) else {
                 return;
             };
-            view.follow_tail();
+            view.follow_tail = true;
+            view.scroll_to_bottom = true;
             render_transcript(&mut commands, &mut view, agent_ref, &collapse);
         },
     );
@@ -1102,97 +1053,74 @@ fn render_entry(
     }
 }
 
-/// Rebuild the visible transcript window from the configured anchor.
+/// Rebuild the transcript from the complete conversation history plus the live
+/// streaming card, if any.
 pub(crate) fn render_transcript(
     commands: &mut Commands,
     view: &mut AgentView,
     agent: &Agent,
     collapse: &TextCollapseConfig,
 ) {
-    render_transcript_with_live(commands, view, agent, collapse, false);
+    commands.entity(view.log).despawn_children();
+    view.assistant = None;
+
+    let history = agent.history();
+    let tool_names = tool_name_map(history);
+    for entry in history {
+        render_entry(commands, view.log, entry, &tool_names, collapse);
+    }
+
+    if live_pending(agent) {
+        view.assistant = Some(spawn_live_assistant(commands, view.log, agent, collapse));
+    }
+
+    view.transcript_visible = true;
+    view.rendered_entries = history.len();
+    view.scroll_to_bottom = true;
 }
 
-/// Start (or restart) the live assistant card for a new turn.
+/// Start (or restart) the live assistant card for a new turn without rebuilding
+/// the already-rendered history.
 pub(crate) fn begin_live_assistant(
     commands: &mut Commands,
     view: &mut AgentView,
     agent: &Agent,
     collapse: &TextCollapseConfig,
 ) {
-    render_transcript_with_live(commands, view, agent, collapse, true);
+    if view.transcript_visible {
+        view.assistant = Some(spawn_live_assistant(commands, view.log, agent, collapse));
+    } else {
+        view.assistant = None;
+    }
+    view.scroll_to_bottom = true;
 }
 
-fn render_transcript_with_live(
+fn spawn_live_assistant(
     commands: &mut Commands,
-    view: &mut AgentView,
+    log: Entity,
     agent: &Agent,
     collapse: &TextCollapseConfig,
-    force_live: bool,
-) {
-    commands.entity(view.log).despawn_children();
-    view.assistant = None;
-
-    let history = agent.history();
-    let history_len = history.len();
-    let following_tail = view.is_following_tail();
-    let show_live = following_tail && live_pending(agent, force_live);
-    // The live card shares the 20-card budget with history cards, so remove one
-    // history card from the window while a response is streaming.
-    let capacity = MAX_TRANSCRIPT_CARDS.saturating_sub(usize::from(show_live));
-    let start = match view.anchor {
-        TranscriptAnchor::FollowTail => history_len.saturating_sub(capacity),
-        TranscriptAnchor::Entry(index) => {
-            let clamped = index.min(history_len.saturating_sub(1));
-            if clamped != index {
-                view.anchor = TranscriptAnchor::Entry(clamped);
-            }
-            clamped
-        }
+) -> AssistantView {
+    let thinking = (!agent.streaming_thinking().is_empty()).then_some(agent.streaming_thinking());
+    let text = agent.streaming_text();
+    let answer = if text.is_empty() && thinking.is_none() {
+        "..."
+    } else {
+        text
     };
-    let end = (start + capacity).min(history_len);
-    let tool_names = tool_name_map(history);
-    for entry in &history[start..end] {
-        render_entry(commands, view.log, entry, &tool_names, collapse);
-    }
-
-    if show_live {
-        let thinking =
-            (!agent.streaming_thinking().is_empty()).then_some(agent.streaming_thinking());
-        let text = agent.streaming_text();
-        let answer = if text.is_empty() && thinking.is_none() {
-            "..."
-        } else {
-            text
-        };
-        view.assistant = Some(spawn_assistant_card(
-            commands, view.log, answer, thinking, collapse,
-        ));
-    }
-
-    view.transcript_visible = true;
-    view.rendered_entries = history_len;
-    // Entry-anchored windows always start at the selected entry so scrolling
-    // changes the top card by exactly one. FollowTail stays glued to the newest
-    // card, even when fewer than 20 cards are rendered.
-    view.scroll_to_bottom = following_tail;
-    view.scroll_to_top = !following_tail;
+    spawn_assistant_card(commands, log, answer, thinking, collapse)
 }
 
 /// Whether a live streaming/placeholder card exists for the current turn.
-fn live_pending(agent: &Agent, force_live: bool) -> bool {
-    force_live
-        || agent.has_active_turn()
+fn live_pending(agent: &Agent) -> bool {
+    agent.has_active_turn()
         || !agent.streaming_text().is_empty()
         || !agent.streaming_thinking().is_empty()
 }
 
-/// Whether the live card should be part of the visible window.
-fn live_requested(view: &AgentView, agent: &Agent, force_live: bool) -> bool {
-    view.is_following_tail() && live_pending(agent, force_live)
-}
-
-/// Rebuild the window when history changed. Scrolling itself re-renders in the
-/// scroll observer, so this only handles appended or rolled-back entries.
+/// Render only the newest history entry when exactly one was appended. This is
+/// the "draft popped" path: the live assistant card is replaced by the
+/// finalized block without rebuilding the whole transcript.
 pub(crate) fn refresh_transcripts(
     mut commands: Commands,
     mut views: Query<(&mut AgentView, &Agent)>,
@@ -1202,8 +1130,27 @@ pub(crate) fn refresh_transcripts(
         if !view.transcript_visible {
             continue;
         }
-        if agent.history().len() != view.rendered_entries {
+
+        let history_len = agent.history().len();
+        if history_len < view.rendered_entries {
+            // Rollback or reset: the transcript is no longer trustworthy.
             render_transcript(&mut commands, &mut view, agent, &collapse);
+            continue;
+        }
+        if history_len > view.rendered_entries + 1 {
+            render_transcript(&mut commands, &mut view, agent, &collapse);
+            continue;
+        }
+        if history_len == view.rendered_entries + 1 {
+            if let Some(assistant) = view.assistant.take() {
+                commands.entity(assistant.card).despawn();
+            }
+            if let Some(entry) = agent.history().last() {
+                let tool_names = tool_name_map(agent.history());
+                render_entry(&mut commands, view.log, entry, &tool_names, &collapse);
+            }
+            view.rendered_entries = history_len;
+            view.scroll_to_bottom = true;
         }
     }
 }
@@ -1216,97 +1163,9 @@ pub(crate) fn ensure_live_assistant(
     agent: &Agent,
     collapse: &TextCollapseConfig,
 ) {
-    if view.transcript_visible && view.assistant.is_none() && live_requested(view, agent, false) {
-        render_transcript_with_live(commands, view, agent, collapse, false);
+    if view.transcript_visible && view.assistant.is_none() && live_pending(agent) {
+        view.assistant = Some(spawn_live_assistant(commands, view.log, agent, collapse));
     }
-}
-
-/// Move the transcript window by exactly one history entry.
-fn scroll_transcript(view: &mut AgentView, agent: &Agent, older: bool, visible_top: usize) -> bool {
-    let history_len = agent.history().len();
-    let tail_capacity =
-        MAX_TRANSCRIPT_CARDS.saturating_sub(usize::from(live_pending(agent, false)));
-    let next = shifted_anchor(view.anchor, older, history_len, tail_capacity, visible_top);
-    if next == view.anchor {
-        return false;
-    }
-    view.anchor = next;
-    true
-}
-
-/// Pure anchor transition used by both the wheel observer and tests.
-fn shifted_anchor(
-    anchor: TranscriptAnchor,
-    older: bool,
-    history_len: usize,
-    tail_capacity: usize,
-    visible_top: usize,
-) -> TranscriptAnchor {
-    if history_len == 0 {
-        return TranscriptAnchor::Entry(0);
-    }
-    let last_index = history_len - 1;
-
-    match (anchor, older) {
-        (TranscriptAnchor::FollowTail, false) => TranscriptAnchor::FollowTail,
-        (TranscriptAnchor::FollowTail, true) => {
-            // `visible_top` is the card index inside the current tail window.
-            // Step one entry above whatever the user can currently see, so the
-            // first wheel notch also works when fewer than 20 cards exist.
-            let tail_start = history_len.saturating_sub(tail_capacity);
-            let top = (tail_start + visible_top).min(last_index);
-            TranscriptAnchor::Entry(top.saturating_sub(1))
-        }
-        (TranscriptAnchor::Entry(index), true) => {
-            let top = index.min(last_index);
-            TranscriptAnchor::Entry(top.saturating_sub(1))
-        }
-        (TranscriptAnchor::Entry(index), false) => {
-            let top = index.min(last_index);
-            if top + 1 >= history_len {
-                TranscriptAnchor::FollowTail
-            } else {
-                TranscriptAnchor::Entry(top + 1)
-            }
-        }
-    }
-}
-
-/// Find the card currently at the top of the scroll viewport. The transcript
-/// layout uses a fixed row gap, so card sizes are enough to map scroll offset
-/// back to a card index without another layout pass.
-fn visible_top_card(
-    log: Entity,
-    children: &Query<&Children>,
-    nodes: &Query<&Node>,
-    computed: &Query<&ComputedNode>,
-    scroll_positions: &Query<&ScrollPosition>,
-) -> usize {
-    let Ok(cards) = children.get(log) else {
-        return 0;
-    };
-    let Some(log_computed) = computed.get(log).ok() else {
-        return 0;
-    };
-    let scroll_y = scroll_positions.get(log).map_or(0., |position| position.y);
-    let inverse_scale = log_computed.inverse_scale_factor();
-    let row_gap = nodes.get(log).ok().map_or(0., |node| match node.row_gap {
-        Val::Px(gap) => gap,
-        _ => 0.,
-    });
-
-    let mut top = 0;
-    let mut offset = 0.;
-    for (index, card) in cards.iter().enumerate() {
-        if offset > scroll_y + 0.5 {
-            break;
-        }
-        top = index;
-        if let Ok(card) = computed.get(card) {
-            offset += card.size().y * inverse_scale + row_gap;
-        }
-    }
-    top
 }
 
 pub(crate) fn response_display_text(entries: &[Entry]) -> Option<String> {
@@ -1405,15 +1264,7 @@ pub(crate) fn auto_scroll(
     mut logs: Query<(&mut ScrollPosition, &ComputedNode)>,
 ) {
     for mut view in &mut views {
-        if view.scroll_to_top {
-            if let Ok((mut scroll_position, _)) = logs.get_mut(view.log) {
-                scroll_position.y = 0.;
-            }
-            view.scroll_to_top = false;
-            view.scroll_to_bottom = false;
-            continue;
-        }
-        if !view.scroll_to_bottom {
+        if !view.follow_tail || !view.scroll_to_bottom {
             continue;
         }
         let Ok((mut scroll_position, computed)) = logs.get_mut(view.log) else {
@@ -1445,8 +1296,7 @@ mod transcript_tests {
             transcript_visible: true,
             rendered_entries: 0,
             scroll_to_bottom: false,
-            scroll_to_top: false,
-            anchor: TranscriptAnchor::FollowTail,
+            follow_tail: true,
         }
     }
 
@@ -1485,7 +1335,7 @@ mod transcript_tests {
     }
 
     #[test]
-    fn window_keeps_only_twenty_cards_and_follows_tail() {
+    fn renders_whole_conversation_history() {
         let mut world = World::new();
         let log = world.spawn((Node::default(), TranscriptLog)).id();
         let agent = agent_with_messages(50);
@@ -1502,37 +1352,14 @@ mod transcript_tests {
         world.flush();
 
         let bodies = rendered_bodies(&world, log);
-        assert_eq!(bodies.len(), MAX_TRANSCRIPT_CARDS);
-        assert_eq!(bodies.first().unwrap(), "message 30");
+        // System prompt plus all 50 messages.
+        assert_eq!(bodies.len(), 51);
+        assert_eq!(bodies[1], "message 0");
         assert_eq!(bodies.last().unwrap(), "message 49");
     }
 
     #[test]
-    fn anchored_window_renders_the_selected_slice() {
-        let mut world = World::new();
-        let log = world.spawn((Node::default(), TranscriptLog)).id();
-        let agent = agent_with_messages(50);
-        let mut view = agent_view(log);
-        view.anchor = TranscriptAnchor::Entry(10);
-        {
-            let mut commands = world.commands();
-            render_transcript(
-                &mut commands,
-                &mut view,
-                &agent,
-                &TextCollapseConfig::default(),
-            );
-        }
-        world.flush();
-
-        let bodies = rendered_bodies(&world, log);
-        assert_eq!(bodies.len(), MAX_TRANSCRIPT_CARDS);
-        assert_eq!(bodies.first().unwrap(), "message 9");
-        assert_eq!(bodies.last().unwrap(), "message 28");
-    }
-
-    #[test]
-    fn live_card_shares_the_twenty_card_budget() {
+    fn live_card_is_appended_to_the_full_history() {
         let mut world = World::new();
         let log = world.spawn((Node::default(), TranscriptLog)).id();
         let mut agent = agent_with_messages(50);
@@ -1550,91 +1377,17 @@ mod transcript_tests {
         world.flush();
 
         let card_count = world.get::<Children>(log).unwrap().len();
-        assert_eq!(card_count, MAX_TRANSCRIPT_CARDS);
+        assert_eq!(card_count, 52);
         assert!(view.assistant.is_some());
-        // 19 history cards plus the live assistant card.
         let bodies = rendered_bodies(&world, log);
-        assert_eq!(bodies.len(), MAX_TRANSCRIPT_CARDS);
-        assert_eq!(bodies.first().unwrap(), "message 31");
+        assert_eq!(bodies.len(), 52);
+        assert_eq!(bodies[1], "message 0");
+        assert_eq!(bodies[bodies.len() - 2], "message 49");
         assert_eq!(bodies.last().unwrap(), "...");
     }
 
     #[test]
-    fn anchored_window_can_start_inside_a_short_dialogue() {
-        let mut world = World::new();
-        let log = world.spawn((Node::default(), TranscriptLog)).id();
-        let agent = agent_with_messages(10);
-        let mut view = agent_view(log);
-        view.anchor = TranscriptAnchor::Entry(5);
-        {
-            let mut commands = world.commands();
-            render_transcript(
-                &mut commands,
-                &mut view,
-                &agent,
-                &TextCollapseConfig::default(),
-            );
-        }
-        world.flush();
-
-        let bodies = rendered_bodies(&world, log);
-        assert_eq!(bodies.len(), 6);
-        assert_eq!(bodies.first().unwrap(), "message 4");
-        assert_eq!(bodies.last().unwrap(), "message 9");
-    }
-
-    #[test]
-    fn scrolling_moves_one_entry_and_returns_to_tail() {
-        assert_eq!(
-            shifted_anchor(TranscriptAnchor::FollowTail, true, 50, 20, 0),
-            TranscriptAnchor::Entry(29)
-        );
-        assert_eq!(
-            shifted_anchor(TranscriptAnchor::Entry(29), false, 50, 20, 0),
-            TranscriptAnchor::Entry(30)
-        );
-        assert_eq!(
-            shifted_anchor(TranscriptAnchor::Entry(49), false, 50, 20, 0),
-            TranscriptAnchor::FollowTail
-        );
-        assert_eq!(
-            shifted_anchor(TranscriptAnchor::Entry(10), true, 50, 20, 0),
-            TranscriptAnchor::Entry(9)
-        );
-        assert_eq!(
-            shifted_anchor(TranscriptAnchor::Entry(10), false, 50, 20, 0),
-            TranscriptAnchor::Entry(11)
-        );
-        assert_eq!(
-            shifted_anchor(TranscriptAnchor::Entry(0), true, 50, 20, 0),
-            TranscriptAnchor::Entry(0)
-        );
-    }
-
-    #[test]
-    fn scrolling_works_when_the_dialogue_is_shorter_than_the_window() {
-        // Ten history entries all fit in the 20-card window. Scrolling up must
-        // still move one visible card instead of doing nothing.
-        assert_eq!(
-            shifted_anchor(TranscriptAnchor::FollowTail, true, 10, 20, 7),
-            TranscriptAnchor::Entry(6)
-        );
-        assert_eq!(
-            shifted_anchor(TranscriptAnchor::Entry(6), true, 10, 20, 0),
-            TranscriptAnchor::Entry(5)
-        );
-        assert_eq!(
-            shifted_anchor(TranscriptAnchor::Entry(8), false, 10, 20, 0),
-            TranscriptAnchor::Entry(9)
-        );
-        assert_eq!(
-            shifted_anchor(TranscriptAnchor::Entry(9), false, 10, 20, 0),
-            TranscriptAnchor::FollowTail
-        );
-    }
-
-    #[test]
-    fn refresh_rebuilds_window_when_history_changes() {
+    fn refresh_rebuilds_transcript_when_history_changes() {
         let mut app = App::new();
         let log = app.world_mut().spawn((Node::default(), TranscriptLog)).id();
         let agent = app.world_mut().spawn(agent_with_messages(3)).id();
