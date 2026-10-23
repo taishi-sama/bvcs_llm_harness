@@ -241,12 +241,12 @@ pub(crate) fn rescan_tools(
     }
 
     let report = reconcile(world.fs.tools(), &rows, &mut world.commands, apply);
-    if apply {
-        world.registry_status.revision = world.fs.tools().revision();
-        world.registry_status.registered = report.registered.len();
-        world.registry_status.broken = report.broken.len();
-        world.registry_status.report = report.render();
-    }
+    // Record the revision even for a dry run: the caller asked for no changes,
+    // so the automatic reconciler must not apply them on the next frame.
+    world.registry_status.revision = world.fs.tools().revision();
+    world.registry_status.registered = report.registered.len();
+    world.registry_status.broken = report.broken.len();
+    world.registry_status.report = report.render();
 
     let mut output = report.render();
     if !apply {
