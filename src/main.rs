@@ -72,7 +72,10 @@ use config::{AppConfig, Provider, session_id_from_env};
 use glyph_cache::{GlyphCacheLimit, limit_glyph_cache, log_glyph_cache_limit};
 use messages::*;
 use shell::setup;
-use transcript::{TextCollapseConfig, auto_scroll, refresh_transcripts};
+use transcript::{
+    TextCollapseConfig, auto_scroll, close_active_agent_menu, open_active_agent_menu,
+    refresh_transcripts,
+};
 use virtual_fs::{VfsStateDir, VirtualFs};
 
 fn main() {
@@ -114,6 +117,8 @@ fn main() {
         .add_observer(index_agent_on_insert)
         .add_observer(index_agent_on_discard)
         .add_observer(deactivate_removed_agent)
+        .add_observer(open_active_agent_menu)
+        .add_observer(close_active_agent_menu)
         .add_observer(start_js_runtime)
         .add_observer(stop_js_runtime)
         .add_message::<StartAgentTurn>()
@@ -139,7 +144,6 @@ fn main() {
             (
                 (
                     create_requested_agents,
-                    sync_active_agent,
                     sync_retry_buttons,
                     cancel_agent_turn,
                     retry_agent_turn,

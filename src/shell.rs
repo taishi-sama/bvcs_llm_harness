@@ -261,5 +261,5 @@ pub(crate) fn setup(mut commands: Commands, config: Res<AppConfig>, storage: Res
     let agent = create_agent(&mut commands, &layout, &config, "LLM Agent 1".to_owned(), 1);
 
     commands.insert_resource(layout);
-    commands.insert_resource(ActiveAgent(Some(agent)));
+    commands.entity(agent).insert(ActiveAgent);
 }

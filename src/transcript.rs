@@ -8,7 +8,7 @@ use std::{collections::HashMap, env};
 
 use bevy::{
     input::mouse::MouseScrollUnit,
-    input_focus::tab_navigation::TabIndex,
+    input_focus::{FocusCause, InputFocus, tab_navigation::TabIndex},
     picking::events::{PointerClick, PointerScroll},
     prelude::*,
     text::{EditableText, TextCursorStyle},
@@ -18,7 +18,7 @@ use llm_api::{usage::Usage, wire_common::thinking_joined};
 use llm_history_model::history::{Entry, Thinking, ToolCallResult};
 
 use crate::{
-    agent::Agent,
+    agent::{ActiveAgent, Agent, AgentLayout},
     messages::{CancelAgentRequest, RemoveAgentRequest, RetryAgentTurn},
 };
 
@@ -68,6 +68,8 @@ pub(crate) struct AgentView {
     /// Whether streaming should keep the transcript pinned to the newest text.
     /// Cleared when the user scrolls away from the bottom.
     pub(crate) follow_tail: bool,
+    /// Unsent input text, preserved while the panel is despawned on tab switch.
+    pub(crate) draft: String,
 }
 
 #[derive(Clone, Copy)]
@@ -291,10 +293,18 @@ pub(crate) struct PanelEntities {
     pub(crate) stats: Entity,
 }
 
+/// Marks a panel root and remembers which agent owns it. The panel is spawned
+/// and despawned by the [`ActiveAgent`] observers below.
+#[derive(Component)]
+pub(crate) struct AgentPanel {
+    pub(crate) agent: Entity,
+}
+
 pub(crate) fn create_agent_panel(
     commands: &mut Commands,
     panels_root: Entity,
     agent: Entity,
+    draft: &str,
 ) -> PanelEntities {
     let panel = commands
         .spawn((
@@ -302,12 +312,13 @@ pub(crate) fn create_agent_panel(
                 width: percent(100.),
                 height: percent(100.),
                 min_height: px(0.),
-                display: Display::None,
+                display: Display::Flex,
                 flex_direction: FlexDirection::Column,
                 row_gap: px(12.),
                 ..default()
             },
-            Visibility::Hidden,
+            Visibility::Inherited,
+            AgentPanel { agent },
         ))
         .id();
 
@@ -372,7 +383,7 @@ pub(crate) fn create_agent_panel(
             EditableText {
                 visible_lines: Some(1.),
                 allow_newlines: false,
-                ..default()
+                ..EditableText::new(draft)
             },
             TextLayout::no_wrap(),
             TextFont {
@@ -623,6 +634,82 @@ pub(crate) fn create_agent_panel(
         input,
         status,
         stats,
+    }
+}
+
+/// Build the active agent's panel and transcript. The panel exists only while
+/// the agent carries [`ActiveAgent`].
+pub(crate) fn open_active_agent_menu(
+    insert: On<Insert<ActiveAgent>>,
+    mut commands: Commands,
+    layout: Res<AgentLayout>,
+    mut views: Query<(&mut AgentView, &Agent)>,
+    mut focus: ResMut<InputFocus>,
+    mut tabs: Query<(&AgentTab, &mut BackgroundColor, &mut BorderColor)>,
+    collapse: Res<TextCollapseConfig>,
+) {
+    let Ok((mut view, agent)) = views.get_mut(insert.entity) else {
+        return;
+    };
+
+    if view.panel == Entity::PLACEHOLDER {
+        let panel = create_agent_panel(&mut commands, layout.panels, insert.entity, &view.draft);
+        view.panel = panel.panel;
+        view.log = panel.log;
+        view.input = panel.input;
+        view.status = panel.status;
+        view.stats = panel.stats;
+    }
+
+    view.follow_tail = true;
+    render_transcript(&mut commands, &mut view, agent, &collapse);
+    focus.set(view.input, FocusCause::Navigated);
+    style_agent_tabs(&mut tabs, Some(insert.entity));
+}
+
+/// Tear down the active agent's panel and transcript when [`ActiveAgent`] is
+/// removed, whether by a tab change or by despawning the agent.
+pub(crate) fn close_active_agent_menu(
+    remove: On<Remove<ActiveAgent>>,
+    mut commands: Commands,
+    panels: Query<(Entity, &AgentPanel)>,
+    mut views: Query<&mut AgentView>,
+    inputs: Query<&EditableText>,
+) {
+    for (panel, owner) in &panels {
+        if owner.agent == remove.entity {
+            commands.entity(panel).despawn();
+        }
+    }
+
+    if let Ok(mut view) = views.get_mut(remove.entity) {
+        view.draft = inputs
+            .get(view.input)
+            .map(|input| input.value().to_string())
+            .unwrap_or_default();
+        view.panel = Entity::PLACEHOLDER;
+        view.log = Entity::PLACEHOLDER;
+        view.input = Entity::PLACEHOLDER;
+        view.status = Entity::PLACEHOLDER;
+        view.stats = Entity::PLACEHOLDER;
+        view.assistant = None;
+        view.transcript_visible = false;
+        view.rendered_entries = 0;
+    }
+}
+
+fn style_agent_tabs(
+    tabs: &mut Query<(&AgentTab, &mut BackgroundColor, &mut BorderColor)>,
+    active: Option<Entity>,
+) {
+    for (tab, mut background, mut border) in tabs.iter_mut() {
+        if Some(tab.agent) == active {
+            background.0 = Color::srgb(0.18, 0.24, 0.34);
+            *border = BorderColor::all(Color::srgb(0.45, 0.62, 0.88));
+        } else {
+            background.0 = Color::srgb(0.12, 0.14, 0.18);
+            *border = BorderColor::all(Color::srgb(0.24, 0.28, 0.36));
+        }
     }
 }
 
@@ -1297,6 +1384,7 @@ mod transcript_tests {
             rendered_entries: 0,
             scroll_to_bottom: false,
             follow_tail: true,
+            draft: String::new(),
         }
     }
 
@@ -1384,6 +1472,59 @@ mod transcript_tests {
         assert_eq!(bodies[1], "message 0");
         assert_eq!(bodies[bodies.len() - 2], "message 49");
         assert_eq!(bodies.last().unwrap(), "...");
+    }
+
+    #[test]
+    fn menu_lives_only_while_active_agent_marker_exists() {
+        let mut app = App::new();
+        app.init_resource::<InputFocus>();
+        app.init_resource::<TextCollapseConfig>();
+        let panels = app.world_mut().spawn_empty().id();
+        let tabs = app.world_mut().spawn_empty().id();
+        app.insert_resource(AgentLayout {
+            tabs,
+            panels,
+            next_number: 1,
+        });
+        app.add_observer(open_active_agent_menu);
+        app.add_observer(close_active_agent_menu);
+
+        let agent = app.world_mut().spawn(agent_with_messages(3)).id();
+        app.world_mut()
+            .entity_mut(agent)
+            .insert(agent_view(Entity::PLACEHOLDER));
+        app.world_mut().entity_mut(agent).insert(ActiveAgent);
+        app.update();
+
+        let view = app.world().get::<AgentView>(agent).unwrap();
+        let panel = view.panel;
+        let log = view.log;
+        let input = view.input;
+        assert_ne!(panel, Entity::PLACEHOLDER);
+        assert!(view.transcript_visible);
+        assert_eq!(app.world().get::<Children>(log).unwrap().len(), 4);
+
+        app.world_mut()
+            .get_mut::<EditableText>(input)
+            .unwrap()
+            .editor_mut()
+            .set_text("unsent draft");
+
+        app.world_mut().entity_mut(agent).remove::<ActiveAgent>();
+        app.update();
+
+        assert!(app.world().get_entity(panel).is_err());
+        let view = app.world().get::<AgentView>(agent).unwrap();
+        assert_eq!(view.panel, Entity::PLACEHOLDER);
+        assert!(!view.transcript_visible);
+        assert_eq!(view.draft, "unsent draft");
+
+        app.world_mut().entity_mut(agent).insert(ActiveAgent);
+        app.update();
+
+        let view = app.world().get::<AgentView>(agent).unwrap();
+        let restored = app.world().get::<EditableText>(view.input).unwrap();
+        assert_eq!(restored.value().to_string(), "unsent draft");
     }
 
     #[test]

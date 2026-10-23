@@ -35,16 +35,17 @@ use crate::{
     tools::{ToolTarget, background_setting, classify_tool_call, execute_tool, interpreter_task},
     transcript::{
         AgentTab, AgentView, CollapsibleText, RetryAgentButton, TextCollapseConfig,
-        begin_live_assistant, create_agent_panel, create_agent_tab, ensure_live_assistant,
-        render_transcript, response_display_text, response_thinking_text, set_collapsible_text,
-        set_display, set_text, stats_text,
+        begin_live_assistant, create_agent_tab, ensure_live_assistant, response_display_text,
+        response_thinking_text, set_collapsible_text, set_display, set_text, stats_text,
     },
     transport::{request_body, stream_transport},
     virtual_fs::VirtualFs,
 };
 
 #[cfg(test)]
-use crate::transcript::{AssistantView, TranscriptCard, TranscriptLog};
+use crate::transcript::{
+    AgentPanel, AssistantView, TranscriptCard, TranscriptLog, close_active_agent_menu,
+};
 
 /// Prevent accidental runaway agent spawning from exhausting UI/VRAM.
 pub(crate) const MAX_AGENTS: usize = 64;
@@ -503,8 +504,32 @@ pub(crate) struct AgentLayout {
     pub(crate) next_number: usize,
 }
 
-#[derive(Resource)]
-pub(crate) struct ActiveAgent(pub(crate) Option<Entity>);
+/// Marks the single agent whose transcript menu currently exists.
+///
+/// The menu panel and all transcript cards live only while this component is
+/// present. Insert/remove observers in [`crate::transcript`] own that lifetime.
+#[derive(Component)]
+pub(crate) struct ActiveAgent;
+
+/// Move the active-agent marker to `next` (or clear it when `next` is `None`).
+pub(crate) fn activate_agent(
+    commands: &mut Commands,
+    active: &Query<Entity, With<ActiveAgent>>,
+    next: Option<Entity>,
+) {
+    for entity in active {
+        if Some(entity) != next {
+            // Agent removal despawns the previous owner, so this command can be
+            // applied after the entity is gone. Removal is best-effort here.
+            commands.entity(entity).try_remove::<ActiveAgent>();
+        }
+    }
+    if let Some(next) = next
+        && !active.contains(next)
+    {
+        commands.entity(next).insert(ActiveAgent);
+    }
+}
 
 /// Name -> entity lookup used by the cross-agent tool.
 #[derive(Resource, Default)]
@@ -587,10 +612,11 @@ pub(crate) fn create_requested_agents(
     mut commands: Commands,
     mut layout: ResMut<AgentLayout>,
     config: Res<AppConfig>,
-    mut active: ResMut<ActiveAgent>,
+    active: Query<Entity, With<ActiveAgent>>,
     mut index: ResMut<AgentIndex>,
 ) {
     let mut created = 0;
+    let mut newest = None;
     for _ in requests.read() {
         if index.by_name.len() + created >= MAX_AGENTS {
             continue;
@@ -600,8 +626,11 @@ pub(crate) fn create_requested_agents(
         let name = format!("LLM Agent {number}");
         let agent = create_agent(&mut commands, &layout, &config, name.clone(), number as i32);
         index.by_name.insert(name, agent);
-        active.0 = Some(agent);
+        newest = Some(agent);
         created += 1;
+    }
+    if let Some(agent) = newest {
+        activate_agent(&mut commands, &active, Some(agent));
     }
 }
 
@@ -619,29 +648,29 @@ pub(crate) fn create_agent(
         ))
         .id();
 
-    let panel = create_agent_panel(commands, layout.panels, agent_entity);
     let (tab, tab_label) = create_agent_tab(commands, layout.tabs, agent_entity, &name, tab_index);
 
     commands.entity(agent_entity).insert(AgentView {
-        panel: panel.panel,
-        log: panel.log,
-        input: panel.input,
-        status: panel.status,
-        stats: panel.stats,
+        panel: Entity::PLACEHOLDER,
+        log: Entity::PLACEHOLDER,
+        input: Entity::PLACEHOLDER,
+        status: Entity::PLACEHOLDER,
+        stats: Entity::PLACEHOLDER,
         tab_label,
         assistant: None,
         transcript_visible: false,
         rendered_entries: 0,
         scroll_to_bottom: false,
         follow_tail: true,
+        draft: String::new(),
     });
 
     // Select this tab when clicked.
-    commands
-        .entity(tab)
-        .observe(move |_: On<Activate>, mut active: ResMut<ActiveAgent>| {
-            active.0 = Some(agent_entity);
-        });
+    commands.entity(tab).observe(
+        move |_: On<Activate>, active: Query<Entity, With<ActiveAgent>>, mut commands: Commands| {
+            activate_agent(&mut commands, &active, Some(agent_entity));
+        },
+    );
 
     agent_entity
 }
@@ -682,17 +711,22 @@ pub(crate) fn index_agent_on_discard(
 pub(crate) fn deactivate_removed_agent(
     remove: On<Remove<Agent>>,
     views: Query<(Entity, &AgentView)>,
-    mut active: ResMut<ActiveAgent>,
+    active: Query<Entity, With<ActiveAgent>>,
+    mut commands: Commands,
     mut focus: ResMut<InputFocus>,
 ) {
-    if active.0 == Some(remove.entity) {
-        active.0 = views
-            .iter()
-            .map(|(entity, _)| entity)
-            .find(|entity| *entity != remove.entity);
-        if active.0.is_none() {
-            focus.clear();
-        }
+    let active_was_removed = active.contains(remove.entity);
+    if !active_was_removed && !active.is_empty() {
+        return;
+    }
+
+    let next = views
+        .iter()
+        .map(|(entity, _)| entity)
+        .find(|entity| *entity != remove.entity);
+    activate_agent(&mut commands, &active, next);
+    if next.is_none() {
+        focus.clear();
     }
 }
 
@@ -709,71 +743,6 @@ pub(crate) fn attach_js_runtime(
     commands
         .entity(add.entity)
         .insert(channels.handle_for(add.entity));
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn sync_active_agent(
-    mut active: ResMut<ActiveAgent>,
-    mut focus: ResMut<InputFocus>,
-    mut views: Query<(Entity, &mut AgentView, &Agent)>,
-    mut nodes: Query<&mut Node>,
-    mut visibilities: Query<&mut Visibility>,
-    mut tabs: Query<(&AgentTab, &mut BackgroundColor, &mut BorderColor)>,
-    collapse: Res<TextCollapseConfig>,
-    mut commands: Commands,
-) {
-    let active_valid = active.0.is_some_and(|entity| views.get(entity).is_ok());
-    if !active_valid {
-        active.0 = views.iter().next().map(|(entity, _, _)| entity);
-    }
-    let Some(active_entity) = active.0 else {
-        return;
-    };
-
-    for (entity, mut view, agent) in &mut views {
-        let is_active = entity == active_entity;
-        if let Ok(mut node) = nodes.get_mut(view.panel) {
-            node.display = if is_active {
-                Display::Flex
-            } else {
-                Display::None
-            };
-        }
-        if let Ok(mut visibility) = visibilities.get_mut(view.panel) {
-            *visibility = if is_active {
-                Visibility::Inherited
-            } else {
-                Visibility::Hidden
-            };
-        }
-
-        if is_active {
-            if !view.transcript_visible {
-                render_transcript(&mut commands, &mut view, agent, &collapse);
-            }
-        } else if view.transcript_visible {
-            commands.entity(view.log).despawn_children();
-            view.transcript_visible = false;
-            view.rendered_entries = 0;
-            view.assistant = None;
-        }
-    }
-
-    for (tab, mut background, mut border) in &mut tabs {
-        if tab.agent == active_entity {
-            background.0 = Color::srgb(0.18, 0.24, 0.34);
-            *border = BorderColor::all(Color::srgb(0.45, 0.62, 0.88));
-        } else {
-            background.0 = Color::srgb(0.12, 0.14, 0.18);
-            *border = BorderColor::all(Color::srgb(0.24, 0.28, 0.36));
-        }
-    }
-
-    if active.is_changed()
-        && let Ok((_, view, _)) = views.get(active_entity)
-    {
-        focus.set(view.input, FocusCause::Navigated);
-    }
 }
 
 pub(crate) fn sync_retry_buttons(
@@ -891,7 +860,7 @@ pub(crate) fn cancel_agent_turn(
 
 pub(crate) fn submit_input(
     keyboard: Res<ButtonInput<KeyCode>>,
-    active: Res<ActiveAgent>,
+    active: Query<Entity, With<ActiveAgent>>,
     mut agents: Query<(&mut Agent, &mut AgentView)>,
     mut inputs: Query<&mut EditableText>,
     mut texts: Query<&mut Text>,
@@ -899,7 +868,7 @@ pub(crate) fn submit_input(
     if !keyboard.just_pressed(KeyCode::Enter) {
         return;
     }
-    let Some(agent_entity) = active.0 else {
+    let Some(agent_entity) = active.iter().next() else {
         return;
     };
     let Ok((mut agent, view)) = agents.get_mut(agent_entity) else {
@@ -1943,7 +1912,6 @@ pub(crate) fn handle_agent_failed(
 pub(crate) fn remove_agents(
     mut requests: MessageReader<RemoveAgentRequest>,
     mut commands: Commands,
-    agents: Query<(Entity, &AgentView)>,
     tabs: Query<(Entity, &AgentTab)>,
     mut runtime: ResMut<AgentRuntime>,
     mut rounds: ResMut<ToolRounds>,
@@ -1961,10 +1929,8 @@ pub(crate) fn remove_agents(
         }
         rounds.remove_agent(agent);
 
-        // The panel and tab are separate roots, not children of the agent.
-        if let Ok((_, view)) = agents.get(agent) {
-            commands.entity(view.panel).despawn();
-        }
+        // The panel is despawned by the ActiveAgent remove observer (if this
+        // agent owned it); tabs are separate roots and are removed here.
         for (tab, tab_agent) in &tabs {
             if tab_agent.agent == agent {
                 commands.entity(tab).despawn();
@@ -2175,30 +2141,35 @@ mod removal_tests {
                     rendered_entries: 0,
                     scroll_to_bottom: false,
                     follow_tail: true,
+                    draft: String::new(),
                 },
             ))
             .id();
         app.world_mut().entity_mut(tab).insert(AgentTab { agent });
+        app.world_mut()
+            .entity_mut(panel)
+            .insert(AgentPanel { agent });
         (agent, panel, tab)
     }
 
     #[test]
     fn removing_an_agent_clears_ui_tabs_index_and_active_selection() {
         let mut app = App::new();
+        app.set_error_handler(bevy::ecs::error::panic);
         app.init_resource::<AgentRuntime>();
         app.init_resource::<ToolRounds>();
         app.init_resource::<AgentIndex>();
         app.init_resource::<InputFocus>();
-        app.insert_resource(ActiveAgent(None));
         app.add_message::<RemoveAgentRequest>();
         app.add_observer(index_agent_on_insert);
         app.add_observer(index_agent_on_discard);
         app.add_observer(deactivate_removed_agent);
+        app.add_observer(close_active_agent_menu);
         app.add_systems(Update, remove_agents);
 
         let (first, first_panel, first_tab) = spawn_test_agent(&mut app, "First");
         let (second, _, _) = spawn_test_agent(&mut app, "Second");
-        app.world_mut().resource_mut::<ActiveAgent>().0 = Some(first);
+        app.world_mut().entity_mut(first).insert(ActiveAgent);
 
         app.world_mut()
             .write_message(RemoveAgentRequest { agent: first });
@@ -2212,7 +2183,7 @@ mod removal_tests {
         assert!(!index.by_name.contains_key("First"));
         assert!(index.by_name.contains_key("Second"));
 
-        assert_eq!(app.world().resource::<ActiveAgent>().0, Some(second));
+        assert!(app.world().get::<ActiveAgent>(second).is_some());
         assert!(
             !app.world()
                 .resource::<AgentRuntime>()
@@ -2439,6 +2410,7 @@ mod cancel_tests {
                     rendered_entries: 3,
                     scroll_to_bottom: false,
                     follow_tail: true,
+                    draft: String::new(),
                 },
             ))
             .id();
@@ -2517,6 +2489,7 @@ mod rename_tests {
                     rendered_entries: 0,
                     scroll_to_bottom: false,
                     follow_tail: true,
+                    draft: String::new(),
                 },
             ))
             .id();
@@ -2587,6 +2560,7 @@ mod empty_response_tests {
             rendered_entries: 1,
             scroll_to_bottom: false,
             follow_tail: true,
+            draft: String::new(),
         });
 
         app.add_message::<AgentTurnFinished>();
