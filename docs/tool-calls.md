@@ -316,3 +316,12 @@ or `index.js`/`main.js`.
 | Live reconciliation / `rescan_tools` | `src/tools/rescan.rs` |
 | `.tools` mount and flat VFS | `src/virtual_fs.rs`, `src/vfs_path.rs` |
 | Boa contexts, `execute` global, module loader | `src/js_runtime.rs` |
+
+## See also
+
+- `docs/architecture.md` — threads, resources, schedules, messages
+- `docs/scheduling.md` — rounds, budgets, detach, cancellation in detail
+- `docs/js-runtime.md` — Boa contexts, the `execute` global, module loading
+- `docs/tools-folder.md` — `.tools` manifests, imports, mirror, rescan
+- `docs/virtual-fs.md` — the two mounts and `fs_*` semantics
+- `docs/known-issues.md` — deliberate decisions and remaining gaps
