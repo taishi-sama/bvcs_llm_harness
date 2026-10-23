@@ -1,7 +1,0 @@
-{
-  "name": "echo",
-  "description": "Echo text back, prefixed.",
-  "parameters": {
-    "text": {"type": "string", "description": "Text to echo"}
-  }
-}
