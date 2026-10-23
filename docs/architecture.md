@@ -125,6 +125,7 @@ src/tools.rs        tool definitions + inline dispatch
 src/tools/          registry, catalog, world, schedule, fs, agents,
                     search, script, manifest, tree, mirror, rescan
 src/transcript.rs   chat cards, collapsibles, tabs, stats, tool activity
+src/tool_display.rs display-only tool-call naming and result presentation
 src/shell.rs        top-level layout and VFS Save/Load
 crates/llm_api      provider adapters, streaming decoders, schemas, usage
 crates/llm_history_model  Entry/history model shared with providers

@@ -119,6 +119,18 @@ must use `world.commands` for world mutation and messages; they never panic.
 
 Results are stored by `call_index`, so async completions never reorder history.
 
+### Transcript presentation (UI only)
+
+Cards are resolved through `src/tool_display.rs`. `present_call` maps a model
+tool call to the effective call shown to the user: an `execute` gateway is
+transparent, so `execute(fs_read, …)` renders as a direct `fs_read` call and
+result. This is presentation only; history keeps the raw `execute` call and
+result, so provider requests and prompt caching are unaffected.
+
+To add a special renderer (for example an edit diff), add a
+`ToolPresentation` variant, return it from `present_call`, and branch on it in
+`transcript::render_entry`. Never add `Entry` variants for display-only data.
+
 ## 5. Async completions and the three request maps
 
 `ToolRounds` (`src/tools/schedule.rs`) owns:
@@ -316,6 +328,7 @@ or `index.js`/`main.js`.
 | Live reconciliation / `rescan_tools` | `src/tools/rescan.rs` |
 | `.tools` mount and flat VFS | `src/virtual_fs.rs`, `src/vfs_path.rs` |
 | Boa contexts, `execute` global, module loader | `src/js_runtime.rs` |
+| Transcript tool-call presentation | `src/tool_display.rs` |
 
 ## See also
 

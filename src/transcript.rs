@@ -20,6 +20,7 @@ use llm_history_model::history::{Entry, Thinking, ToolCallResult};
 use crate::{
     agent::{ActiveAgent, Agent, AgentLayout},
     messages::{CancelAgentRequest, RemoveAgentRequest, RetryAgentTurn},
+    tool_display::{PresentedCall, ToolPresentation, present_call},
     tools::schedule::ToolRounds,
 };
 
@@ -1063,41 +1064,46 @@ pub(crate) fn spawn_assistant_card(
     }
 }
 
-fn tool_result_summary(results: &[ToolCallResult], tool_names: &HashMap<String, String>) -> String {
+fn tool_result_summary(
+    results: &[ToolCallResult],
+    calls: &HashMap<String, PresentedCall>,
+) -> String {
     results
         .iter()
         .map(|result| {
-            let name = tool_names
-                .get(&result.tool_use_id)
-                .map(String::as_str)
+            let call = calls.get(&result.tool_use_id);
+            let name = call
+                .map(|call| call.name.as_str())
                 .unwrap_or(&result.tool_use_id);
+            let body = match call.map_or(ToolPresentation::Plain, |call| call.kind) {
+                ToolPresentation::Plain => result.result.as_str(),
+            };
             format!(
-                "{name} [{}]\n{}",
+                "{name} [{}]\n{body}",
                 if result.is_error { "error" } else { "ok" },
-                result.result
             )
         })
         .collect::<Vec<_>>()
         .join("\n\n")
 }
 
-fn tool_name_map(history: &[Entry]) -> HashMap<String, String> {
-    let mut names = HashMap::new();
+fn tool_display_map(history: &[Entry]) -> HashMap<String, PresentedCall> {
+    let mut calls = HashMap::new();
     for entry in history {
         if let Entry::ResponseToolCall { tool_call, .. } = entry {
             for call in tool_call {
-                names.insert(call.tool_use_id.clone(), call.tool_name.clone());
+                calls.insert(call.tool_use_id.clone(), present_call(call));
             }
         }
     }
-    names
+    calls
 }
 
 fn render_entry(
     commands: &mut Commands,
     log: Entity,
     entry: &Entry,
-    tool_names: &HashMap<String, String>,
+    calls: &HashMap<String, PresentedCall>,
     collapse: &TextCollapseConfig,
 ) {
     match entry {
@@ -1139,7 +1145,7 @@ fn render_entry(
             {
                 let names = tool_call
                     .iter()
-                    .map(|call| format!("`{}`", call.tool_name))
+                    .map(|call| format!("`{}`", present_call(call).name))
                     .collect::<Vec<_>>()
                     .join(", ");
                 spawn_message_card(
@@ -1160,7 +1166,7 @@ fn render_entry(
                 log,
                 "Tool calls",
                 Color::srgb(0.95, 0.75, 0.40),
-                tool_result_summary(tool_call, tool_names),
+                tool_result_summary(tool_call, calls),
                 Color::srgb(0.13, 0.115, 0.09),
                 true,
                 collapse,
@@ -1182,9 +1188,9 @@ pub(crate) fn render_transcript(
     view.assistant = None;
 
     let history = agent.history();
-    let tool_names = tool_name_map(history);
+    let calls = tool_display_map(history);
     for entry in history {
-        render_entry(commands, view.log, entry, &tool_names, collapse);
+        render_entry(commands, view.log, entry, &calls, collapse);
     }
 
     if live_pending(agent) {
@@ -1263,8 +1269,8 @@ pub(crate) fn refresh_transcripts(
                 commands.entity(assistant.card).despawn();
             }
             if let Some(entry) = agent.history().last() {
-                let tool_names = tool_name_map(agent.history());
-                render_entry(&mut commands, view.log, entry, &tool_names, &collapse);
+                let calls = tool_display_map(agent.history());
+                render_entry(&mut commands, view.log, entry, &calls, &collapse);
             }
             view.rendered_entries = history_len;
             view.scroll_to_bottom = true;
@@ -1303,7 +1309,7 @@ pub(crate) fn response_display_text(entries: &[Entry]) -> Option<String> {
                 "Calling {}...",
                 tool_call
                     .iter()
-                    .map(|call| format!("`{}`", call.tool_name))
+                    .map(|call| format!("`{}`", present_call(call).name))
                     .collect::<Vec<_>>()
                     .join(", ")
             ));
@@ -1622,6 +1628,7 @@ mod transcript_tests {
 #[cfg(test)]
 mod display_tests {
     use super::*;
+    use llm_history_model::history::ToolCall;
     use std::time::Duration;
 
     fn config() -> TextCollapseConfig {
@@ -1799,6 +1806,21 @@ mod display_tests {
         );
     }
 
+    fn history_with_call(call: ToolCall) -> Vec<Entry> {
+        vec![Entry::ResponseToolCall {
+            blocks: Vec::new(),
+            tool_call: vec![call],
+        }]
+    }
+
+    fn tool_call(name: &str, params: &str) -> ToolCall {
+        ToolCall {
+            tool_name: name.to_owned(),
+            toolcall_params: params.to_owned(),
+            tool_use_id: "call-1".to_owned(),
+        }
+    }
+
     #[test]
     fn tool_results_show_the_called_tool_name() {
         let results = vec![ToolCallResult {
@@ -1806,8 +1828,36 @@ mod display_tests {
             is_error: false,
             tool_use_id: "call-1".to_owned(),
         }];
-        let names = HashMap::from([("call-1".to_owned(), "fs_read".to_owned())]);
-        let summary = tool_result_summary(&results, &names);
+        let calls = tool_display_map(&history_with_call(tool_call("fs_read", "{}")));
+        let summary = tool_result_summary(&results, &calls);
         assert!(summary.contains("fs_read"), "{summary}");
+    }
+
+    #[test]
+    fn execute_results_show_the_target_tool_name() {
+        let results = vec![ToolCallResult {
+            result: "file contents".to_owned(),
+            is_error: false,
+            tool_use_id: "call-1".to_owned(),
+        }];
+        let calls = tool_display_map(&history_with_call(tool_call(
+            "execute",
+            r#"{"tool_name":"fs_read","args":{"path":"src/main.rs"}}"#,
+        )));
+        let summary = tool_result_summary(&results, &calls);
+
+        assert!(summary.starts_with("fs_read [ok]"), "{summary}");
+        assert!(!summary.contains("execute"), "{summary}");
+    }
+
+    #[test]
+    fn transient_calling_text_uses_the_execute_target() {
+        let entries =
+            history_with_call(tool_call("execute", r#"{"tool_name":"fs_read","args":{}}"#));
+
+        assert_eq!(
+            response_display_text(&entries).as_deref(),
+            Some("Calling `fs_read`...")
+        );
     }
 }

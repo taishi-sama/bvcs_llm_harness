@@ -85,15 +85,24 @@ fn list_agents(
     (format!("Available agents: {available}"), false)
 }
 
+/// Agent targeted by a history read. An omitted or blank `agent` means the
+/// caller's own history, matching the optional schema parameter.
+fn history_target_name<'a>(arguments: &'a Value, source_agent: &'a str) -> &'a str {
+    arguments
+        .get("agent")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(source_agent)
+}
+
 fn get_agent_history(
     world: &mut ToolWorld<'_, '_>,
     arguments: &Value,
     _source_entity: Entity,
-    _source_agent: &str,
+    source_agent: &str,
 ) -> (String, bool) {
-    let Some(target_name) = arguments.get("agent").and_then(Value::as_str) else {
-        return ("missing required string parameter `agent`".to_owned(), true);
-    };
+    let target_name = history_target_name(arguments, source_agent);
     let target = match history_agent(target_name, &world.index, &world.agents) {
         Ok(target) => target,
         Err(err) => return (err, true),
@@ -131,11 +140,9 @@ fn get_agent_message(
     world: &mut ToolWorld<'_, '_>,
     arguments: &Value,
     _source_entity: Entity,
-    _source_agent: &str,
+    source_agent: &str,
 ) -> (String, bool) {
-    let Some(target_name) = arguments.get("agent").and_then(Value::as_str) else {
-        return ("missing required string parameter `agent`".to_owned(), true);
-    };
+    let target_name = history_target_name(arguments, source_agent);
     let target = match history_agent(target_name, &world.index, &world.agents) {
         Ok(target) => target,
         Err(err) => return (err, true),
@@ -319,4 +326,25 @@ agent_tools! {
     "spawn_agent" => spawn_agent_tool = spawn_agent,
     "rename_self" => rename_self_tool = rename_self,
     "end_agent" => end_agent_tool = end_agent,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn omitted_history_agent_defaults_to_the_caller() {
+        assert_eq!(
+            history_target_name(&Value::Null, "LLM Agent 1"),
+            "LLM Agent 1"
+        );
+        assert_eq!(
+            history_target_name(&serde_json::json!({ "agent": "   " }), "LLM Agent 1"),
+            "LLM Agent 1"
+        );
+        assert_eq!(
+            history_target_name(&serde_json::json!({ "agent": "Worker" }), "LLM Agent 1"),
+            "Worker"
+        );
+    }
 }

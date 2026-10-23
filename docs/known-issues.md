@@ -84,6 +84,9 @@ agent does not “fix” a decision by accident.
   advertised set.
 - `execute` and `search_tools` are advertised; the catalog is otherwise
   trimmed. Adjust `catalog::policy` if schema size becomes a problem.
+- The transcript presents `execute` as the tool it targets, but nested
+  `execute()` calls made inside `run_javascript`/scripts are not shown as
+  separate cards.
 
 ### Testing
 

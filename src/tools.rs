@@ -757,9 +757,9 @@ pub(crate) fn definitions() -> Vec<Tool> {
             name: "get_agent_history".into(),
             description: Some(
                 "List the messages in any agent's conversation history, including this agent's \
-                 own. Accepts an exact agent name. Each item has `type`, `sender`, and \
-                 `message_index`; read the full message with get_agent_message. By default the \
-                 last 20 messages are returned."
+                 own. Omit `agent` to read this agent's history. Each item has `type`, \
+                 `sender`, and `message_index`; read the full message with get_agent_message. \
+                 By default the last 20 messages are returned."
                     .into(),
             ),
             parameters: HashMap::from([
@@ -767,7 +767,8 @@ pub(crate) fn definitions() -> Vec<Tool> {
                     "agent".to_owned(),
                     ParameterDescription {
                         r#type: ParameterType::String,
-                        description: "Exact agent title, or this agent's own name".into(),
+                        description: "Optional exact agent title; defaults to this agent"
+                            .into(),
                         required: false,
                     },
                 ),
@@ -795,8 +796,9 @@ pub(crate) fn definitions() -> Vec<Tool> {
         Tool {
             name: "get_agent_message".into(),
             description: Some(
-                "Read one message from an agent's conversation history, serialized as JSON. Use \
-                 the `message_index` values from get_agent_history."
+                "Read one message from an agent's conversation history, serialized as JSON. \
+                 Omit `agent` to read this agent's history. Use the `message_index` values from \
+                 get_agent_history."
                     .into(),
             ),
             parameters: HashMap::from([
@@ -804,7 +806,8 @@ pub(crate) fn definitions() -> Vec<Tool> {
                     "agent".to_owned(),
                     ParameterDescription {
                         r#type: ParameterType::String,
-                        description: "Exact agent title, or this agent's own name".into(),
+                        description: "Optional exact agent title; defaults to this agent"
+                            .into(),
                         required: false,
                     },
                 ),
@@ -813,7 +816,7 @@ pub(crate) fn definitions() -> Vec<Tool> {
                     ParameterDescription {
                         r#type: ParameterType::Number,
                         description: "Message index from get_agent_history".into(),
-                        required: false,
+                        required: true,
                     },
                 ),
             ]),
@@ -918,7 +921,7 @@ pub(crate) fn execute_tool(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::{AgentIndex, AgentLayout};
+    use crate::agent::{Agent, AgentIndex, AgentLayout};
     use crate::config::{AppConfig, Provider};
     use crate::messages::{RemoveAgentRequest, RenameAgentRequest, SendAgentMessage};
     use crate::tools::catalog::static_tools;
@@ -1048,6 +1051,8 @@ mod tests {
             ("eval_javascript_reset_context", "symbol"),
             ("get_agent_history", "position"),
             ("get_agent_history", "amount"),
+            ("get_agent_history", "agent"),
+            ("get_agent_message", "agent"),
             ("spawn_agent", "name"),
             ("spawn_agent", "prompt"),
         ] {
@@ -1063,6 +1068,7 @@ mod tests {
             ("fs_write", "path"),
             ("fs_write", "content"),
             ("fs_edit_pattern", "pattern"),
+            ("get_agent_message", "index"),
         ] {
             assert!(
                 parameter(tool, name).required,
@@ -1119,8 +1125,14 @@ mod tests {
             execute_tool(&mut world, "no_such_tool", &Value::Null, &smoke_context());
         let (agents_message, agents_error) =
             execute_tool(&mut world, "list_agents", &Value::Null, &smoke_context());
+        let (history_message, history_error) = execute_tool(
+            &mut world,
+            "get_agent_history",
+            &serde_json::json!({}),
+            &smoke_context(),
+        );
         out.0 = format!(
-            "{inline_error}|{inline_message}\n{legacy_error}|{legacy_message}\n{unknown_error}|{unknown_message}\n{agents_error}|{agents_message}"
+            "{inline_error}|{inline_message}\n{legacy_error}|{legacy_message}\n{unknown_error}|{unknown_message}\n{agents_error}|{agents_message}\n{history_error}|{history_message}"
         );
     }
 
@@ -1149,6 +1161,20 @@ mod tests {
             .add_message::<RenameAgentRequest>()
             .add_systems(PreStartup, register_static_tools)
             .add_systems(Update, smoke_dispatch);
+
+        let agent = app
+            .world_mut()
+            .spawn(Agent::new(
+                "Smoke".to_owned(),
+                Provider::Responses,
+                "test".to_owned(),
+            ))
+            .id();
+        app.world_mut()
+            .resource_mut::<AgentIndex>()
+            .by_name
+            .insert("Smoke".to_owned(), agent);
+
         app.update();
 
         let output = &app.world().resource::<SmokeOutput>().0;
@@ -1159,7 +1185,11 @@ mod tests {
         );
         assert_eq!(lines[1], "false|Virtual filesystem is empty.");
         assert_eq!(lines[2], "true|Unknown tool: no_such_tool");
-        assert_eq!(lines[3], "false|Available agents: ");
+        assert_eq!(lines[3], "false|Available agents: Smoke (you)");
+        assert!(
+            output.contains("false|[") && output.contains("\"type\": \"system_prompt\""),
+            "get_agent_history without `agent` returned {lines:?}"
+        );
     }
 
     #[test]

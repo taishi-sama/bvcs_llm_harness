@@ -112,4 +112,5 @@ envelopes so the provider sees them in order without breaking role alternation.
 | Tool round application | `src/agent.rs` (`apply_tool_results`) |
 | History model/validation | `crates/llm_history_model`, `crates/llm_api/src/validation.rs` |
 | UI rendering | `src/transcript.rs` |
+| Tool-call presentation (`execute` unwrapping) | `src/tool_display.rs` |
 | Provider request bodies | `src/transport.rs` + `crates/llm_api/src/{openai_responses,openai_completions,anthropic}` |

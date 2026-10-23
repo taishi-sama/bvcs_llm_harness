@@ -37,6 +37,7 @@
 //! Module layout:
 //! - `agent`: agent state, turn loop, tool rounds, and per-agent systems
 //! - `transcript`: chat-log cards, collapsible text, bounded window, scrolling
+//! - `tool_display`: display-only tool-call naming and result presentation
 //! - `glyph_cache`: bounds the shared font-atlas cache
 //! - `messages`: the Bevy message protocol shared by all layers
 //! - `transport`: HTTP streaming and provider request bodies
@@ -52,6 +53,7 @@ mod glyph_cache;
 mod js_runtime;
 mod messages;
 mod shell;
+mod tool_display;
 mod tools;
 mod transcript;
 mod transport;
