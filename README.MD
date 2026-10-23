@@ -25,7 +25,8 @@ Used by the main `bvcs_llm_harness` binary (`cargo run`).
 | `API_TOKEN` | empty | If non-empty, sent as `Authorization: Bearer <token>`. |
 | `SESSION_ID` | generated per process | Sent as the `x-opencode-session` header for request routing and prompt-cache stickiness. |
 | `VFS_STATE_DIR` | `vfs_state` | Directory used by the VFS Save/Load buttons. Relative paths resolve against the current working directory. |
-| `JS_AUTO_BACKGROUND_MS` | `5000` | Grace period before a long-running JavaScript tool call is detached into the background. `0` disables automatic backgrounding. |
+| `TOOLS_DIR` | `.tools` | On-disk mirror for the `.tools` script-tool tree. Relative paths resolve against the current working directory. |
+| `JS_AUTO_BACKGROUND_MS` | `5000` | Grace period before a root tool call that opts in (JavaScript tools by default) is detached into the background. `0` disables automatic backgrounding. |
 | `COLLAPSE_MAX_CHARS` | `1000` | Collapse a transcript body when it exceeds this many characters. Must be greater than zero. |
 | `COLLAPSE_MAX_LINES` | `10` | Collapse a transcript body when it exceeds this many lines. Must be greater than zero. |
 | `FONT_ATLAS_MAX_MB` | `32` | Maximum size of Bevy's shared font glyph atlas in MiB. When exceeded, the atlas is cleared and visible text is re-rasterized. `0` disables the limiter. |
@@ -57,4 +58,14 @@ Used by `crates/llm_connector_example`.
 
 ## Internal notes
 
-Tool call dispatch, lifetimes, and how to add a tool: `docs/tool-calls.md`.
+- `docs/architecture.md` — threads, ECS shape, schedules, messages, principles
+- `docs/agent-loop.md` — turn lifecycle, history, retries, pending messages
+- `docs/tool-calls.md` — dispatch, request lifetimes, budgets, how to add a tool
+- `docs/scheduling.md` — rounds, detached/nested calls, budgets, cancellation
+- `docs/js-runtime.md` — Boa contexts, `execute`, module loading, reset
+- `docs/tools-folder.md` — `.tools` manifests, imports, execution, mirror, rescan
+- `docs/virtual-fs.md` — flat root + `.tools` mount, `fs_*` semantics, persistence
+- `docs/providers.md` — `llm_api` adapters, streaming, schemas, validation
+- `docs/configuration.md` — environment variables and defaults
+- `docs/testing-debugging.md` — tests, BRP workflow, logs, pitfalls
+- `docs/known-issues.md` — deliberate decisions and remaining gaps
