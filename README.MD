@@ -54,3 +54,7 @@ Used by `crates/llm_connector_example`.
 
 ### Critical
 
+
+## Internal notes
+
+Tool call dispatch, lifetimes, and how to add a tool: `docs/tool-calls.md`.
