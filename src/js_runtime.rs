@@ -583,6 +583,8 @@ fn build_context_with(
         .build()
         .map_err(|err| format!("failed to create JavaScript context: {err}"))?;
 
+    context
+        .strict(true);
     // Protect the host from runaway loops and allocation in model-generated code.
     context
         .runtime_limits_mut()
