@@ -161,7 +161,12 @@ fn fs_edit_pattern(
         arguments.get("replacement").and_then(Value::as_str),
     ) {
         (Some(path), Some(pattern), Some(replacement)) => {
-            match world.fs.edit_pattern(path, pattern, replacement) {
+            let allow_multiple = bool_option(arguments, "allow_multiple", false);
+            let use_regex = bool_option(arguments, "use_regex", false);
+            match world
+                .fs
+                .edit_pattern(path, pattern, replacement, allow_multiple, use_regex)
+            {
                 Ok(message) => (message, false),
                 Err(err) => (err, true),
             }

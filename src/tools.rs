@@ -564,8 +564,10 @@ pub(crate) fn definitions() -> Vec<Tool> {
         Tool {
             name: "fs_edit_pattern".into(),
             description: Some(
-                "Replace a literal substring in a shared virtual file. Fails unless the \
-                 pattern occurs exactly once, so ambiguous edits cannot happen."
+                "Replace text in a shared virtual file. By default the pattern is literal and \
+                 must occur exactly once; set `allow_multiple` to replace every match and \
+                 `use_regex` to use a regular expression (replacement supports `$1`/`${name}` \
+                 captures)."
                     .into(),
             ),
             parameters: HashMap::from([
@@ -581,7 +583,7 @@ pub(crate) fn definitions() -> Vec<Tool> {
                     "pattern".to_owned(),
                     ParameterDescription {
                         r#type: ParameterType::String,
-                        description: "Literal text to find".into(),
+                        description: "Literal text or regular expression to find".into(),
                         required: true,
                     },
                 ),
@@ -591,6 +593,23 @@ pub(crate) fn definitions() -> Vec<Tool> {
                         r#type: ParameterType::String,
                         description: "Replacement text (may be empty)".into(),
                         required: true,
+                    },
+                ),
+                (
+                    "allow_multiple".to_owned(),
+                    ParameterDescription {
+                        r#type: ParameterType::Boolean,
+                        description: "Replace every match instead of failing on multiple matches"
+                            .into(),
+                        required: false,
+                    },
+                ),
+                (
+                    "use_regex".to_owned(),
+                    ParameterDescription {
+                        r#type: ParameterType::Boolean,
+                        description: "Treat `pattern` as a regular expression".into(),
+                        required: false,
                     },
                 ),
             ]),
@@ -1022,6 +1041,8 @@ mod tests {
             ("fs_sed", "start_line"),
             ("fs_sed", "end_line"),
             ("fs_sed", "line_numbers"),
+            ("fs_edit_pattern", "allow_multiple"),
+            ("fs_edit_pattern", "use_regex"),
             ("run_javascript", "run_in_background"),
             ("eval_javascript", "run_in_background"),
             ("eval_javascript_reset_context", "symbol"),

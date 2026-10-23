@@ -7,6 +7,7 @@ use std::{
 };
 
 use bevy::prelude::Resource;
+use regex::Regex;
 
 use crate::{
     tools::tree::ToolsTree,
@@ -509,12 +510,18 @@ impl VirtualFs {
         ))
     }
 
-    /// Replaces a literal substring only when it occurs exactly once.
+    /// Replaces a substring or regular expression.
+    ///
+    /// By default the pattern is literal and must match exactly once. Matching
+    /// every occurrence requires `allow_multiple`. Regex replacements expand
+    /// `$1`/`${name}` capture references.
     pub(crate) fn edit_pattern(
         &mut self,
         path: &str,
         pattern: &str,
         replacement: &str,
+        allow_multiple: bool,
+        use_regex: bool,
     ) -> Result<String, String> {
         let path = Self::resolve(path)?;
         let name = path.display();
@@ -523,18 +530,38 @@ impl VirtualFs {
         }
         let original = self.read_any(&path)?;
 
-        match original.matches(pattern).count() {
-            0 => Err(format!("Pattern not found in `{name}`.")),
-            1 => {
-                self.write_any(&path, original.replacen(pattern, replacement, 1));
-                Ok(format!(
-                    "Replaced the single match of the pattern in `{name}`."
-                ))
-            }
-            count => Err(format!(
-                "Pattern matches {count} times in `{name}`; refusing to edit because exactly one match is required."
-            )),
+        let regex = if use_regex {
+            Some(
+                Regex::new(pattern)
+                    .map_err(|err| format!("invalid regular expression `{pattern}`: {err}"))?,
+            )
+        } else {
+            None
+        };
+        let count = match &regex {
+            Some(regex) => regex.find_iter(&original).count(),
+            None => original.matches(pattern).count(),
+        };
+        if count == 0 {
+            return Err(format!("Pattern not found in `{name}`."));
         }
+        if count > 1 && !allow_multiple {
+            return Err(format!(
+                "Pattern matches {count} times in `{name}`; refusing to edit because exactly one match is required."
+            ));
+        }
+
+        let updated = match &regex {
+            Some(regex) if allow_multiple => regex.replace_all(&original, replacement).into_owned(),
+            Some(regex) => regex.replacen(&original, 1, replacement).into_owned(),
+            None if allow_multiple => original.replace(pattern, replacement),
+            None => original.replacen(pattern, replacement, 1),
+        };
+        self.write_any(&path, updated);
+        Ok(match count {
+            1 => format!("Replaced the single match of the pattern in `{name}`."),
+            count => format!("Replaced {count} matches of the pattern in `{name}`."),
+        })
     }
 }
 
@@ -558,7 +585,8 @@ mod tests {
             fs.list()
         );
 
-        fs.edit_pattern(".tools/tool1/main.js", "1", "2").unwrap();
+        fs.edit_pattern(".tools/tool1/main.js", "1", "2", false, false)
+            .unwrap();
         assert_eq!(
             fs.read(".tools/tool1/main.js").unwrap(),
             "export const x = 2;"
@@ -592,7 +620,8 @@ mod tests {
         fs.edit_lines("notes.txt", 2, 2, "TWO".into()).unwrap();
         assert_eq!(fs.read("notes.txt").unwrap(), "one\nTWO\nthree\n");
 
-        fs.edit_pattern("notes.txt", "TWO", "two").unwrap();
+        fs.edit_pattern("notes.txt", "TWO", "two", false, false)
+            .unwrap();
         assert_eq!(fs.read("notes.txt").unwrap(), "one\ntwo\nthree\n");
 
         fs.delete("notes.txt").unwrap();
@@ -606,16 +635,65 @@ mod tests {
         fs.write("a.txt", "same same\nsecond".into()).unwrap();
 
         let err = fs
-            .edit_pattern("a.txt", "same", "other")
+            .edit_pattern("a.txt", "same", "other", false, false)
             .expect_err("ambiguous pattern must fail");
         assert!(err.contains("2 times"), "{err}");
 
-        assert!(fs.edit_pattern("a.txt", "missing", "x").is_err());
+        assert!(
+            fs.edit_pattern("a.txt", "missing", "x", false, false)
+                .is_err()
+        );
         assert!(fs.edit_lines("a.txt", 0, 1, "x".into()).is_err());
         assert!(fs.edit_lines("a.txt", 3, 3, "x".into()).is_err());
         assert!(fs.edit_lines("a.txt", 2, 1, "x".into()).is_err());
         assert!(fs.write("dir/file.txt", "x".into()).is_err());
         assert!(fs.read("..").is_err());
+    }
+
+    #[test]
+    fn edit_pattern_can_replace_all_literal_matches() {
+        let mut fs = VirtualFs::default();
+        fs.write("m.txt", "same same same".into()).unwrap();
+
+        let message = fs
+            .edit_pattern("m.txt", "same", "other", true, false)
+            .unwrap();
+        assert_eq!(fs.read("m.txt").unwrap(), "other other other");
+        assert!(message.contains("3 matches"), "{message}");
+    }
+
+    #[test]
+    fn edit_pattern_supports_regular_expressions_and_captures() {
+        let mut fs = VirtualFs::default();
+        fs.write("r.txt", "name: Ada".into()).unwrap();
+
+        fs.edit_pattern("r.txt", r"name: (\w+)", "name: ${1} Lovelace", false, true)
+            .unwrap();
+        assert_eq!(fs.read("r.txt").unwrap(), "name: Ada Lovelace");
+
+        fs.write("n.txt", "a1 b2".into()).unwrap();
+        let err = fs
+            .edit_pattern("n.txt", r"\d", "0", false, true)
+            .expect_err("ambiguous regex must fail");
+        assert!(err.contains("2 times"), "{err}");
+
+        let message = fs.edit_pattern("n.txt", r"\d", "0", true, true).unwrap();
+        assert_eq!(fs.read("n.txt").unwrap(), "a0 b0");
+        assert!(message.contains("2 matches"), "{message}");
+    }
+
+    #[test]
+    fn edit_pattern_rejects_invalid_regex_and_treats_literals_literally() {
+        let mut fs = VirtualFs::default();
+        fs.write("lit.txt", "a.b".into()).unwrap();
+
+        fs.edit_pattern("lit.txt", ".", "!", false, false).unwrap();
+        assert_eq!(fs.read("lit.txt").unwrap(), "a!b");
+
+        let err = fs
+            .edit_pattern("lit.txt", "(", "x", false, true)
+            .expect_err("invalid regex must fail");
+        assert!(err.contains("invalid regular expression"), "{err}");
     }
 
     #[test]

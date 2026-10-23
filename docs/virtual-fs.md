@@ -29,7 +29,7 @@ handler sees them.
 | `fs_grep` | literal substring; `file:line:text` for hits, `file-line-text` for context, `--` between groups. Omit `path` to search the flat root **and** `.tools`. `context` capped at 100, `max_matches` default 200 / max 5000, optional case folding. |
 | `fs_write` | create or overwrite; reports line count. `.tools` writes mark the mirror dirty. |
 | `fs_edit_lines` | replace an inclusive 1-based range; empty content deletes the range. |
-| `fs_edit_pattern` | literal replace that **fails unless the pattern occurs exactly once**. |
+| `fs_edit_pattern` | replace text. Literal and exactly-once by default; `allow_multiple` replaces every match; `use_regex` treats `pattern` as a regular expression and expands `$1` / `${name}` captures in `replacement`. |
 | `fs_delete` | remove a file; `.tools` deletions also prune empty directories in the mirror. |
 
 Files are UTF-8 text. Writes are in-memory and immediate; persistence differs by
@@ -56,7 +56,8 @@ project content.
   mirror write cannot change what a call sees.
 - Empty files are valid; `read_range` on an empty file returns `""`.
 - `edit_pattern` refusing ambiguous edits is intentional: it replaces the “edit
-  the wrong occurrence” failure mode with a clear error.
+  the wrong occurrence” failure mode with a clear error. `allow_multiple` is the
+  explicit opt-in for the replace-everything case.
 
 ## Where to look
 
