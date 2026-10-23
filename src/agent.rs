@@ -145,6 +145,23 @@ impl ToolRounds {
     fn take_background(&mut self, request: u64) -> Option<BackgroundTask> {
         self.background.remove(&request)
     }
+
+    /// Tool calls still in flight for `agent`: unresolved round slots plus
+    /// detached tasks that outlived their round.
+    pub(crate) fn running_for(&self, agent: Entity) -> usize {
+        let pending = self
+            .active
+            .values()
+            .filter(|round| round.agent == agent)
+            .map(|round| round.remaining)
+            .sum::<usize>();
+        let detached = self
+            .background
+            .values()
+            .filter(|task| task.agent == agent)
+            .count();
+        pending + detached
+    }
 }
 
 fn background_started_message(task_id: u64) -> String {
@@ -658,6 +675,7 @@ pub(crate) fn create_agent(
         input: Entity::PLACEHOLDER,
         status: Entity::PLACEHOLDER,
         stats: Entity::PLACEHOLDER,
+        tool_activity: Entity::PLACEHOLDER,
         tab_label,
         assistant: None,
         transcript_visible: false,
@@ -2104,6 +2122,7 @@ mod removal_tests {
                     input: Entity::PLACEHOLDER,
                     status: Entity::PLACEHOLDER,
                     stats: Entity::PLACEHOLDER,
+                    tool_activity: Entity::PLACEHOLDER,
                     tab_label: Entity::PLACEHOLDER,
                     assistant: None,
                     transcript_visible: false,
@@ -2368,6 +2387,7 @@ mod cancel_tests {
                     input: Entity::PLACEHOLDER,
                     status,
                     stats: Entity::PLACEHOLDER,
+                    tool_activity: Entity::PLACEHOLDER,
                     tab_label: Entity::PLACEHOLDER,
                     assistant: Some(AssistantView {
                         card: live_card,
@@ -2452,6 +2472,7 @@ mod rename_tests {
                     input: Entity::PLACEHOLDER,
                     status,
                     stats: Entity::PLACEHOLDER,
+                    tool_activity: Entity::PLACEHOLDER,
                     tab_label,
                     assistant: None,
                     transcript_visible: false,
@@ -2518,6 +2539,7 @@ mod empty_response_tests {
             input: Entity::PLACEHOLDER,
             status,
             stats: Entity::PLACEHOLDER,
+            tool_activity: Entity::PLACEHOLDER,
             tab_label: Entity::PLACEHOLDER,
             assistant: Some(AssistantView {
                 card: live_card,

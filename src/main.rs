@@ -76,7 +76,7 @@ use messages::*;
 use shell::setup;
 use transcript::{
     TextCollapseConfig, auto_scroll, close_active_agent_menu, open_active_agent_menu,
-    refresh_transcripts,
+    refresh_transcripts, update_tool_activity,
 };
 use virtual_fs::{VfsStateDir, VirtualFs};
 
@@ -164,6 +164,7 @@ fn main() {
                     execute_tool_calls,
                     auto_background_long_js_tasks,
                     apply_tool_results,
+                    update_tool_activity,
                     handle_send_agent_message,
                     start_agent_turn,
                     handle_agent_failed,

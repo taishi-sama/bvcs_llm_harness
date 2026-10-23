@@ -18,7 +18,7 @@ use llm_api::{usage::Usage, wire_common::thinking_joined};
 use llm_history_model::history::{Entry, Thinking, ToolCallResult};
 
 use crate::{
-    agent::{ActiveAgent, Agent, AgentLayout},
+    agent::{ActiveAgent, Agent, AgentLayout, ToolRounds},
     messages::{CancelAgentRequest, RemoveAgentRequest, RetryAgentTurn},
 };
 
@@ -57,6 +57,8 @@ pub(crate) struct AgentView {
     pub(crate) status: Entity,
     /// Fixed-width usage readout (input/output/cached tokens).
     pub(crate) stats: Entity,
+    /// "Currently running toolcalls: N" readout.
+    pub(crate) tool_activity: Entity,
     pub(crate) tab_label: Entity,
     pub(crate) assistant: Option<AssistantView>,
     /// Whether the transcript cards for this agent are currently spawned.
@@ -291,6 +293,7 @@ pub(crate) struct PanelEntities {
     pub(crate) input: Entity,
     pub(crate) status: Entity,
     pub(crate) stats: Entity,
+    pub(crate) tool_activity: Entity,
 }
 
 /// Marks a panel root and remembers which agent owns it. The panel is spawned
@@ -579,6 +582,29 @@ pub(crate) fn create_agent_panel(
         ))
         .id();
 
+    let tool_activity = commands
+        .spawn((
+            Text::new(tool_activity_text(0)),
+            TextFont {
+                font_size: FontSize::Px(12.),
+                ..default()
+            },
+            TextColor(Color::srgb(0.62, 0.68, 0.78)),
+            TextLayout::no_wrap(),
+            ToolActivityText,
+        ))
+        .id();
+
+    let status_row = commands
+        .spawn(Node {
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::Center,
+            column_gap: px(8.),
+            ..default()
+        })
+        .add_children(&[status, tool_activity])
+        .id();
+
     let mut stats = Entity::PLACEHOLDER;
     let stats_box = commands
         .spawn((
@@ -620,7 +646,7 @@ pub(crate) fn create_agent_panel(
             column_gap: px(8.),
             ..default()
         })
-        .add_children(&[status, stats_box, scroll_to_bottom])
+        .add_children(&[status_row, stats_box, scroll_to_bottom])
         .id();
 
     commands
@@ -634,6 +660,7 @@ pub(crate) fn create_agent_panel(
         input,
         status,
         stats,
+        tool_activity,
     }
 }
 
@@ -659,6 +686,7 @@ pub(crate) fn open_active_agent_menu(
         view.input = panel.input;
         view.status = panel.status;
         view.stats = panel.stats;
+        view.tool_activity = panel.tool_activity;
     }
 
     view.follow_tail = true;
@@ -692,6 +720,7 @@ pub(crate) fn close_active_agent_menu(
         view.input = Entity::PLACEHOLDER;
         view.status = Entity::PLACEHOLDER;
         view.stats = Entity::PLACEHOLDER;
+        view.tool_activity = Entity::PLACEHOLDER;
         view.assistant = None;
         view.transcript_visible = false;
         view.rendered_entries = 0;
@@ -1333,6 +1362,38 @@ pub(crate) fn set_display(nodes: &mut Query<&mut Node>, entity: Entity, display:
     }
 }
 
+/// Marks the "Currently running toolcalls: N" readout.
+#[derive(Component)]
+pub(crate) struct ToolActivityText;
+
+/// Renders the in-flight tool-call count.
+///
+/// Inline tools finish within the frame, so this currently tracks interpreter
+/// and detached calls; the per-root budget work will feed the same readout.
+pub(crate) fn tool_activity_text(running: usize) -> String {
+    format!("Currently running toolcalls: {running}")
+}
+
+/// Keep every visible agent's tool-activity readout in sync with [`ToolRounds`].
+pub(crate) fn update_tool_activity(
+    rounds: Res<ToolRounds>,
+    views: Query<(Entity, &AgentView)>,
+    mut texts: Query<&mut Text>,
+) {
+    for (agent, view) in &views {
+        if view.tool_activity == Entity::PLACEHOLDER {
+            continue;
+        }
+        let wanted = tool_activity_text(rounds.running_for(agent));
+        let Ok(mut text) = texts.get_mut(view.tool_activity) else {
+            continue;
+        };
+        if text.0 != wanted {
+            text.0 = wanted;
+        }
+    }
+}
+
 /// Renders the fixed-width usage readout. Fields are padded so the text does
 /// not shift as token counts grow (Bevy's default font is monospaced).
 pub(crate) fn stats_text(usage: Option<&Usage>) -> String {
@@ -1378,6 +1439,7 @@ mod transcript_tests {
             input: Entity::PLACEHOLDER,
             status: Entity::PLACEHOLDER,
             stats: Entity::PLACEHOLDER,
+            tool_activity: Entity::PLACEHOLDER,
             tab_label: Entity::PLACEHOLDER,
             assistant: None,
             transcript_visible: true,
@@ -1420,6 +1482,12 @@ mod transcript_tests {
             .filter(|child| world.get::<TranscriptCard>(*child).is_some())
             .map(|card| card_body_text(world, card))
             .collect()
+    }
+
+    #[test]
+    fn tool_activity_readout_has_stable_wording() {
+        assert_eq!(tool_activity_text(0), "Currently running toolcalls: 0");
+        assert_eq!(tool_activity_text(7), "Currently running toolcalls: 7");
     }
 
     #[test]
