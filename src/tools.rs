@@ -1,45 +1,35 @@
-//! Central tool registry and executor.
+//! Tool catalog, registry, and executor.
 //!
+//! `definitions` is the single source of truth for names, descriptions, and
+//! parameter schemas. `catalog` decides how each one is exposed, and `registry`
+//! spawns one entity per tool so the live catalog is an ordinary ECS query.
 //! Both LLM-driven tool calls and JavaScript `execute(name, args)` calls end up
 //! in [`execute_tool`]. Tools that start JavaScript are deliberately not handled
 //! here; callers dispatch those asynchronously to the owning JS context.
 
+mod agent_tools;
+mod catalog;
+mod fs;
+mod registry;
+mod search;
+mod world;
+
 use std::collections::HashMap;
 
-use bevy::prelude::{Commands, Entity, MessageWriter, Query};
+use bevy::prelude::{Entity, Query};
 use llm_api::generic_tool::{ParameterDescription, ParameterType, Tool};
 use llm_history_model::history::Entry;
 use serde_json::Value;
 
 use crate::{
-    agent::{Agent, AgentIndex, AgentLayout, MAX_AGENTS, create_agent},
-    config::AppConfig,
+    agent::{Agent, AgentIndex},
     js_runtime::JsTask,
-    messages::{RemoveAgentRequest, RenameAgentRequest, SendAgentMessage},
     virtual_fs::VirtualFs,
 };
 
-/// Where one tool call must run.
-///
-/// LLM tool calls are classified by [`classify_tool_call`]. JavaScript
-/// `execute(name, args)` always goes to [`ToolTarget::Agent`], where
-/// [`execute_tool`] rejects [`JS_TOOLS`], so an interpreter can never
-/// recursively start another interpreter.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ToolTarget {
-    /// Execute immediately on the Bevy main loop (fast, world-state tools).
-    Agent,
-    /// Send to the agent's JavaScript thread and finish asynchronously.
-    Interpreter,
-}
-
-pub(crate) fn classify_tool_call(name: &str) -> ToolTarget {
-    if is_js_tool(name) {
-        ToolTarget::Interpreter
-    } else {
-        ToolTarget::Agent
-    }
-}
+pub(crate) use catalog::{AdvertisedTools, advertised_tools};
+pub(crate) use registry::{CallContext, Execution, find, register_static_tools};
+pub(crate) use world::ToolWorld;
 
 /// Build the interpreter task for one JavaScript tool call.
 pub(crate) fn interpreter_task(
@@ -97,7 +87,7 @@ pub(crate) fn initial_task_message(creator: &str, prompt: &str) -> String {
     format!("You were created by {creator}, your task:\n{prompt}")
 }
 
-fn optional_u64(arguments: &Value, name: &str) -> Result<Option<u64>, String> {
+pub(crate) fn optional_u64(arguments: &Value, name: &str) -> Result<Option<u64>, String> {
     match arguments.get(name) {
         None | Some(Value::Null) => Ok(None),
         Some(value) => value
@@ -108,13 +98,13 @@ fn optional_u64(arguments: &Value, name: &str) -> Result<Option<u64>, String> {
 }
 
 /// Required counterpart to [`optional_u64`].
-fn required_u64(arguments: &Value, name: &str) -> Result<u64, String> {
+pub(crate) fn required_u64(arguments: &Value, name: &str) -> Result<u64, String> {
     optional_u64(arguments, name)?
         .ok_or_else(|| format!("missing required integer parameter `{name}`"))
 }
 
 /// Like [`optional_u64`], but negative values are meaningful (relative indices).
-fn optional_i64(arguments: &Value, name: &str) -> Result<Option<i64>, String> {
+pub(crate) fn optional_i64(arguments: &Value, name: &str) -> Result<Option<i64>, String> {
     match arguments.get(name) {
         None | Some(Value::Null) => Ok(None),
         Some(value) => value
@@ -125,7 +115,7 @@ fn optional_i64(arguments: &Value, name: &str) -> Result<Option<i64>, String> {
 }
 
 /// Boolean option with a default when the argument is omitted or null.
-fn bool_option(arguments: &Value, name: &str, default: bool) -> bool {
+pub(crate) fn bool_option(arguments: &Value, name: &str, default: bool) -> bool {
     match arguments.get(name) {
         None | Some(Value::Null) => default,
         Some(value) => is_truthy(Some(value)),
@@ -133,21 +123,25 @@ fn bool_option(arguments: &Value, name: &str, default: bool) -> bool {
 }
 
 /// Default and upper bounds for `fs_grep` output.
-const DEFAULT_GREP_MATCHES: u64 = 200;
-const MAX_GREP_MATCHES: u64 = 5_000;
-const MAX_GREP_CONTEXT: u64 = 100;
+pub(crate) const DEFAULT_GREP_MATCHES: u64 = 200;
+pub(crate) const MAX_GREP_MATCHES: u64 = 5_000;
+pub(crate) const MAX_GREP_CONTEXT: u64 = 100;
 
 /// Messages returned by `get_agent_history` when `amount` is omitted.
-const DEFAULT_HISTORY_AMOUNT: usize = 20;
+pub(crate) const DEFAULT_HISTORY_AMOUNT: usize = 20;
 /// Upper bound on `amount`, so one call cannot dump an unbounded history.
-const MAX_HISTORY_AMOUNT: usize = 1000;
+pub(crate) const MAX_HISTORY_AMOUNT: usize = 1000;
 
 /// Resolve the inclusive-exclusive slice of history to return.
 ///
 /// - omitted `position` starts at the last `amount` entries
 /// - a negative `position` counts back from the end (`-1` is the newest entry)
 /// - otherwise `position` is a plain zero-based index
-fn history_window(len: usize, position: Option<i64>, amount: Option<u64>) -> (usize, usize) {
+pub(crate) fn history_window(
+    len: usize,
+    position: Option<i64>,
+    amount: Option<u64>,
+) -> (usize, usize) {
     let amount = amount
         .unwrap_or(DEFAULT_HISTORY_AMOUNT as u64)
         .min(MAX_HISTORY_AMOUNT as u64) as usize;
@@ -162,7 +156,7 @@ fn history_window(len: usize, position: Option<i64>, amount: Option<u64>) -> (us
 }
 
 /// Snake-case name of the history entry kind, exposed to the model.
-fn entry_type(entry: &Entry) -> &'static str {
+pub(crate) fn entry_type(entry: &Entry) -> &'static str {
     match entry {
         Entry::SystemPrompt { .. } => "system_prompt",
         Entry::SystemMessage { .. } => "system_message",
@@ -175,7 +169,7 @@ fn entry_type(entry: &Entry) -> &'static str {
 }
 
 /// Who produced the entry, as far as it can be recovered from its content.
-fn entry_sender(entry: &Entry, agent_name: &str) -> String {
+pub(crate) fn entry_sender(entry: &Entry, agent_name: &str) -> String {
     match entry {
         Entry::SystemPrompt { .. } | Entry::SystemMessage { .. } => "system".to_owned(),
         Entry::UserMessage { content } => content
@@ -191,7 +185,7 @@ fn entry_sender(entry: &Entry, agent_name: &str) -> String {
 }
 
 /// Recover the sender from the envelopes used for queued user messages.
-fn user_message_sender(text: &str) -> Option<String> {
+pub(crate) fn user_message_sender(text: &str) -> Option<String> {
     const AGENT_PREFIX: &str = "<system_message>[Message from ";
     const TASK_PREFIX: &str = "You were created by ";
     const BACKGROUND_PREFIX: &str = "<system_message>[Background task ";
@@ -254,20 +248,52 @@ pub(crate) fn is_truthy(value: Option<&Value>) -> bool {
     }
 }
 
-/// Every tool advertised to the model. This is the single source of truth for
-/// tool names, descriptions, and parameter schemas.
-pub(crate) fn tools() -> Vec<Tool> {
+/// Every tool definition. This is the single source of truth for names,
+/// descriptions, and parameter schemas; exposure is decided by `catalog`.
+pub(crate) fn definitions() -> Vec<Tool> {
     vec![
         Tool {
-            name: "get_weather".into(),
-            description: Some("Returns the current weather for a city.".into()),
-            parameters: HashMap::from([(
-                "city".to_owned(),
-                ParameterDescription {
-                    r#type: ParameterType::String,
-                    description: "City name".into(),
-                },
-            )]),
+            name: "search_tools".into(),
+            description: Some(
+                "Search registered tools by name and/or description and return a compact \
+                 signature per match: `name(required: type, optional?: type) — description`. \
+                 Use it to discover tools that are not in your schema, then call a discovery \
+                 result directly by name. `filter` is an optional case-insensitive regular \
+                 expression; `max` defaults to 20 (max 100); `search_descriptions` defaults \
+                 to true."
+                    .into(),
+            ),
+            parameters: HashMap::from([
+                (
+                    "filter".to_owned(),
+                    ParameterDescription {
+                        r#type: ParameterType::String,
+                        description: "Optional case-insensitive regular expression matched \
+                                      against tool names, and against descriptions when \
+                                      `search_descriptions` is true"
+                            .into(),
+                        required: false,
+                    },
+                ),
+                (
+                    "max".to_owned(),
+                    ParameterDescription {
+                        r#type: ParameterType::Number,
+                        description: "Maximum number of matches to return (default 20, max 100)"
+                            .into(),
+                        required: false,
+                    },
+                ),
+                (
+                    "search_descriptions".to_owned(),
+                    ParameterDescription {
+                        r#type: ParameterType::Boolean,
+                        description: "Also match the filter against descriptions (default true)"
+                            .into(),
+                        required: false,
+                    },
+                ),
+            ]),
         },
         Tool {
             name: "fs_read".into(),
@@ -283,6 +309,7 @@ pub(crate) fn tools() -> Vec<Tool> {
                     ParameterDescription {
                         r#type: ParameterType::String,
                         description: "File name".into(),
+                        required: true,
                     },
                 ),
                 (
@@ -291,6 +318,7 @@ pub(crate) fn tools() -> Vec<Tool> {
                         r#type: ParameterType::Number,
                         description: "Optional byte offset to start reading from (default 0)"
                             .into(),
+                        required: true,
                     },
                 ),
                 (
@@ -298,6 +326,7 @@ pub(crate) fn tools() -> Vec<Tool> {
                     ParameterDescription {
                         r#type: ParameterType::Number,
                         description: "Number of bytes to read (required)".into(),
+                        required: true,
                     },
                 ),
             ]),
@@ -318,6 +347,7 @@ pub(crate) fn tools() -> Vec<Tool> {
                     ParameterDescription {
                         r#type: ParameterType::String,
                         description: "Literal substring to find".into(),
+                        required: true,
                     },
                 ),
                 (
@@ -325,6 +355,7 @@ pub(crate) fn tools() -> Vec<Tool> {
                     ParameterDescription {
                         r#type: ParameterType::String,
                         description: "Optional file name; omit to search all files".into(),
+                        required: true,
                     },
                 ),
                 (
@@ -333,6 +364,7 @@ pub(crate) fn tools() -> Vec<Tool> {
                         r#type: ParameterType::Number,
                         description: "Optional number of lines before and after each match (default 0, max 100)"
                             .into(),
+                        required: true,
                     },
                 ),
                 (
@@ -340,6 +372,7 @@ pub(crate) fn tools() -> Vec<Tool> {
                     ParameterDescription {
                         r#type: ParameterType::Boolean,
                         description: "Match without regard to case (default false)".into(),
+                        required: true,
                     },
                 ),
                 (
@@ -348,6 +381,7 @@ pub(crate) fn tools() -> Vec<Tool> {
                         r#type: ParameterType::Number,
                         description: "Optional maximum number of matching lines to report (default 200)"
                             .into(),
+                        required: true,
                     },
                 ),
             ]),
@@ -367,6 +401,7 @@ pub(crate) fn tools() -> Vec<Tool> {
                     ParameterDescription {
                         r#type: ParameterType::String,
                         description: "File name".into(),
+                        required: true,
                     },
                 ),
                 (
@@ -374,6 +409,7 @@ pub(crate) fn tools() -> Vec<Tool> {
                     ParameterDescription {
                         r#type: ParameterType::Number,
                         description: "First line to print (1-based, default 1)".into(),
+                        required: true,
                     },
                 ),
                 (
@@ -381,6 +417,7 @@ pub(crate) fn tools() -> Vec<Tool> {
                     ParameterDescription {
                         r#type: ParameterType::Number,
                         description: "Last line to print (inclusive, default: end of file)".into(),
+                        required: true,
                     },
                 ),
                 (
@@ -389,6 +426,7 @@ pub(crate) fn tools() -> Vec<Tool> {
                         r#type: ParameterType::Boolean,
                         description: "Prefix each line with its 1-based line number (default true)"
                             .into(),
+                        required: true,
                     },
                 ),
             ]),
@@ -415,6 +453,7 @@ pub(crate) fn tools() -> Vec<Tool> {
                     ParameterDescription {
                         r#type: ParameterType::String,
                         description: "File name".into(),
+                        required: true,
                     },
                 ),
                 (
@@ -422,6 +461,7 @@ pub(crate) fn tools() -> Vec<Tool> {
                     ParameterDescription {
                         r#type: ParameterType::String,
                         description: "Complete new file content".into(),
+                        required: true,
                     },
                 ),
             ]),
@@ -439,6 +479,7 @@ pub(crate) fn tools() -> Vec<Tool> {
                     ParameterDescription {
                         r#type: ParameterType::String,
                         description: "File name".into(),
+                        required: true,
                     },
                 ),
                 (
@@ -446,6 +487,7 @@ pub(crate) fn tools() -> Vec<Tool> {
                     ParameterDescription {
                         r#type: ParameterType::Number,
                         description: "First line to replace (1-based)".into(),
+                        required: true,
                     },
                 ),
                 (
@@ -453,6 +495,7 @@ pub(crate) fn tools() -> Vec<Tool> {
                     ParameterDescription {
                         r#type: ParameterType::Number,
                         description: "Last line to replace (inclusive)".into(),
+                        required: true,
                     },
                 ),
                 (
@@ -460,6 +503,7 @@ pub(crate) fn tools() -> Vec<Tool> {
                     ParameterDescription {
                         r#type: ParameterType::String,
                         description: "Replacement text; may contain newlines".into(),
+                        required: true,
                     },
                 ),
             ]),
@@ -477,6 +521,7 @@ pub(crate) fn tools() -> Vec<Tool> {
                     ParameterDescription {
                         r#type: ParameterType::String,
                         description: "File name".into(),
+                        required: true,
                     },
                 ),
                 (
@@ -484,6 +529,7 @@ pub(crate) fn tools() -> Vec<Tool> {
                     ParameterDescription {
                         r#type: ParameterType::String,
                         description: "Literal text to find".into(),
+                        required: true,
                     },
                 ),
                 (
@@ -491,6 +537,7 @@ pub(crate) fn tools() -> Vec<Tool> {
                     ParameterDescription {
                         r#type: ParameterType::String,
                         description: "Replacement text (may be empty)".into(),
+                        required: true,
                     },
                 ),
             ]),
@@ -503,6 +550,7 @@ pub(crate) fn tools() -> Vec<Tool> {
                 ParameterDescription {
                     r#type: ParameterType::String,
                     description: "File name".into(),
+                    required: true,
                 },
             )]),
         },
@@ -537,6 +585,7 @@ pub(crate) fn tools() -> Vec<Tool> {
                     ParameterDescription {
                         r#type: ParameterType::String,
                         description: "Virtual file name containing JavaScript source".into(),
+                        required: true,
                     },
                 ),
                 (
@@ -545,6 +594,7 @@ pub(crate) fn tools() -> Vec<Tool> {
                         r#type: ParameterType::Boolean,
                         description: "Run asynchronously and deliver the result as a message"
                             .into(),
+                        required: true,
                     },
                 ),
             ]),
@@ -567,6 +617,7 @@ pub(crate) fn tools() -> Vec<Tool> {
                     ParameterDescription {
                         r#type: ParameterType::String,
                         description: "JavaScript source code to execute".into(),
+                        required: true,
                     },
                 ),
                 (
@@ -575,6 +626,7 @@ pub(crate) fn tools() -> Vec<Tool> {
                         r#type: ParameterType::Boolean,
                         description: "Run asynchronously and deliver the result as a message"
                             .into(),
+                        required: true,
                     },
                 ),
             ]),
@@ -594,6 +646,7 @@ pub(crate) fn tools() -> Vec<Tool> {
                     description: "Optional single identifier to drop; omit or use an empty \
                                   string to reset the whole context"
                         .into(),
+                    required: true,
                 },
             )]),
         },
@@ -610,6 +663,7 @@ pub(crate) fn tools() -> Vec<Tool> {
                     ParameterDescription {
                         r#type: ParameterType::String,
                         description: "Exact target agent title, for example `LLM Agent 2`".into(),
+                        required: true,
                     },
                 ),
                 (
@@ -617,6 +671,7 @@ pub(crate) fn tools() -> Vec<Tool> {
                     ParameterDescription {
                         r#type: ParameterType::String,
                         description: "Message to send to the target agent".into(),
+                        required: true,
                     },
                 ),
             ]),
@@ -641,6 +696,7 @@ pub(crate) fn tools() -> Vec<Tool> {
                     ParameterDescription {
                         r#type: ParameterType::String,
                         description: "Exact agent title, or this agent's own name".into(),
+                        required: true,
                     },
                 ),
                 (
@@ -651,6 +707,7 @@ pub(crate) fn tools() -> Vec<Tool> {
                                       count back from the end (-1 is the newest message); omit \
                                       to start at the most recent messages."
                             .into(),
+                        required: true,
                     },
                 ),
                 (
@@ -658,6 +715,7 @@ pub(crate) fn tools() -> Vec<Tool> {
                     ParameterDescription {
                         r#type: ParameterType::Number,
                         description: "Optional number of messages to return (default 20)".into(),
+                        required: true,
                     },
                 ),
             ]),
@@ -675,6 +733,7 @@ pub(crate) fn tools() -> Vec<Tool> {
                     ParameterDescription {
                         r#type: ParameterType::String,
                         description: "Exact agent title, or this agent's own name".into(),
+                        required: true,
                     },
                 ),
                 (
@@ -682,6 +741,7 @@ pub(crate) fn tools() -> Vec<Tool> {
                     ParameterDescription {
                         r#type: ParameterType::Number,
                         description: "Message index from get_agent_history".into(),
+                        required: true,
                     },
                 ),
             ]),
@@ -700,6 +760,7 @@ pub(crate) fn tools() -> Vec<Tool> {
                     ParameterDescription {
                         r#type: ParameterType::String,
                         description: "Optional unique agent title, for example `Researcher`".into(),
+                        required: true,
                     },
                 ),
                 (
@@ -707,6 +768,7 @@ pub(crate) fn tools() -> Vec<Tool> {
                     ParameterDescription {
                         r#type: ParameterType::String,
                         description: "Optional initial task for the new agent".into(),
+                        required: true,
                     },
                 ),
             ]),
@@ -723,6 +785,7 @@ pub(crate) fn tools() -> Vec<Tool> {
                 ParameterDescription {
                     r#type: ParameterType::String,
                     description: "New unique name for this agent".into(),
+                    required: true,
                 },
             )]),
         },
@@ -738,404 +801,232 @@ pub(crate) fn tools() -> Vec<Tool> {
     ]
 }
 
-/// Execute one non-JavaScript tool.
+/// Dispatch one tool call by name.
 ///
-/// Returns `(message, is_error)`. JavaScript tools are rejected here so that a
-/// JS `execute` call can never recursively start another JS evaluation.
-#[allow(clippy::too_many_arguments)]
+/// Returns `(message, is_error)`. Honours `DisabledTool`, reports unknown
+/// names, and routes to the execution kind registered for the tool.
 pub(crate) fn execute_tool(
+    world: &mut ToolWorld<'_, '_>,
     name: &str,
     arguments: &Value,
     source_entity: Entity,
     source_agent: &str,
-    index: &mut AgentIndex,
-    agents: &Query<&Agent>,
-    layout: &mut AgentLayout,
-    fs: &mut VirtualFs,
-    config: &AppConfig,
-    commands: &mut Commands,
-    send_agent_message: &mut MessageWriter<SendAgentMessage>,
-    remove_agent: &mut MessageWriter<RemoveAgentRequest>,
-    rename_agent: &mut MessageWriter<RenameAgentRequest>,
 ) -> (String, bool) {
-    match name {
-        "get_weather" => match arguments.get("city").and_then(Value::as_str) {
-            Some(city) => (format!("{city}: 30 degrees Celsius"), false),
-            None => ("missing required string parameter `city`".to_owned(), true),
-        },
-        "fs_read" => match arguments.get("path").and_then(Value::as_str) {
-            Some(path) => match (
-                optional_u64(arguments, "offset"),
-                required_u64(arguments, "limit"),
-            ) {
-                (Ok(offset), Ok(limit)) => match fs.read_range(path, offset, Some(limit)) {
-                    Ok(content) => (content, false),
-                    Err(err) => (err, true),
-                },
-                (Err(err), _) | (_, Err(err)) => (err, true),
-            },
-            None => ("missing required string parameter `path`".to_owned(), true),
-        },
-        "fs_grep" => {
-            let Some(pattern) = arguments.get("pattern").and_then(Value::as_str) else {
-                return (
-                    "missing required string parameter `pattern`".to_owned(),
-                    true,
-                );
-            };
-            let path = arguments
-                .get("path")
-                .and_then(Value::as_str)
-                .filter(|path| !path.is_empty());
-            let context = match optional_u64(arguments, "context") {
-                Ok(context) => context.unwrap_or(0).min(MAX_GREP_CONTEXT) as usize,
-                Err(err) => return (err, true),
-            };
-            let max_matches = match optional_u64(arguments, "max_matches") {
-                Ok(max_matches) => max_matches
-                    .unwrap_or(DEFAULT_GREP_MATCHES)
-                    .min(MAX_GREP_MATCHES) as usize,
-                Err(err) => return (err, true),
-            };
-            match fs.grep(
-                pattern,
-                path,
-                context,
-                bool_option(arguments, "ignore_case", false),
-                max_matches,
-            ) {
-                Ok(output) => (output, false),
-                Err(err) => (err, true),
-            }
-        }
-        "fs_sed" => match arguments.get("path").and_then(Value::as_str) {
-            Some(path) => {
-                let start = match optional_u64(arguments, "start_line") {
-                    Ok(start) => start,
-                    Err(err) => return (err, true),
-                };
-                let end = match optional_u64(arguments, "end_line") {
-                    Ok(end) => end,
-                    Err(err) => return (err, true),
-                };
-                match fs.line_range(
-                    path,
-                    start,
-                    end,
-                    bool_option(arguments, "line_numbers", true),
-                ) {
-                    Ok(output) => (output, false),
-                    Err(err) => (err, true),
-                }
-            }
-            None => ("missing required string parameter `path`".to_owned(), true),
-        },
-        "fs_ls" => (fs.list(), false),
-        "fs_write" => match (
-            arguments.get("path").and_then(Value::as_str),
-            arguments.get("content").and_then(Value::as_str),
-        ) {
-            (Some(path), Some(content)) => match fs.write(path, content.to_owned()) {
-                Ok(message) => (message, false),
-                Err(err) => (err, true),
-            },
-            _ => (
-                "missing required string parameters `path` and `content`".to_owned(),
-                true,
-            ),
-        },
-        "fs_edit_lines" => match (
-            arguments.get("path").and_then(Value::as_str),
-            arguments.get("start_line").and_then(Value::as_u64),
-            arguments.get("end_line").and_then(Value::as_u64),
-            arguments.get("content").and_then(Value::as_str),
-        ) {
-            (Some(path), Some(start), Some(end), Some(content)) => {
-                match fs.edit_lines(path, start, end, content.to_owned()) {
-                    Ok(message) => (message, false),
-                    Err(err) => (err, true),
-                }
-            }
-            _ => (
-                "missing required parameters `path`, `start_line`, `end_line`, `content`"
-                    .to_owned(),
-                true,
-            ),
-        },
-        "fs_edit_pattern" => match (
-            arguments.get("path").and_then(Value::as_str),
-            arguments.get("pattern").and_then(Value::as_str),
-            arguments.get("replacement").and_then(Value::as_str),
-        ) {
-            (Some(path), Some(pattern), Some(replacement)) => {
-                match fs.edit_pattern(path, pattern, replacement) {
-                    Ok(message) => (message, false),
-                    Err(err) => (err, true),
-                }
-            }
-            _ => (
-                "missing required string parameters `path`, `pattern`, `replacement`".to_owned(),
-                true,
-            ),
-        },
-        "fs_delete" => match arguments.get("path").and_then(Value::as_str) {
-            Some(path) => match fs.delete(path) {
-                Ok(message) => (message, false),
-                Err(err) => (err, true),
-            },
-            None => ("missing required string parameter `path`".to_owned(), true),
-        },
-        // Disabled together with the tool definition above: arbitrary file
-        // reads leak secrets such as tokens from /proc/self/cmdline.
-        // "read_file" => match arguments.get("file_path").and_then(Value::as_str) {
-        //     Some(path) => match fs::read_to_string(path) {
-        //         Ok(contents) => (contents, false),
-        //         Err(err) => (err.to_string(), true),
-        //     },
-        //     None => (
-        //         "missing required string parameter `file_path`".to_owned(),
-        //         true,
-        //     ),
-        // },
-        "list_agents" => {
-            let mut names = index.by_name.keys().cloned().collect::<Vec<_>>();
-            names.sort();
-            let available = names
-                .into_iter()
-                .map(|name| {
-                    if name == source_agent {
-                        format!("{name} (you)")
-                    } else {
-                        name
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            (format!("Available agents: {available}"), false)
-        }
-        "get_agent_history" => {
-            let Some(target_name) = arguments.get("agent").and_then(Value::as_str) else {
-                return ("missing required string parameter `agent`".to_owned(), true);
-            };
-            let target = match history_agent(target_name, index, agents) {
-                Ok(target) => target,
-                Err(err) => return (err, true),
-            };
-            let position = match optional_i64(arguments, "position") {
-                Ok(position) => position,
-                Err(err) => return (err, true),
-            };
-            let amount = match optional_u64(arguments, "amount") {
-                Ok(amount) => amount,
-                Err(err) => return (err, true),
-            };
-
-            let history = target.history();
-            let (start, end) = history_window(history.len(), position, amount);
-            let items = history[start..end]
-                .iter()
-                .enumerate()
-                .map(|(offset, entry)| {
-                    serde_json::json!({
-                        "type": entry_type(entry),
-                        "sender": entry_sender(entry, target.name()),
-                        "message_index": start + offset,
-                    })
-                })
-                .collect::<Vec<_>>();
-
-            match serde_json::to_string_pretty(&items) {
-                Ok(json) => (json, false),
-                Err(err) => (format!("could not serialize history: {err}"), true),
-            }
-        }
-        "get_agent_message" => {
-            let Some(target_name) = arguments.get("agent").and_then(Value::as_str) else {
-                return ("missing required string parameter `agent`".to_owned(), true);
-            };
-            let target = match history_agent(target_name, index, agents) {
-                Ok(target) => target,
-                Err(err) => return (err, true),
-            };
-            let Some(message_index) = arguments.get("index").and_then(Value::as_u64) else {
-                return (
-                    "missing required non-negative integer parameter `index`".to_owned(),
-                    true,
-                );
-            };
-
-            let history = target.history();
-            let Some(entry) = history.get(message_index as usize) else {
-                return (
-                    format!(
-                        "index {message_index} is out of range; `{target_name}` has {} messages (0..{})",
-                        history.len(),
-                        history.len().saturating_sub(1)
-                    ),
-                    true,
-                );
-            };
-
-            match serde_json::to_string_pretty(entry) {
-                Ok(json) => (json, false),
-                Err(err) => (format!("could not serialize message: {err}"), true),
-            }
-        }
-        "send_message_to_agent" => {
-            let target_name = arguments.get("agent").and_then(Value::as_str);
-            let message = arguments.get("message").and_then(Value::as_str);
-            match (target_name, message) {
-                (Some(target_name), Some(_)) if target_name == source_agent => {
-                    ("Cannot send a message to the same agent.".to_owned(), true)
-                }
-                (Some(target_name), Some(message)) => {
-                    if let Some(target) = index.by_name.get(target_name) {
-                        send_agent_message.write(SendAgentMessage {
-                            target: *target,
-                            from: source_agent.to_owned(),
-                            message: message.to_owned(),
-                            verbatim: false,
-                        });
-                        (
-                            format!(
-                                "Queued message for `{target_name}`. Continue your task or end turn to await reply."
-                            ),
-                            false,
-                        )
-                    } else {
-                        let mut names = index.by_name.keys().cloned().collect::<Vec<_>>();
-                        names.sort();
-                        (
-                            format!(
-                                "No agent named `{target_name}`. Available agents: {}",
-                                names.join(", ")
-                            ),
-                            true,
-                        )
-                    }
-                }
-                _ => (
-                    "missing required string parameters `agent` and `message`".to_owned(),
-                    true,
-                ),
-            }
-        }
-        "rename_self" => {
-            let Some(new_name) = arguments
-                .get("name")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|name| !name.is_empty())
-            else {
-                return (
-                    "missing required non-empty string parameter `name`".to_owned(),
-                    true,
-                );
-            };
-
-            if new_name == source_agent {
-                return ("Name unchanged.".to_owned(), false);
-            }
-            if index.by_name.contains_key(new_name) {
-                return (format!("An agent named `{new_name}` already exists."), true);
-            }
-
-            // Reserve the name immediately so two renames in one tool round
-            // cannot both claim it.
-            index.by_name.remove(source_agent);
-            index.by_name.insert(new_name.to_owned(), source_entity);
-            rename_agent.write(RenameAgentRequest {
-                agent: source_entity,
-                name: new_name.to_owned(),
-            });
-            (format!("Renamed this agent to `{new_name}`."), false)
-        }
-        "end_agent" => {
-            remove_agent.write(RemoveAgentRequest {
-                agent: source_entity,
-            });
-            ("Ending this agent...".to_owned(), false)
-        }
-        "spawn_agent" => {
-            if index.by_name.len() >= MAX_AGENTS {
-                return (
-                    format!("Agent limit reached ({MAX_AGENTS}); remove an agent first."),
-                    true,
-                );
-            }
-
-            let requested_name = arguments
-                .get("name")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|name| !name.is_empty());
-            let prompt = arguments
-                .get("prompt")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|prompt| !prompt.is_empty());
-
-            if let Some(name) = requested_name
-                && index.by_name.contains_key(name)
-            {
-                return (format!("An agent named `{name}` already exists."), true);
-            }
-
-            let mut number = layout.next_number;
-            let name = if let Some(name) = requested_name {
-                name.to_owned()
-            } else {
-                let mut candidate = format!("LLM Agent {number}");
-                while index.by_name.contains_key(&candidate) {
-                    number += 1;
-                    candidate = format!("LLM Agent {number}");
-                }
-                candidate
-            };
-            layout.next_number = number + 1;
-
-            let agent = create_agent(commands, layout, config, name.clone(), number as i32);
-            index.by_name.insert(name.clone(), agent);
-
-            if let Some(prompt) = prompt {
-                // Delivered verbatim (no cross-agent envelope), so the new
-                // agent's first user message starts exactly with this text.
-                send_agent_message.write(SendAgentMessage {
-                    target: agent,
-                    from: source_agent.to_owned(),
-                    message: initial_task_message(source_agent, prompt),
-                    verbatim: true,
-                });
-                (
-                    format!("Spawned `{name}` in a new tab with its initial task."),
-                    false,
-                )
-            } else {
-                (format!("Spawned `{name}` in a new tab."), false)
-            }
-        }
-        other if is_js_tool(other) => (
-            format!(
-                "tool `{other}` cannot be called from JavaScript; recursive JavaScript execution is disabled"
-            ),
+    let Some(tool) = registry::find(world, name) else {
+        return (format!("Unknown tool: {name}"), true);
+    };
+    if let Some(reason) = tool.disabled {
+        return (format!("Tool `{name}` is disabled: {reason}"), true);
+    }
+    let call = CallContext {
+        source_entity,
+        source_agent,
+    };
+    match tool.execution {
+        Execution::Inline(handler) => handler(world, arguments, &call),
+        Execution::Interpreter => (
+            format!("tool `{name}` must run in the JavaScript interpreter"),
             true,
         ),
-        other => (format!("Unknown tool: {other}"), true),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::{AgentIndex, AgentLayout};
+    use crate::config::{AppConfig, Provider};
+    use crate::messages::{RemoveAgentRequest, RenameAgentRequest, SendAgentMessage};
+    use crate::tools::catalog::static_tools;
+    use crate::virtual_fs::VirtualFs;
+    use bevy::prelude::{App, Entity, PreStartup, ResMut, Resource, Update};
+    use serde_json::Value;
 
     #[test]
-    fn javascript_tools_route_to_the_interpreter() {
+    fn javascript_tools_are_registered_as_interpreter_tools() {
+        let tools = static_tools();
         for name in JS_TOOLS {
-            assert_eq!(classify_tool_call(name), ToolTarget::Interpreter);
+            let entry = tools
+                .iter()
+                .find(|entry| entry.definition.name == *name)
+                .expect("JavaScript tool should be registered");
+            assert!(
+                matches!(entry.execution, Execution::Interpreter),
+                "{name} should be an interpreter tool"
+            );
         }
-        assert_eq!(classify_tool_call("fs_read"), ToolTarget::Agent);
-        assert_eq!(classify_tool_call("spawn_agent"), ToolTarget::Agent);
-        assert_eq!(classify_tool_call("end_agent"), ToolTarget::Agent);
+        for name in ["fs_read", "spawn_agent", "end_agent"] {
+            let entry = tools
+                .iter()
+                .find(|entry| entry.definition.name == name)
+                .expect("tool should be registered");
+            assert!(
+                !matches!(entry.execution, Execution::Interpreter),
+                "{name} should not be an interpreter tool"
+            );
+        }
+    }
+
+    #[test]
+    fn every_definition_is_registered_with_unique_names() {
+        let definitions = definitions();
+        let tools = static_tools();
+        assert_eq!(tools.len(), definitions.len());
+
+        let mut names = definitions
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        let unique = names.len();
+        names.dedup();
+        assert_eq!(names.len(), unique, "duplicate tool names: {names:?}");
+
+        for definition in &definitions {
+            assert!(
+                tools
+                    .iter()
+                    .any(|entry| entry.definition.name == definition.name),
+                "`{}` is defined but not registered",
+                definition.name
+            );
+        }
+    }
+
+    #[test]
+    fn advertisement_policy_matches_the_trim() {
+        let tools = static_tools();
+        let advertised = |name: &str| {
+            tools
+                .iter()
+                .find(|entry| entry.definition.name == name)
+                .unwrap_or_else(|| panic!("`{name}` is not registered"))
+                .advertised
+        };
+
+        for name in [
+            "search_tools",
+            "fs_read",
+            "fs_write",
+            "fs_edit_pattern",
+            "fs_edit_lines",
+            "fs_ls",
+            "fs_grep",
+            "fs_sed",
+            "eval_javascript",
+            "run_javascript",
+            "send_message_to_agent",
+            "spawn_agent",
+            "rename_self",
+        ] {
+            assert!(advertised(name), "`{name}` should be advertised");
+        }
+        for name in [
+            "fs_delete",
+            "eval_javascript_reset_context",
+            "list_agents",
+            "get_agent_history",
+            "get_agent_message",
+            "end_agent",
+        ] {
+            assert!(!advertised(name), "`{name}` should be hidden");
+        }
+    }
+
+    #[test]
+    fn search_tools_has_only_optional_parameters() {
+        let tools = definitions();
+        let search = tools
+            .iter()
+            .find(|tool| tool.name == "search_tools")
+            .expect("search_tools should exist");
+        for (name, parameter) in &search.parameters {
+            assert!(!parameter.required, "`{name}` should be optional");
+        }
+    }
+
+    #[test]
+    fn every_definition_has_a_handler() {
+        for definition in definitions() {
+            assert!(
+                crate::tools::catalog::is_implemented(&definition.name),
+                "`{}` is defined but no module handles it",
+                definition.name
+            );
+        }
+    }
+
+    #[derive(Resource, Default)]
+    struct SmokeOutput(String);
+
+    fn smoke_dispatch(mut world: ToolWorld, mut out: ResMut<SmokeOutput>) {
+        let (inline_message, inline_error) = execute_tool(
+            &mut world,
+            "search_tools",
+            &serde_json::json!({ "filter": "^fs_read$" }),
+            Entity::PLACEHOLDER,
+            "Smoke",
+        );
+        let (legacy_message, legacy_error) = execute_tool(
+            &mut world,
+            "fs_ls",
+            &Value::Null,
+            Entity::PLACEHOLDER,
+            "Smoke",
+        );
+        let (unknown_message, unknown_error) = execute_tool(
+            &mut world,
+            "no_such_tool",
+            &Value::Null,
+            Entity::PLACEHOLDER,
+            "Smoke",
+        );
+        let (agents_message, agents_error) = execute_tool(
+            &mut world,
+            "list_agents",
+            &Value::Null,
+            Entity::PLACEHOLDER,
+            "Smoke",
+        );
+        out.0 = format!(
+            "{inline_error}|{inline_message}\n{legacy_error}|{legacy_message}\n{unknown_error}|{unknown_message}\n{agents_error}|{agents_message}"
+        );
+    }
+
+    #[test]
+    fn registered_tools_dispatch_through_the_registry() {
+        let mut app = App::new();
+        app.insert_resource(AgentIndex::default())
+            .insert_resource(AgentLayout {
+                tabs: Entity::PLACEHOLDER,
+                panels: Entity::PLACEHOLDER,
+                next_number: 1,
+            })
+            .insert_resource(VirtualFs::default())
+            .insert_resource(AppConfig {
+                provider: Provider::Responses,
+                model_name: "test".into(),
+                endpoint: "http://localhost".into(),
+                token: String::new(),
+                session_id: "ses_test".into(),
+            })
+            .init_resource::<SmokeOutput>()
+            .add_message::<SendAgentMessage>()
+            .add_message::<RemoveAgentRequest>()
+            .add_message::<RenameAgentRequest>()
+            .add_systems(PreStartup, register_static_tools)
+            .add_systems(Update, smoke_dispatch);
+        app.update();
+
+        let output = &app.world().resource::<SmokeOutput>().0;
+        let lines = output.lines().collect::<Vec<_>>();
+        assert!(
+            lines[0].starts_with("false|fs_read("),
+            "search_tools returned {lines:?}"
+        );
+        assert_eq!(lines[1], "false|Virtual filesystem is empty.");
+        assert_eq!(lines[2], "true|Unknown tool: no_such_tool");
+        assert_eq!(lines[3], "false|Available agents: ");
     }
 
     #[test]
@@ -1148,7 +1039,7 @@ mod tests {
 
     #[test]
     fn fs_read_exposes_offset_and_limit() {
-        let tools = tools();
+        let tools = definitions();
         let fs_read = tools
             .iter()
             .find(|tool| tool.name == "fs_read")
@@ -1175,7 +1066,7 @@ mod tests {
 
     #[test]
     fn javascript_tools_expose_a_background_flag() {
-        let tools = tools();
+        let tools = definitions();
         for name in ["run_javascript", "eval_javascript"] {
             let tool = tools
                 .iter()
@@ -1190,7 +1081,7 @@ mod tests {
 
     #[test]
     fn grep_and_sed_tools_are_advertised() {
-        let tools = tools();
+        let tools = definitions();
         let grep = tools
             .iter()
             .find(|tool| tool.name == "fs_grep")
@@ -1212,9 +1103,6 @@ mod tests {
                 "fs_sed is missing `{parameter}`"
             );
         }
-
-        assert_eq!(classify_tool_call("fs_grep"), ToolTarget::Agent);
-        assert_eq!(classify_tool_call("fs_sed"), ToolTarget::Agent);
     }
 
     #[test]
@@ -1270,7 +1158,7 @@ mod rename_tool_tests {
 
     #[test]
     fn rename_self_tool_exists() {
-        let tools = tools();
+        let tools = definitions();
         let tool = tools
             .iter()
             .find(|tool| tool.name == "rename_self")
@@ -1319,7 +1207,7 @@ mod history_tool_tests {
 
     #[test]
     fn history_tools_are_advertised() {
-        let tools = tools();
+        let tools = definitions();
         let history = tools
             .iter()
             .find(|tool| tool.name == "get_agent_history")

@@ -46,6 +46,7 @@ mod tests {
             ParameterDescription {
                 r#type: ParameterType::String,
                 description: "Ticker symbol".to_owned(),
+                required: true,
             },
         );
         Tool {

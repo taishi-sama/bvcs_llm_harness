@@ -20,9 +20,14 @@ const fn parameter_type_str(t: &ParameterType) -> &'static str {
 /// Builds the `properties` + sorted `required` parts of a JSON Schema object
 /// from a tool's parameter map. Returns the ready-to-embed schema value.
 ///
-/// Every declared parameter is listed as required and unknown extra arguments
-/// are rejected (`additionalProperties: false`) — matching what OpenAI's
-/// `strict` mode expects.
+/// Parameters marked `required` are listed in a sorted `required` array; when
+/// none are required the key is omitted entirely (JSON Schema allows its
+/// absence). Unknown extra arguments are always rejected
+/// (`additionalProperties: false`).
+///
+/// Note that OpenAI's `strict` function-calling mode requires every property to
+/// appear in `required`, so optional parameters are only safe with non-strict
+/// or compatible endpoints.
 pub fn parameters_schema(tool: &Tool) -> Value {
     // `serde_json` preserves insertion order, so iterate in a stable order.
     // `Tool.parameters` is a `HashMap`; leaving its iteration order in the
@@ -43,12 +48,20 @@ pub fn parameters_schema(tool: &Tool) -> Value {
         );
     }
 
-    serde_json::json!({
-        "type": "object",
-        "properties": properties,
-        "required": names,
-        "additionalProperties": false,
-    })
+    let required: Vec<&str> = names
+        .iter()
+        .copied()
+        .filter(|name| tool.parameters[*name].required)
+        .collect();
+
+    let mut schema = Map::new();
+    schema.insert("type".to_owned(), Value::String("object".to_owned()));
+    schema.insert("properties".to_owned(), Value::Object(properties));
+    if !required.is_empty() {
+        schema.insert("required".to_owned(), serde_json::json!(required));
+    }
+    schema.insert("additionalProperties".to_owned(), Value::Bool(false));
+    Value::Object(schema)
 }
 
 /// Canonical MIME string for image blocks (`image/png`, `image/jpeg`).
@@ -123,6 +136,7 @@ mod tests {
             ParameterDescription {
                 r#type: ParameterType::String,
                 description: "City name".to_owned(),
+                required: true,
             },
         );
         parameters.insert(
@@ -130,6 +144,7 @@ mod tests {
             ParameterDescription {
                 r#type: ParameterType::Number,
                 description: "Forecast length".to_owned(),
+                required: true,
             },
         );
         Tool {
@@ -150,6 +165,63 @@ mod tests {
     }
 
     #[test]
+    fn schema_all_required_matches_previous_output() {
+        let schema = parameters_schema(&sample_tool());
+        assert_eq!(
+            schema,
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "city": { "type": "string", "description": "City name" },
+                    "days": { "type": "number", "description": "Forecast length" },
+                },
+                "required": ["city", "days"],
+                "additionalProperties": false,
+            })
+        );
+        assert_eq!(schema["required"], serde_json::json!(["city", "days"]));
+        assert_eq!(schema["additionalProperties"], false);
+    }
+
+    #[test]
+    fn schema_optional_parameters_are_not_required() {
+        let mut tool = sample_tool();
+        tool.parameters.get_mut("days").unwrap().required = false;
+
+        let schema = parameters_schema(&tool);
+        assert_eq!(schema["required"], serde_json::json!(["city"]));
+        assert_eq!(schema["properties"]["city"]["type"], "string");
+        assert_eq!(schema["properties"]["days"]["type"], "number");
+        assert!(schema["properties"].get("days").is_some());
+    }
+
+    #[test]
+    fn schema_all_optional_omits_required() {
+        let mut tool = sample_tool();
+        for parameter in tool.parameters.values_mut() {
+            parameter.required = false;
+        }
+
+        let schema = parameters_schema(&tool);
+        assert!(schema.get("required").is_none());
+        assert_eq!(schema["properties"].as_object().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn parameter_description_missing_required_defaults_to_true() {
+        let parameter = ParameterDescription {
+            r#type: ParameterType::String,
+            description: "City name".to_owned(),
+            required: true,
+        };
+        let mut value = serde_json::to_value(&parameter).unwrap();
+        value.as_object_mut().unwrap().remove("required");
+
+        let decoded: ParameterDescription = serde_json::from_value(value).unwrap();
+        assert!(decoded.required);
+    }
+
+    #[test]
     fn schema_property_order_is_stable() {
         // `Tool.parameters` is a `HashMap`; the serialized schema must not
         // inherit its randomized iteration order or prompt caches break.
@@ -160,6 +232,7 @@ mod tests {
                 ParameterDescription {
                     r#type: ParameterType::String,
                     description: name.to_owned(),
+                    required: true,
                 },
             );
         }

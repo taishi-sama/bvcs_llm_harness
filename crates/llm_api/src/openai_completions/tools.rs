@@ -67,6 +67,7 @@ mod tests {
             ParameterDescription {
                 r#type: ParameterType::String,
                 description: "City name".to_owned(),
+                required: true,
             },
         );
         Tool {
@@ -105,7 +106,6 @@ mod tests {
             serde_json::json!({
                 "type": "object",
                 "properties": {},
-                "required": [],
                 "additionalProperties": false
             })
         );

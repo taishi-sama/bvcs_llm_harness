@@ -478,6 +478,7 @@ mod tests {
             crate::generic_tool::ParameterDescription {
                 r#type: crate::generic_tool::ParameterType::String,
                 description: "City name".to_owned(),
+                required: true,
             },
         );
         let cfg = ModelConfig {

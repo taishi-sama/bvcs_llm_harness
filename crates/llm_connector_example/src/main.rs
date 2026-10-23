@@ -200,6 +200,7 @@ fn tools() -> Vec<Tool> {
                     ParameterDescription {
                         r#type: ParameterType::String,
                         description: "City".into(),
+                        required: true,
                     },
                 );
                 hashmap
@@ -235,6 +236,7 @@ fn tools() -> Vec<Tool> {
                     ParameterDescription {
                         r#type: ParameterType::String,
                         description: "Blank-state prompt for agent".into(),
+                        required: true,
                     },
                 );
                 hashmap
@@ -254,6 +256,7 @@ fn tools() -> Vec<Tool> {
                     ParameterDescription {
                         r#type: ParameterType::String,
                         description: "JavaScript source code to execute".into(),
+                        required: true,
                     },
                 );
                 hashmap

@@ -32,14 +32,16 @@ use crate::{
     config::{AppConfig, Provider},
     js_runtime::{HostCommand, HostRequest, JsChannels, JsEvent, JsRuntimeHandle},
     messages::*,
-    tools::{ToolTarget, background_setting, classify_tool_call, execute_tool, interpreter_task},
+    tools::{
+        AdvertisedTools, Execution, ToolWorld, advertised_tools, background_setting, execute_tool,
+        find, interpreter_task,
+    },
     transcript::{
         AgentTab, AgentView, CollapsibleText, RetryAgentButton, TextCollapseConfig,
         begin_live_assistant, create_agent_tab, ensure_live_assistant, response_display_text,
         response_thinking_text, set_collapsible_text, set_display, set_text, stats_text,
     },
     transport::{request_body, stream_transport},
-    virtual_fs::VirtualFs,
 };
 
 #[cfg(test)]
@@ -277,10 +279,10 @@ impl Agent {
         rollback_pending_turn(&mut self.history)
     }
 
-    fn model_config(&self) -> ModelConfig {
+    fn model_config(&self, tools: Vec<llm_api::generic_tool::Tool>) -> ModelConfig {
         ModelConfig {
             kind: self.provider.kind(&self.model_name),
-            tools: crate::tools::tools(),
+            tools,
             max_tokens: Some(8192),
         }
     }
@@ -1028,6 +1030,7 @@ pub(crate) fn start_agent_turn(
     collapse: Res<TextCollapseConfig>,
     tokio_runtime: Res<TokioTasksRuntime>,
     app_config: Res<AppConfig>,
+    tools: AdvertisedTools,
     mut commands: Commands,
 ) {
     for request in requests.read() {
@@ -1040,7 +1043,7 @@ pub(crate) fn start_agent_turn(
 
         agent.retry_message = None;
         agent.previous_request_body = agent.last_request_body.take();
-        let config = agent.model_config();
+        let config = agent.model_config(advertised_tools(&tools));
         let body = match request_body(agent.provider, &agent.history, &config) {
             Ok(body) => body,
             Err(err) => {
@@ -1432,29 +1435,21 @@ pub(crate) fn handle_turn_finished(
 /// World tools run immediately. JavaScript tools become [`JsTask`]s on the
 /// owning context thread, so this system never blocks on a Boa heap. Results
 /// are collected by [`poll_js_events`] and committed by [`apply_tool_results`].
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_tool_calls(
     mut requests: MessageReader<RunToolCalls>,
-    agents: Query<&Agent>,
-    mut index: ResMut<AgentIndex>,
-    mut layout: ResMut<AgentLayout>,
-    mut fs: ResMut<VirtualFs>,
-    config: Res<AppConfig>,
-    mut send_agent_message: MessageWriter<SendAgentMessage>,
-    mut remove_agent: MessageWriter<RemoveAgentRequest>,
-    mut rename_agent: MessageWriter<RenameAgentRequest>,
+    mut world: ToolWorld,
     js_handles: Query<&JsRuntimeHandle>,
     mut rounds: ResMut<ToolRounds>,
     mut finished: MessageWriter<ToolRoundFinished>,
-    mut commands: Commands,
 ) {
     for request in requests.read() {
-        let Ok(agent) = agents.get(request.agent) else {
+        let Ok(agent) = world.agents.get(request.agent) else {
             continue;
         };
         if agent.current_turn != Some(request.turn_id) || request.tool_call.is_empty() {
             continue;
         }
+        let source_name = agent.name().to_owned();
 
         let round_id = rounds.next_round;
         rounds.next_round += 1;
@@ -1467,31 +1462,9 @@ pub(crate) fn execute_tool_calls(
             let arguments =
                 serde_json::from_str::<Value>(&call.toolcall_params).unwrap_or(Value::Null);
 
-            match classify_tool_call(&call.tool_name) {
-                ToolTarget::Agent => {
-                    let (result, is_error) = execute_tool(
-                        &call.tool_name,
-                        &arguments,
-                        request.agent,
-                        &agent.name,
-                        &mut index,
-                        &agents,
-                        &mut layout,
-                        &mut fs,
-                        &config,
-                        &mut commands,
-                        &mut send_agent_message,
-                        &mut remove_agent,
-                        &mut rename_agent,
-                    );
-                    results[call_index] = Some(ToolCallResult {
-                        result,
-                        is_error,
-                        tool_use_id: call.tool_use_id.clone(),
-                    });
-                    remaining -= 1;
-                }
-                ToolTarget::Interpreter => {
+            match find(&world, &call.tool_name).map(|tool| tool.execution) {
+                Some(Execution::Interpreter) => {
+                    // JavaScript tools run on the agent's own context thread.
                     let supports_background = matches!(
                         call.tool_name.as_str(),
                         "run_javascript" | "eval_javascript"
@@ -1504,8 +1477,8 @@ pub(crate) fn execute_tool_calls(
                     let immediate_background = background == Some(true);
                     let auto_background = supports_background && background != Some(false);
 
-                    let submitted =
-                        interpreter_task(&call.tool_name, &arguments, &fs).and_then(|task| {
+                    let submitted = interpreter_task(&call.tool_name, &arguments, &world.fs)
+                        .and_then(|task| {
                             js_handles
                                 .get(request.agent)
                                 .map_err(|_| {
@@ -1543,6 +1516,21 @@ pub(crate) fn execute_tool_calls(
                             remaining -= 1;
                         }
                     }
+                }
+                _ => {
+                    let (result, is_error) = execute_tool(
+                        &mut world,
+                        &call.tool_name,
+                        &arguments,
+                        request.agent,
+                        &source_name,
+                    );
+                    results[call_index] = Some(ToolCallResult {
+                        result,
+                        is_error,
+                        tool_use_id: call.tool_use_id.clone(),
+                    });
+                    remaining -= 1;
                 }
             }
         }
@@ -1685,16 +1673,8 @@ pub(crate) fn auto_background_long_js_tasks(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn poll_js_host_requests(
     channels: Res<JsChannels>,
-    mut fs: ResMut<VirtualFs>,
-    mut index: ResMut<AgentIndex>,
-    mut layout: ResMut<AgentLayout>,
-    config: Res<AppConfig>,
-    agents: Query<&Agent>,
+    mut world: ToolWorld,
     js_handles: Query<&JsRuntimeHandle>,
-    mut send_agent_message: MessageWriter<SendAgentMessage>,
-    mut remove_agent: MessageWriter<RemoveAgentRequest>,
-    mut rename_agent: MessageWriter<RenameAgentRequest>,
-    mut commands: Commands,
 ) {
     for request in channels.drain_host_requests() {
         let HostRequest {
@@ -1704,28 +1684,17 @@ pub(crate) fn poll_js_host_requests(
         } = request;
 
         let (result, is_error) = match command {
-            HostCommand::Tool { name, arguments } => match agents.get(agent_entity) {
-                Ok(agent) => execute_tool(
-                    &name,
-                    &arguments,
-                    agent_entity,
-                    &agent.name,
-                    &mut index,
-                    &agents,
-                    &mut layout,
-                    &mut fs,
-                    &config,
-                    &mut commands,
-                    &mut send_agent_message,
-                    &mut remove_agent,
-                    &mut rename_agent,
-                ),
+            HostCommand::Tool { name, arguments } => match world.agents.get(agent_entity) {
+                Ok(agent) => {
+                    let source_name = agent.name().to_owned();
+                    execute_tool(&mut world, &name, &arguments, agent_entity, &source_name)
+                }
                 Err(_) => (
                     format!("agent entity {agent_entity} no longer exists"),
                     true,
                 ),
             },
-            HostCommand::ReadFile { path } => match fs.read(&path) {
+            HostCommand::ReadFile { path } => match world.fs.read(&path) {
                 Ok(content) => (content, false),
                 Err(err) => (err, true),
             },

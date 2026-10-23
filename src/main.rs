@@ -55,6 +55,8 @@ mod shell;
 mod tools;
 mod transcript;
 mod transport;
+#[allow(dead_code, reason = "wired into VirtualFs during the .tools phase")]
+mod vfs_path;
 mod virtual_fs;
 
 use std::env;
@@ -137,6 +139,7 @@ fn main() {
         .add_message::<RemoveAgentRequest>()
         .add_message::<RenameAgentRequest>()
         .add_message::<TaskResult>()
+        .add_systems(PreStartup, tools::register_static_tools)
         .add_systems(Startup, (setup, log_glyph_cache_limit))
         .add_systems(Update, limit_glyph_cache)
         .add_systems(

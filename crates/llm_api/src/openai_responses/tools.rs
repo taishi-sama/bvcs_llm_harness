@@ -58,6 +58,7 @@ mod tests {
             ParameterDescription {
                 r#type: ParameterType::String,
                 description: "City name".to_owned(),
+                required: true,
             },
         );
         parameters.insert(
@@ -65,6 +66,7 @@ mod tests {
             ParameterDescription {
                 r#type: ParameterType::Number,
                 description: "Forecast length".to_owned(),
+                required: true,
             },
         );
         Tool {
