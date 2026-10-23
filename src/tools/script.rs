@@ -8,6 +8,7 @@
 
 use std::{
     collections::HashMap,
+    panic::AssertUnwindSafe,
     path::Path,
     sync::{
         Arc, Mutex,
@@ -274,6 +275,10 @@ impl ScriptRuntime {
         let request = SCRIPT_REQUEST_TAG | self.next_request.fetch_add(1, Ordering::Relaxed);
         let done = Arc::new(AtomicBool::new(false));
         let deadline_done = done.clone();
+        // Set when the deadline fires; blocked host calls notice and unwind.
+        let expired = Arc::new(AtomicBool::new(false));
+        let expired_worker = expired.clone();
+        let expired_watchdog = expired.clone();
         // Signals the watchdog that the worker finished; dropping it (panic or
         // return) also counts as finished.
         let (finished_tx, finished_rx) = mpsc::channel::<()>();
@@ -293,16 +298,21 @@ impl ScriptRuntime {
                 let dispatch = ScriptHost {
                     agent,
                     host: host_tx,
+                    expired: expired_worker,
                 };
-                let result = JsSession::new_tools(
-                    std::rc::Rc::new(dispatch),
-                    task.sources,
-                    task.depth,
-                    task.root,
-                )
-                .and_then(|mut session| {
-                    session.eval_module_call(&task.entry, &task.export, &task.arguments)
-                });
+                // A Boa panic must not strand the round or consume a slot.
+                let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                    JsSession::new_tools(
+                        std::rc::Rc::new(dispatch),
+                        task.sources,
+                        task.depth,
+                        task.root,
+                    )
+                    .and_then(|mut session| {
+                        session.eval_module_call(&task.entry, &task.export, &task.arguments)
+                    })
+                }))
+                .unwrap_or_else(|_| Err("script tool panicked".to_owned()));
                 if done
                     .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                     .is_ok()
@@ -330,14 +340,26 @@ impl ScriptRuntime {
         let deadline = thread::Builder::new()
             .name(format!("tool-script-deadline-{request:x}"))
             .spawn(move || {
-                // Sleeps only until the call finishes, so at most the number of
+                // Exits as soon as the call finishes, so at most the number of
                 // in-flight scripts (not the number of calls) have watchdogs.
-                if !matches!(
-                    finished_rx.recv_timeout(timeout),
-                    Err(RecvTimeoutError::Timeout)
-                ) {
-                    return;
+                match finished_rx.recv_timeout(timeout) {
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => {
+                        if done
+                            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_ok()
+                        {
+                            let _ = event_tx.send(ScriptEvent::Done {
+                                agent,
+                                request,
+                                result: Err("script tool stopped unexpectedly".to_owned()),
+                            });
+                        }
+                        return;
+                    }
+                    Ok(()) => return,
                 }
+                expired_watchdog.store(true, Ordering::SeqCst);
                 if done
                     .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                     .is_ok()
@@ -365,10 +387,14 @@ impl ScriptRuntime {
 struct ScriptHost {
     agent: Entity,
     host: Sender<ScriptHostRequest>,
+    expired: Arc<AtomicBool>,
 }
 
 impl HostDispatch for ScriptHost {
     fn call(&self, command: HostCommand) -> Result<String, String> {
+        if self.expired.load(Ordering::SeqCst) {
+            return Err("script tool timed out".to_owned());
+        }
         let (reply, wait) = mpsc::channel();
         self.host
             .send(ScriptHostRequest {
@@ -377,8 +403,20 @@ impl HostDispatch for ScriptHost {
                 reply,
             })
             .map_err(|_| "the harness stopped accepting tool calls".to_owned())?;
-        wait.recv()
-            .map_err(|_| "the harness stopped before answering the tool call".to_owned())?
+        // Poll the deadline so a timed-out worker cannot block here forever.
+        loop {
+            match wait.recv_timeout(Duration::from_millis(100)) {
+                Ok(result) => return result,
+                Err(RecvTimeoutError::Timeout) => {
+                    if self.expired.load(Ordering::SeqCst) {
+                        return Err("script tool timed out".to_owned());
+                    }
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err("the harness stopped before answering the tool call".to_owned());
+                }
+            }
+        }
     }
 }
 

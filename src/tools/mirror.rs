@@ -79,6 +79,7 @@ pub(crate) fn flush_tool_mirror(
 ) {
     if !vfs.tools().has_dirty() {
         status.pending = 0;
+        status.last_error = None;
         return;
     }
 

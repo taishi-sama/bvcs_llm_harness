@@ -21,6 +21,11 @@ pub(crate) const MAX_TOOL_DEPTH: u32 = 50;
 /// Nested calls allowed per root call (the model's own batch entries are roots).
 pub(crate) const MAX_CALLS_PER_ROOT: u32 = 2_000;
 
+struct Budget {
+    agent: Entity,
+    remaining: u32,
+}
+
 /// One in-flight tool round. Results are stored by call index so asynchronous
 /// completions cannot reorder the history entry.
 pub(crate) struct PendingToolRound {
@@ -88,9 +93,10 @@ pub(crate) fn parse_background_after(value: Option<f64>) -> Result<AutoBackgroun
     if seconds == 0.0 {
         return Ok(AutoBackground::Immediately);
     }
-    let duration = Duration::from_secs_f64(seconds);
-    let clamped = duration.clamp(Duration::from_millis(1), Duration::from_secs(24 * 60 * 60));
-    Ok(AutoBackground::After(clamped))
+    // Clamp before converting: `Duration::from_secs_f64` panics on values that
+    // overflow `Duration`, and this value comes from model-authored code.
+    let seconds = seconds.clamp(0.001, 24.0 * 60.0 * 60.0);
+    Ok(AutoBackground::After(Duration::from_secs_f64(seconds)))
 }
 
 /// `run_in_background` on the JavaScript tools is the boolean spelling of the
@@ -152,8 +158,8 @@ pub(crate) struct ToolRounds {
     detached: HashMap<u64, DetachedTask>,
     /// Calls made by scripts/tools through `execute`, keyed by request id.
     nested: HashMap<u64, NestedCall>,
-    /// Remaining nested-call budget per root call.
-    budgets: HashMap<u64, u32>,
+    /// Remaining nested-call budget per root call, tagged with its agent.
+    budgets: HashMap<u64, Budget>,
     pub(crate) next_round: u64,
     next_task_id: u64,
 }
@@ -194,7 +200,7 @@ impl ToolRounds {
         }
         self.pending
             .retain(|_, pending| self.active.contains_key(&pending.round_id));
-        self.budgets.clear();
+        self.budgets.retain(|_, budget| budget.agent != agent);
     }
 
     /// Drop everything belonging to an agent, including detached work.
@@ -261,23 +267,39 @@ impl ToolRounds {
     }
 
     /// Open the nested-call budget for one root call.
-    pub(crate) fn open_budget(&mut self, root: u64) {
-        self.budgets.insert(root, MAX_CALLS_PER_ROOT);
+    pub(crate) fn open_budget(&mut self, root: u64, agent: Entity) {
+        self.budgets.insert(
+            root,
+            Budget {
+                agent,
+                remaining: MAX_CALLS_PER_ROOT,
+            },
+        );
     }
 
     /// Spend one nested call. Returns false when the root's budget is gone.
     pub(crate) fn spend_budget(&mut self, root: u64) -> bool {
         match self.budgets.get_mut(&root) {
-            Some(remaining) if *remaining > 0 => {
-                *remaining -= 1;
+            Some(budget) if budget.remaining > 0 => {
+                budget.remaining -= 1;
                 true
             }
             _ => false,
         }
     }
 
-    pub(crate) fn close_budget(&mut self, root: u64) {
-        self.budgets.remove(&root);
+    /// Give one call back after a submission failed.
+    pub(crate) fn refund_budget(&mut self, root: u64) {
+        if let Some(budget) = self.budgets.get_mut(&root) {
+            budget.remaining = budget.remaining.saturating_add(1);
+        }
+    }
+
+    /// Close every budget belonging to one agent (called when its next tool
+    /// batch starts, so detached work from the previous turn keeps its budget
+    /// for that turn's lifetime).
+    pub(crate) fn close_agent_budgets(&mut self, agent: Entity) {
+        self.budgets.retain(|_, budget| budget.agent != agent);
     }
 
     #[cfg(test)]
@@ -352,9 +374,6 @@ pub(crate) fn finish_round_if_ready(
         .active
         .remove(&round_id)
         .expect("the round was checked above");
-    for index in 0..round.calls.len() {
-        rounds.close_budget((round_id << 32) | index as u64);
-    }
     finished.write(ToolRoundFinished {
         agent: round.agent,
         turn_id: round.turn_id,
@@ -517,6 +536,32 @@ mod tests {
     }
 
     #[test]
+    fn huge_durations_are_clamped_not_panicking() {
+        for value in [1e300, f64::MAX] {
+            let AutoBackground::After(duration) = parse_background_after(Some(value)).unwrap()
+            else {
+                panic!("expected a clamped duration");
+            };
+            assert_eq!(duration, Duration::from_secs(86_400));
+        }
+    }
+
+    #[test]
+    fn budgets_are_closed_per_agent() {
+        let mut world = bevy::prelude::World::new();
+        let first = world.spawn_empty().id();
+        let second = world.spawn_empty().id();
+        let mut rounds = ToolRounds::default();
+        rounds.open_budget(1, first);
+        rounds.open_budget(2, second);
+
+        rounds.close_agent_budgets(first);
+
+        assert!(!rounds.spend_budget(1));
+        assert!(rounds.spend_budget(2));
+    }
+
+    #[test]
     fn per_call_request_overrides_the_tool_default() {
         let policy = Some(Duration::from_secs(5));
         assert_eq!(
@@ -540,8 +585,8 @@ mod tests {
     #[test]
     fn budgets_are_scoped_to_one_root_call() {
         let mut rounds = ToolRounds::default();
-        rounds.open_budget(1);
-        rounds.open_budget(2);
+        rounds.open_budget(1, bevy::prelude::Entity::PLACEHOLDER);
+        rounds.open_budget(2, bevy::prelude::Entity::PLACEHOLDER);
         for _ in 0..MAX_CALLS_PER_ROOT {
             assert!(rounds.spend_budget(1));
         }

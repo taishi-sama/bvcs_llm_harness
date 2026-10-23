@@ -27,6 +27,7 @@ pub(crate) struct StaticTool {
     pub order: u32,
     pub tags: &'static [&'static str],
     pub auto_background: bool,
+    pub model_only: bool,
 }
 
 /// Advertisement query used to build a request's tool list.
@@ -122,6 +123,15 @@ pub(crate) fn auto_background(name: &str) -> bool {
     matches!(name, "run_javascript" | "eval_javascript")
 }
 
+/// Tools that scripts and JavaScript must not call (agent lifecycle and the
+/// interpreter itself).
+pub(crate) fn model_only(name: &str) -> bool {
+    matches!(
+        name,
+        "spawn_agent" | "rename_self" | "end_agent" | "eval_javascript" | "run_javascript"
+    )
+}
+
 /// Whether a definition has a real handler.
 ///
 /// Tests use this to catch a tool added to `definitions` but never wired into
@@ -158,7 +168,7 @@ pub(crate) fn register_script_tools(vfs: Res<VirtualFs>, mut commands: Commands)
                 definition: spec.definition,
                 execution: Execution::Script,
                 availability: Availability::AnyWay,
-                order: 1000 + spec.order,
+                order: 1000u32.saturating_add(spec.order),
                 tags: &["script"],
                 auto_background: false,
             },
@@ -193,6 +203,7 @@ pub(crate) fn static_tools() -> Vec<StaticTool> {
             StaticTool {
                 execution: execution(&definition.name),
                 auto_background: auto_background(&definition.name),
+                model_only: model_only(&definition.name),
                 definition,
                 availability,
                 advertised,

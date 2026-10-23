@@ -328,7 +328,7 @@ pub(crate) fn definitions() -> Vec<Tool> {
                         r#type: ParameterType::Number,
                         description: "Optional byte offset to start reading from (default 0)"
                             .into(),
-                        required: true,
+                        required: false,
                     },
                 ),
                 (
@@ -365,7 +365,7 @@ pub(crate) fn definitions() -> Vec<Tool> {
                     ParameterDescription {
                         r#type: ParameterType::String,
                         description: "Optional file name; omit to search all files".into(),
-                        required: true,
+                        required: false,
                     },
                 ),
                 (
@@ -374,7 +374,7 @@ pub(crate) fn definitions() -> Vec<Tool> {
                         r#type: ParameterType::Number,
                         description: "Optional number of lines before and after each match (default 0, max 100)"
                             .into(),
-                        required: true,
+                        required: false,
                     },
                 ),
                 (
@@ -382,7 +382,7 @@ pub(crate) fn definitions() -> Vec<Tool> {
                     ParameterDescription {
                         r#type: ParameterType::Boolean,
                         description: "Match without regard to case (default false)".into(),
-                        required: true,
+                        required: false,
                     },
                 ),
                 (
@@ -391,7 +391,7 @@ pub(crate) fn definitions() -> Vec<Tool> {
                         r#type: ParameterType::Number,
                         description: "Optional maximum number of matching lines to report (default 200)"
                             .into(),
-                        required: true,
+                        required: false,
                     },
                 ),
             ]),
@@ -419,7 +419,7 @@ pub(crate) fn definitions() -> Vec<Tool> {
                     ParameterDescription {
                         r#type: ParameterType::Number,
                         description: "First line to print (1-based, default 1)".into(),
-                        required: true,
+                        required: false,
                     },
                 ),
                 (
@@ -427,7 +427,7 @@ pub(crate) fn definitions() -> Vec<Tool> {
                     ParameterDescription {
                         r#type: ParameterType::Number,
                         description: "Last line to print (inclusive, default: end of file)".into(),
-                        required: true,
+                        required: false,
                     },
                 ),
                 (
@@ -436,7 +436,7 @@ pub(crate) fn definitions() -> Vec<Tool> {
                         r#type: ParameterType::Boolean,
                         description: "Prefix each line with its 1-based line number (default true)"
                             .into(),
-                        required: true,
+                        required: false,
                     },
                 ),
             ]),
@@ -604,7 +604,7 @@ pub(crate) fn definitions() -> Vec<Tool> {
                         r#type: ParameterType::Boolean,
                         description: "Run asynchronously and deliver the result as a message"
                             .into(),
-                        required: true,
+                        required: false,
                     },
                 ),
             ]),
@@ -627,7 +627,7 @@ pub(crate) fn definitions() -> Vec<Tool> {
                     ParameterDescription {
                         r#type: ParameterType::String,
                         description: "JavaScript source code to execute".into(),
-                        required: true,
+                        required: false,
                     },
                 ),
                 (
@@ -636,7 +636,7 @@ pub(crate) fn definitions() -> Vec<Tool> {
                         r#type: ParameterType::Boolean,
                         description: "Run asynchronously and deliver the result as a message"
                             .into(),
-                        required: true,
+                        required: false,
                     },
                 ),
             ]),
@@ -656,7 +656,7 @@ pub(crate) fn definitions() -> Vec<Tool> {
                     description: "Optional single identifier to drop; omit or use an empty \
                                   string to reset the whole context"
                         .into(),
-                    required: true,
+                    required: false,
                 },
             )]),
         },
@@ -673,7 +673,7 @@ pub(crate) fn definitions() -> Vec<Tool> {
                     ParameterDescription {
                         r#type: ParameterType::String,
                         description: "Exact target agent title, for example `LLM Agent 2`".into(),
-                        required: true,
+                        required: false,
                     },
                 ),
                 (
@@ -681,7 +681,7 @@ pub(crate) fn definitions() -> Vec<Tool> {
                     ParameterDescription {
                         r#type: ParameterType::String,
                         description: "Message to send to the target agent".into(),
-                        required: true,
+                        required: false,
                     },
                 ),
             ]),
@@ -706,7 +706,7 @@ pub(crate) fn definitions() -> Vec<Tool> {
                     ParameterDescription {
                         r#type: ParameterType::String,
                         description: "Exact agent title, or this agent's own name".into(),
-                        required: true,
+                        required: false,
                     },
                 ),
                 (
@@ -717,7 +717,7 @@ pub(crate) fn definitions() -> Vec<Tool> {
                                       count back from the end (-1 is the newest message); omit \
                                       to start at the most recent messages."
                             .into(),
-                        required: true,
+                        required: false,
                     },
                 ),
                 (
@@ -725,7 +725,7 @@ pub(crate) fn definitions() -> Vec<Tool> {
                     ParameterDescription {
                         r#type: ParameterType::Number,
                         description: "Optional number of messages to return (default 20)".into(),
-                        required: true,
+                        required: false,
                     },
                 ),
             ]),
@@ -743,7 +743,7 @@ pub(crate) fn definitions() -> Vec<Tool> {
                     ParameterDescription {
                         r#type: ParameterType::String,
                         description: "Exact agent title, or this agent's own name".into(),
-                        required: true,
+                        required: false,
                     },
                 ),
                 (
@@ -751,7 +751,7 @@ pub(crate) fn definitions() -> Vec<Tool> {
                     ParameterDescription {
                         r#type: ParameterType::Number,
                         description: "Message index from get_agent_history".into(),
-                        required: true,
+                        required: false,
                     },
                 ),
             ]),
@@ -770,7 +770,7 @@ pub(crate) fn definitions() -> Vec<Tool> {
                     ParameterDescription {
                         r#type: ParameterType::String,
                         description: "Optional unique agent title, for example `Researcher`".into(),
-                        required: true,
+                        required: false,
                     },
                 ),
                 (
@@ -778,7 +778,7 @@ pub(crate) fn definitions() -> Vec<Tool> {
                     ParameterDescription {
                         r#type: ParameterType::String,
                         description: "Optional initial task for the new agent".into(),
-                        required: true,
+                        required: false,
                     },
                 ),
             ]),
@@ -795,7 +795,7 @@ pub(crate) fn definitions() -> Vec<Tool> {
                 ParameterDescription {
                     r#type: ParameterType::String,
                     description: "New unique name for this agent".into(),
-                    required: true,
+                    required: false,
                 },
             )]),
         },
@@ -948,6 +948,56 @@ mod tests {
             "end_agent",
         ] {
             assert!(!advertised(name), "`{name}` should be hidden");
+        }
+    }
+
+    #[test]
+    fn documented_optional_parameters_are_not_required() {
+        let tools = definitions();
+        let parameter = |tool: &str, parameter: &str| {
+            tools
+                .iter()
+                .find(|entry| entry.name == tool)
+                .unwrap_or_else(|| panic!("missing tool `{tool}`"))
+                .parameters
+                .get(parameter)
+                .unwrap_or_else(|| panic!("missing parameter `{tool}.{parameter}`"))
+        };
+
+        for (tool, name) in [
+            ("fs_read", "offset"),
+            ("fs_grep", "path"),
+            ("fs_grep", "context"),
+            ("fs_grep", "ignore_case"),
+            ("fs_grep", "max_matches"),
+            ("fs_sed", "start_line"),
+            ("fs_sed", "end_line"),
+            ("fs_sed", "line_numbers"),
+            ("run_javascript", "run_in_background"),
+            ("eval_javascript", "run_in_background"),
+            ("eval_javascript_reset_context", "symbol"),
+            ("get_agent_history", "position"),
+            ("get_agent_history", "amount"),
+            ("spawn_agent", "name"),
+            ("spawn_agent", "prompt"),
+        ] {
+            assert!(
+                !parameter(tool, name).required,
+                "`{tool}.{name}` is documented as optional"
+            );
+        }
+
+        for (tool, name) in [
+            ("fs_read", "path"),
+            ("fs_read", "limit"),
+            ("fs_write", "path"),
+            ("fs_write", "content"),
+            ("fs_edit_pattern", "pattern"),
+        ] {
+            assert!(
+                parameter(tool, name).required,
+                "`{tool}.{name}` is required"
+            );
         }
     }
 

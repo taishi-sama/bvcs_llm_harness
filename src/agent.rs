@@ -1334,6 +1334,10 @@ pub(crate) fn execute_tool_calls(
         }
         let source_name = agent.name().to_owned();
 
+        // Budgets from the previous batch are only closed once that turn's work
+        // has had a chance to finish.
+        rounds.close_agent_budgets(request.agent);
+
         let round_id = rounds.next_round;
         rounds.next_round += 1;
 
@@ -1342,10 +1346,28 @@ pub(crate) fn execute_tool_calls(
         let mut remaining = request.tool_call.len();
 
         for (call_index, call) in request.tool_call.iter().enumerate() {
-            let arguments =
-                serde_json::from_str::<Value>(&call.toolcall_params).unwrap_or(Value::Null);
+            let raw_arguments = call.toolcall_params.trim();
+            let arguments = if raw_arguments.is_empty() {
+                Value::Null
+            } else {
+                match serde_json::from_str::<Value>(raw_arguments) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        results[call_index] = Some(ToolCallResult {
+                            result: format!(
+                                "invalid JSON arguments for `{}`: {err}",
+                                call.tool_name
+                            ),
+                            is_error: true,
+                            tool_use_id: call.tool_use_id.clone(),
+                        });
+                        remaining -= 1;
+                        continue;
+                    }
+                }
+            };
             let root = (round_id << 32) | call_index as u64;
-            rounds.open_budget(root);
+            rounds.open_budget(root, request.agent);
             let context = CallContext {
                 source_entity: request.agent,
                 source_agent: &source_name,
@@ -1354,6 +1376,15 @@ pub(crate) fn execute_tool_calls(
             };
 
             let found = find(&world, &call.tool_name);
+            if let Some(reason) = found.and_then(|found| found.disabled) {
+                results[call_index] = Some(ToolCallResult {
+                    result: format!("Tool `{}` is disabled: {reason}", call.tool_name),
+                    is_error: true,
+                    tool_use_id: call.tool_use_id.clone(),
+                });
+                remaining -= 1;
+                continue;
+            }
             match found {
                 Some(found) if matches!(found.execution, Execution::Interpreter) => {
                     let auto = resolve_auto_background(
@@ -1361,6 +1392,15 @@ pub(crate) fn execute_tool_calls(
                         found.auto_background,
                         policy.auto_after,
                     );
+                    if !rounds.spend_budget(root) {
+                        results[call_index] = Some(ToolCallResult {
+                            result: budget_exhausted_message(),
+                            is_error: true,
+                            tool_use_id: call.tool_use_id.clone(),
+                        });
+                        remaining -= 1;
+                        continue;
+                    }
                     let submitted =
                         interpreter_task(&call.tool_name, &arguments, &world.fs, 1, root).and_then(
                             |task| {
@@ -1391,6 +1431,7 @@ pub(crate) fn execute_tool_calls(
                             },
                         ),
                         Err(err) => {
+                            rounds.refund_budget(root);
                             results[call_index] = Some(ToolCallResult {
                                 result: err,
                                 is_error: true,
@@ -1413,6 +1454,15 @@ pub(crate) fn execute_tool_calls(
                                 .timeout_ms
                                 .map(Duration::from_millis)
                                 .unwrap_or(DEFAULT_SCRIPT_TIMEOUT);
+                            if !rounds.spend_budget(root) {
+                                results[call_index] = Some(ToolCallResult {
+                                    result: budget_exhausted_message(),
+                                    is_error: true,
+                                    tool_use_id: call.tool_use_id.clone(),
+                                });
+                                remaining -= 1;
+                                continue;
+                            }
                             let submitted = script.submit(
                                 request.agent,
                                 ScriptTask {
@@ -1444,6 +1494,7 @@ pub(crate) fn execute_tool_calls(
                                     },
                                 ),
                                 Err(err) => {
+                                    rounds.refund_budget(root);
                                     results[call_index] = Some(ToolCallResult {
                                         result: err,
                                         is_error: true,
@@ -1592,6 +1643,15 @@ pub(crate) fn poll_script_events(
     }
 }
 
+/// Which context is asking the main loop to run a tool.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HostOrigin {
+    /// The agent's persistent interpreter thread.
+    AgentInterpreter,
+    /// A script worker with a throwaway context.
+    Script,
+}
+
 /// Outcome of a host tool call.
 enum HostOutcome {
     /// The reply was already sent.
@@ -1625,6 +1685,7 @@ fn handle_host_tool(
     depth: u32,
     root: u64,
     background: Option<f64>,
+    origin: HostOrigin,
     reply: NestedReply,
 ) -> HostOutcome {
     if depth > MAX_TOOL_DEPTH {
@@ -1662,6 +1723,15 @@ fn handle_host_tool(
             Err(format!("Tool `{name}` is disabled: {disabled}")),
         );
     }
+    if found.model_only {
+        return reply_now(
+            js_handles,
+            reply,
+            Err(format!(
+                "tool `{name}` can only be called by the model, not from JavaScript or scripts"
+            )),
+        );
+    }
 
     let auto = resolve_auto_background(request, found.auto_background, policy.auto_after);
     match found.execution {
@@ -1688,6 +1758,20 @@ fn handle_host_tool(
             reply_now(js_handles, reply, result)
         }
         Execution::Interpreter => {
+            // The agent has exactly one interpreter thread. Submitting to it
+            // while that thread is blocked in `execute()` would never run.
+            if origin == HostOrigin::AgentInterpreter {
+                return reply_now(
+                    js_handles,
+                    reply,
+                    Err(format!(
+                        "JavaScript cannot call another JavaScript tool (`{name}`)"
+                    )),
+                );
+            }
+            if !rounds.spend_budget(root) {
+                return reply_now(js_handles, reply, Err(budget_exhausted_message()));
+            }
             let submitted =
                 interpreter_task(name, arguments, &world.fs, depth + 1, root).and_then(|task| {
                     js_handles
@@ -1696,18 +1780,11 @@ fn handle_host_tool(
                         .submit(task)
                 });
             match submitted {
-                Err(err) => reply_now(js_handles, reply, Err(err)),
+                Err(err) => {
+                    rounds.refund_budget(root);
+                    reply_now(js_handles, reply, Err(err))
+                }
                 Ok(request_id) => {
-                    if !rounds.spend_budget(root) {
-                        return reply_now(
-                            js_handles,
-                            reply,
-                            Err(format!(
-                                "tool call budget for this root call is exhausted ({})",
-                                crate::tools::schedule::MAX_CALLS_PER_ROOT
-                            )),
-                        );
-                    }
                     let deadline = auto.map(|grace| Instant::now() + grace);
                     rounds.add_nested(NestedCall::new(agent, request_id, deadline, reply));
                     HostOutcome::Pending
@@ -1728,6 +1805,9 @@ fn handle_host_tool(
                 .timeout_ms
                 .map(Duration::from_millis)
                 .unwrap_or(DEFAULT_SCRIPT_TIMEOUT);
+            if !rounds.spend_budget(root) {
+                return reply_now(js_handles, reply, Err(budget_exhausted_message()));
+            }
             let submitted = script.submit(
                 agent,
                 ScriptTask {
@@ -1741,18 +1821,11 @@ fn handle_host_tool(
                 },
             );
             match submitted {
-                Err(err) => reply_now(js_handles, reply, Err(err)),
+                Err(err) => {
+                    rounds.refund_budget(root);
+                    reply_now(js_handles, reply, Err(err))
+                }
                 Ok(request_id) => {
-                    if !rounds.spend_budget(root) {
-                        return reply_now(
-                            js_handles,
-                            reply,
-                            Err(format!(
-                                "tool call budget for this root call is exhausted ({})",
-                                crate::tools::schedule::MAX_CALLS_PER_ROOT
-                            )),
-                        );
-                    }
                     let deadline = auto.map(|grace| Instant::now() + grace);
                     rounds.add_nested(NestedCall::new(agent, request_id, deadline, reply));
                     HostOutcome::Pending
@@ -1779,6 +1852,12 @@ pub(crate) fn poll_script_host_requests(
             reply,
         } = request;
 
+        // Work from a removed agent must not keep mutating the world.
+        if world.agents.get(agent).is_err() {
+            let _ = reply.send(Err(format!("agent entity {agent} no longer exists")));
+            continue;
+        }
+
         match command {
             HostCommand::Tool {
                 name,
@@ -1800,6 +1879,7 @@ pub(crate) fn poll_script_host_requests(
                     depth,
                     root,
                     background,
+                    HostOrigin::Script,
                     NestedReply::Channel(reply),
                 );
             }
@@ -1829,6 +1909,13 @@ pub(crate) fn poll_js_host_requests(
             command,
         } = request;
 
+        if world.agents.get(agent).is_err() {
+            if let Ok(handle) = js_handles.get(agent) {
+                handle.respond(token, Err(format!("agent entity {agent} no longer exists")));
+            }
+            continue;
+        }
+
         match command {
             HostCommand::Tool {
                 name,
@@ -1852,6 +1939,7 @@ pub(crate) fn poll_js_host_requests(
                     depth,
                     root,
                     background,
+                    HostOrigin::AgentInterpreter,
                     NestedReply::Agent { agent, token },
                 );
             }
@@ -2359,6 +2447,7 @@ mod background_tests {
                 remaining: 1,
             },
         );
+        rounds.open_budget(round_id << 32, agent);
         rounds.track(
             request,
             PendingCallFields {
@@ -2402,6 +2491,7 @@ mod background_tests {
                 remaining: 1,
             },
         );
+        rounds.open_budget(round_id << 32, agent);
         rounds.track(
             request,
             PendingCallFields {
@@ -2711,4 +2801,11 @@ mod empty_response_tests {
         assert!(agent_ref.current_turn.is_none());
         assert!(!agent_ref.pending);
     }
+}
+
+fn budget_exhausted_message() -> String {
+    format!(
+        "tool call budget for this root call is exhausted ({})",
+        crate::tools::schedule::MAX_CALLS_PER_ROOT
+    )
 }

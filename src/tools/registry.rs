@@ -59,8 +59,8 @@ pub(crate) enum Availability {
     /// Reachable from any origin, including search results.
     #[default]
     AnyWay,
-    /// Hidden from the schema and from `search_tools`; still callable when
-    /// named directly. This is a discovery policy, not access control.
+    /// Not advertised, but discoverable through `search_tools` and callable
+    /// when named directly. This is a discovery policy, not access control.
     OnlyManual,
 }
 
@@ -144,6 +144,7 @@ pub(crate) fn register_static_tools(mut commands: Commands) {
         order,
         tags,
         auto_background,
+        model_only,
     } in static_tools()
     {
         let mut entity = commands.spawn(ToolEntry {
@@ -156,6 +157,9 @@ pub(crate) fn register_static_tools(mut commands: Commands) {
         });
         if advertised {
             entity.insert(Advertised);
+        }
+        if model_only {
+            entity.insert(ModelOnly);
         }
     }
 }

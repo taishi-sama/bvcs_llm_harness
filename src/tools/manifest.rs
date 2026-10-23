@@ -296,7 +296,7 @@ pub(crate) fn scan_libraries(tree: &ToolsTree, warnings: &mut Vec<String>) -> Ve
         if tree.read(&entry).is_err() {
             warnings.push(format!(
                 "`{manifest_path}` points at missing entry `{}`; skipped",
-                directory
+                entry
             ));
             continue;
         }
