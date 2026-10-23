@@ -5,13 +5,18 @@
 //! model-facing trim reviewable in one small table instead of being spread
 //! across the definitions.
 
-use bevy::prelude::{Query, With, Without};
+use bevy::log::{info, warn};
+use bevy::prelude::{Commands, Query, Res, With, Without};
 use llm_api::generic_tool::Tool;
 use serde_json::Value;
 
-use crate::tools::{
-    definitions,
-    registry::{Advertised, Availability, DisabledTool, Execution, ToolEntry},
+use crate::{
+    tools::{
+        definitions,
+        registry::{Advertised, Availability, CallContext, DisabledTool, Execution, ToolEntry},
+        world::ToolWorld,
+    },
+    virtual_fs::VirtualFs,
 };
 
 /// One definition plus its registration policy.
@@ -122,6 +127,55 @@ pub(crate) fn is_implemented(name: &str) -> bool {
         || crate::tools::agent_tools::handler(name).is_some()
         || name == "search_tools"
         || crate::tools::is_js_tool(name)
+}
+
+/// Register script tools found under `.tools`.
+///
+/// Execution lands in the next phase; registering them now makes the scan and
+/// policy observable while keeping them out of the model's schema (`DisabledTool`
+/// excludes them from advertisement and explains why a direct call fails).
+pub(crate) fn register_script_tools(vfs: Res<VirtualFs>, mut commands: Commands) {
+    let mut warnings = Vec::new();
+    let specs = crate::tools::manifest::scan_tools(vfs.tools(), &mut warnings);
+    let libraries = crate::tools::manifest::scan_libraries(vfs.tools(), &mut warnings);
+
+    for warning in warnings {
+        warn!("tool manifest: {warning}");
+    }
+
+    for spec in specs {
+        info!(
+            "registered script tool `{}` from `{}`",
+            spec.name, spec.entry
+        );
+        commands.spawn((
+            ToolEntry {
+                definition: spec.definition,
+                execution: Execution::Inline(script_unavailable),
+                availability: Availability::AnyWay,
+                order: 1000 + spec.order,
+                tags: &["script"],
+            },
+            DisabledTool {
+                reason: "script execution is not wired yet",
+            },
+        ));
+    }
+
+    if !libraries.is_empty() {
+        info!(
+            "found {} importable tool library(ies) under `.tools`",
+            libraries.len()
+        );
+    }
+}
+
+fn script_unavailable(
+    _world: &mut ToolWorld<'_, '_>,
+    _arguments: &Value,
+    _call: &CallContext<'_>,
+) -> (String, bool) {
+    ("script tools cannot run yet".to_owned(), true)
 }
 
 /// Every static tool, ready to be spawned.

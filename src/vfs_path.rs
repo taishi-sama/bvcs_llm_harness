@@ -85,6 +85,14 @@ impl VfsPath {
         &self.segments
     }
 
+    /// Path as the model sees it: the flat name, or `.tools/<relative>`.
+    pub(crate) fn display(&self) -> String {
+        match self.mount {
+            Mount::Root => self.relative(),
+            Mount::Tools => format!("{TOOLS_MOUNT}/{}", self.relative()),
+        }
+    }
+
     /// Path relative to its mount, joined with `/`.
     ///
     /// For [`Mount::Root`] this is the flat file name; for [`Mount::Tools`] it

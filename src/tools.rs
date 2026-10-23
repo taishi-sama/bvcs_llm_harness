@@ -7,6 +7,10 @@
 //! in [`execute_tool`]. Tools that start JavaScript are deliberately not handled
 //! here; callers dispatch those asynchronously to the owning JS context.
 
+pub(crate) mod manifest;
+pub(crate) mod mirror;
+pub(crate) mod tree;
+
 mod agent_tools;
 mod catalog;
 mod fs;
@@ -27,7 +31,10 @@ use crate::{
     virtual_fs::VirtualFs,
 };
 
-pub(crate) use catalog::{AdvertisedTools, advertised_tools};
+pub(crate) use catalog::{AdvertisedTools, advertised_tools, register_script_tools};
+pub(crate) use mirror::{
+    MirrorDebounce, MirrorStatus, ToolsDir, flush_tool_mirror, seed_tool_tree,
+};
 pub(crate) use registry::{CallContext, Execution, find, register_static_tools};
 pub(crate) use world::ToolWorld;
 

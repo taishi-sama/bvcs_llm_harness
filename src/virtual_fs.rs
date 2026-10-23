@@ -8,6 +8,11 @@ use std::{
 
 use bevy::prelude::Resource;
 
+use crate::{
+    tools::tree::ToolsTree,
+    vfs_path::{Mount, VfsPath},
+};
+
 /// Snapshot folder used by the Save/Load VFS buttons.
 ///
 /// Defaults to `vfs_state` in the current working directory. Set
@@ -39,6 +44,8 @@ impl Default for VfsStateDir {
 #[derive(Resource, Default)]
 pub(crate) struct VirtualFs {
     files: HashMap<String, String>,
+    /// Validated, hierarchical `.tools` sources. See [`crate::tools::tree`].
+    tools: ToolsTree,
 }
 
 fn split_virtual_file(content: &str) -> (Vec<String>, bool) {
@@ -49,37 +56,88 @@ fn split_virtual_file(content: &str) -> (Vec<String>, bool) {
 }
 
 impl VirtualFs {
-    /// The virtual filesystem has no directories: a path is a plain file name.
-    fn normalize_path(path: &str) -> Result<String, String> {
-        let path = path.trim();
-        if path.is_empty() {
-            return Err("path must not be empty".to_owned());
+    /// The `.tools` source tree (mounted, not part of the flat root).
+    pub(crate) fn tools(&self) -> &ToolsTree {
+        &self.tools
+    }
+
+    pub(crate) fn tools_mut(&mut self) -> &mut ToolsTree {
+        &mut self.tools
+    }
+
+    /// Parse a caller-supplied path. All validation lives in [`VfsPath`]:
+    /// the flat root stays directory-free, and `.tools` is the only mount.
+    fn resolve(path: &str) -> Result<VfsPath, String> {
+        VfsPath::parse(path.trim())
+    }
+
+    fn read_any(&self, path: &VfsPath) -> Result<String, String> {
+        match path.mount() {
+            Mount::Root => self.files.get(&path.relative()).cloned().ok_or_else(|| {
+                format!(
+                    "No such file: `{}`. Use fs_write to create it.",
+                    path.display()
+                )
+            }),
+            Mount::Tools => self.tools.read(&path.relative()).map_err(|_| {
+                format!(
+                    "No such file: `{}`. Use fs_write to create it.",
+                    path.display()
+                )
+            }),
         }
-        if path.contains('/') || path.contains('\\') {
-            return Err(format!(
-                "invalid path `{path}`: the virtual filesystem is flat (no directories)"
-            ));
+    }
+
+    fn write_any(&mut self, path: &VfsPath, content: String) {
+        match path.mount() {
+            Mount::Root => {
+                self.files.insert(path.relative(), content);
+            }
+            Mount::Tools => self.tools.write(&path.relative(), content),
         }
-        if path == "." || path == ".." {
-            return Err(format!("invalid file name `{path}`"));
+    }
+
+    fn delete_any(&mut self, path: &VfsPath) -> Result<usize, String> {
+        match path.mount() {
+            Mount::Root => self
+                .files
+                .remove(&path.relative())
+                .map(|content| content.len())
+                .ok_or_else(|| format!("No such file: `{}`", path.display())),
+            Mount::Tools => self.tools.delete(&path.relative()),
         }
-        Ok(path.to_owned())
     }
 
     pub(crate) fn list(&self) -> String {
-        if self.files.is_empty() {
+        if self.files.is_empty() && self.tools.is_empty() {
             return "Virtual filesystem is empty.".to_owned();
         }
 
         let mut names: Vec<&String> = self.files.keys().collect();
         names.sort_unstable();
-        let mut listing = format!("Files ({}):", names.len());
-        for name in names {
-            let content = &self.files[name];
+        let mut listing = if names.is_empty() {
+            String::new()
+        } else {
+            let mut listing = format!("Files ({}):", names.len());
+            for name in names {
+                let content = &self.files[name];
+                listing.push_str(&format!(
+                    "\n{name} - {} bytes, {} line(s)",
+                    content.len(),
+                    content.lines().count()
+                ));
+            }
+            listing
+        };
+        if !self.tools.is_empty() {
+            if !listing.is_empty() {
+                listing.push('\n');
+            }
             listing.push_str(&format!(
-                "\n{name} - {} bytes, {} line(s)",
-                content.len(),
-                content.lines().count()
+                "{}/ - {} tool file(s), use a `{}/<path>` file name to read or edit",
+                crate::vfs_path::TOOLS_MOUNT,
+                self.tools.len(),
+                crate::vfs_path::TOOLS_MOUNT
             ));
         }
         listing
@@ -97,23 +155,21 @@ impl VirtualFs {
         offset: Option<u64>,
         limit: Option<u64>,
     ) -> Result<String, String> {
-        let path = Self::normalize_path(path)?;
-        let content = self
-            .files
-            .get(&path)
-            .ok_or_else(|| format!("No such file: `{path}`. Use fs_write to create it."))?;
+        let path = Self::resolve(path)?;
+        let name = path.display();
+        let content = self.read_any(&path)?;
 
         let start = usize::try_from(offset.unwrap_or(0))
             .map_err(|_| "`offset` is too large for this platform".to_owned())?;
         if start > content.len() {
             return Err(format!(
-                "`offset` ({start}) is past the end of `{path}` ({} bytes)",
+                "`offset` ({start}) is past the end of `{name}` ({} bytes)",
                 content.len()
             ));
         }
         if !content.is_char_boundary(start) {
             return Err(format!(
-                "`offset` ({start}) is not on a UTF-8 character boundary in `{path}`"
+                "`offset` ({start}) is not on a UTF-8 character boundary in `{name}`"
             ));
         }
 
@@ -127,7 +183,7 @@ impl VirtualFs {
         };
         if !content.is_char_boundary(end) {
             return Err(format!(
-                "`offset` + `limit` ends at byte {end}, which is not on a UTF-8 character boundary in `{path}`"
+                "`offset` + `limit` ends at byte {end}, which is not on a UTF-8 character boundary in `{name}`"
             ));
         }
 
@@ -159,26 +215,33 @@ impl VirtualFs {
             pattern.to_owned()
         };
 
-        let mut names = match path {
+        let mut files = match path {
             Some(path) => {
-                let path = Self::normalize_path(path)?;
-                if !self.files.contains_key(&path) {
-                    return Err(format!(
-                        "No such file: `{path}`. Use fs_write to create it."
-                    ));
-                }
-                vec![path]
+                let path = Self::resolve(path)?;
+                vec![(path.display(), self.read_any(&path)?)]
             }
-            None => self.files.keys().cloned().collect::<Vec<_>>(),
+            None => {
+                let mut files: Vec<(String, String)> = self
+                    .files
+                    .iter()
+                    .map(|(name, content)| (name.clone(), content.clone()))
+                    .collect();
+                files.extend(self.tools.iter().map(|(name, content)| {
+                    (
+                        format!("{}/{name}", crate::vfs_path::TOOLS_MOUNT),
+                        content.to_owned(),
+                    )
+                }));
+                files
+            }
         };
-        names.sort_unstable();
+        files.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
         let mut output = String::new();
         let mut found = 0usize;
         let mut truncated = false;
 
-        for name in names {
-            let content = &self.files[&name];
+        for (name, content) in files {
             let lines = content.lines().collect::<Vec<_>>();
             let mut matched = Vec::new();
             let mut limit_hit = false;
@@ -261,14 +324,12 @@ impl VirtualFs {
         end_line: Option<u64>,
         line_numbers: bool,
     ) -> Result<String, String> {
-        let path = Self::normalize_path(path)?;
-        let content = self
-            .files
-            .get(&path)
-            .ok_or_else(|| format!("No such file: `{path}`. Use fs_write to create it."))?;
+        let path = Self::resolve(path)?;
+        let name = path.display();
+        let content = self.read_any(&path)?;
         let lines = content.lines().collect::<Vec<_>>();
         if lines.is_empty() {
-            return Ok(format!("`{path}` is empty."));
+            return Ok(format!("`{name}` is empty."));
         }
 
         let start = usize::try_from(start_line.unwrap_or(1))
@@ -278,7 +339,7 @@ impl VirtualFs {
         }
         if start > lines.len() {
             return Err(format!(
-                "start_line ({start}) is past the end of `{path}` ({} line(s))",
+                "start_line ({start}) is past the end of `{name}` ({} line(s))",
                 lines.len()
             ));
         }
@@ -380,19 +441,18 @@ impl VirtualFs {
     }
 
     pub(crate) fn write(&mut self, path: &str, content: String) -> Result<String, String> {
-        let path = Self::normalize_path(path)?;
+        let path = Self::resolve(path)?;
+        let name = path.display();
         let lines = content.lines().count();
-        self.files.insert(path.clone(), content);
-        Ok(format!("Wrote `{path}` ({lines} lines)."))
+        self.write_any(&path, content);
+        Ok(format!("Wrote `{name}` ({lines} lines)."))
     }
 
     pub(crate) fn delete(&mut self, path: &str) -> Result<String, String> {
-        let path = Self::normalize_path(path)?;
-        let content = self
-            .files
-            .remove(&path)
-            .ok_or_else(|| format!("No such file: `{path}`"))?;
-        Ok(format!("Deleted `{path}` ({} bytes).", content.len()))
+        let path = Self::resolve(path)?;
+        let name = path.display();
+        let bytes = self.delete_any(&path)?;
+        Ok(format!("Deleted `{name}` ({bytes} bytes)."))
     }
 
     /// Replaces an inclusive, 1-based line range. An empty `content` deletes
@@ -404,12 +464,9 @@ impl VirtualFs {
         end_line: u64,
         content: String,
     ) -> Result<String, String> {
-        let path = Self::normalize_path(path)?;
-        let original = self
-            .files
-            .get(&path)
-            .cloned()
-            .ok_or_else(|| format!("No such file: `{path}`"))?;
+        let path = Self::resolve(path)?;
+        let name = path.display();
+        let original = self.read_any(&path)?;
         let (mut lines, trailing_newline) = split_virtual_file(&original);
 
         let start = usize::try_from(start_line)
@@ -426,7 +483,7 @@ impl VirtualFs {
         }
         if end > lines.len() {
             return Err(format!(
-                "line range {start_line}-{end_line} is out of bounds; `{path}` has {} line(s)",
+                "line range {start_line}-{end_line} is out of bounds; `{name}` has {} line(s)",
                 lines.len()
             ));
         }
@@ -443,9 +500,9 @@ impl VirtualFs {
             updated.push('\n');
         }
         let line_count = lines.len();
-        self.files.insert(path.clone(), updated);
+        self.write_any(&path, updated);
         Ok(format!(
-            "Replaced lines {start_line}-{end_line} in `{path}`; file now has {line_count} line(s)."
+            "Replaced lines {start_line}-{end_line} in `{name}`; file now has {line_count} line(s)."
         ))
     }
 
@@ -456,27 +513,23 @@ impl VirtualFs {
         pattern: &str,
         replacement: &str,
     ) -> Result<String, String> {
-        let path = Self::normalize_path(path)?;
+        let path = Self::resolve(path)?;
+        let name = path.display();
         if pattern.is_empty() {
             return Err("pattern must not be empty".to_owned());
         }
-        let original = self
-            .files
-            .get(&path)
-            .cloned()
-            .ok_or_else(|| format!("No such file: `{path}`"))?;
+        let original = self.read_any(&path)?;
 
         match original.matches(pattern).count() {
-            0 => Err(format!("Pattern not found in `{path}`.")),
+            0 => Err(format!("Pattern not found in `{name}`.")),
             1 => {
-                self.files
-                    .insert(path.clone(), original.replacen(pattern, replacement, 1));
+                self.write_any(&path, original.replacen(pattern, replacement, 1));
                 Ok(format!(
-                    "Replaced the single match of the pattern in `{path}`."
+                    "Replaced the single match of the pattern in `{name}`."
                 ))
             }
             count => Err(format!(
-                "Pattern matches {count} times in `{path}`; refusing to edit because exactly one match is required."
+                "Pattern matches {count} times in `{name}`; refusing to edit because exactly one match is required."
             )),
         }
     }
@@ -485,6 +538,39 @@ impl VirtualFs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tools_mount_reads_and_writes_outside_the_flat_root() {
+        let mut fs = VirtualFs::default();
+        fs.write(".tools/tool1/main.js", "export const x = 1;".into())
+            .unwrap();
+        assert_eq!(
+            fs.read(".tools/tool1/main.js").unwrap(),
+            "export const x = 1;"
+        );
+        assert!(fs.read("tool1/main.js").is_err());
+        assert!(
+            fs.list().contains(".tools/ - 1 tool file(s)"),
+            "{}",
+            fs.list()
+        );
+
+        fs.edit_pattern(".tools/tool1/main.js", "1", "2").unwrap();
+        assert_eq!(
+            fs.read(".tools/tool1/main.js").unwrap(),
+            "export const x = 2;"
+        );
+        fs.delete(".tools/tool1/main.js").unwrap();
+        assert!(fs.read(".tools/tool1/main.js").is_err());
+    }
+
+    #[test]
+    fn tools_paths_are_validated() {
+        let mut fs = VirtualFs::default();
+        assert!(fs.write(".tools/../escape.js", "x".into()).is_err());
+        assert!(fs.write(".tools", "x".into()).is_err());
+        assert!(fs.write("dir/file.txt", "x".into()).is_err());
+    }
 
     #[test]
     fn virtual_fs_supports_shared_file_lifecycle() {

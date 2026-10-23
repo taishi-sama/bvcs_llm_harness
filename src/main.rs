@@ -111,6 +111,9 @@ fn main() {
         .init_resource::<VirtualFs>()
         .init_resource::<VfsStateDir>()
         .init_resource::<JsChannels>()
+        .init_resource::<tools::ToolsDir>()
+        .init_resource::<tools::MirrorStatus>()
+        .init_resource::<tools::MirrorDebounce>()
         .init_resource::<ToolRounds>()
         .init_resource::<BackgroundPolicy>()
         .init_resource::<TextCollapseConfig>()
@@ -139,7 +142,15 @@ fn main() {
         .add_message::<RemoveAgentRequest>()
         .add_message::<RenameAgentRequest>()
         .add_message::<TaskResult>()
-        .add_systems(PreStartup, tools::register_static_tools)
+        .add_systems(
+            PreStartup,
+            (
+                tools::seed_tool_tree,
+                tools::register_static_tools,
+                tools::register_script_tools,
+            )
+                .chain(),
+        )
         .add_systems(Startup, (setup, log_glyph_cache_limit))
         .add_systems(Update, limit_glyph_cache)
         .add_systems(
@@ -165,6 +176,7 @@ fn main() {
                     auto_background_long_js_tasks,
                     apply_tool_results,
                     update_tool_activity,
+                    tools::flush_tool_mirror,
                     handle_send_agent_message,
                     start_agent_turn,
                     handle_agent_failed,
