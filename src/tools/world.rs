@@ -11,11 +11,15 @@ use crate::{
     agent::{Agent, AgentIndex, AgentLayout},
     config::AppConfig,
     messages::{RemoveAgentRequest, RenameAgentRequest, SendAgentMessage},
-    tools::registry::{Advertised, DisabledTool, ModelOnly, ToolEntry},
+    tools::{
+        registry::{Advertised, DisabledTool, ModelOnly, ToolEntry},
+        script::ScriptTool,
+    },
     virtual_fs::VirtualFs,
 };
 
 pub(crate) type ToolRow = (
+    bevy::prelude::Entity,
     &'static ToolEntry,
     bevy::ecs::query::Has<Advertised>,
     Option<&'static DisabledTool>,
@@ -36,6 +40,8 @@ pub(crate) struct ToolWorld<'w, 's> {
     /// a handler can never change the catalog mid-round; that goes through a
     /// message handled outside dispatch.
     pub tools: Query<'w, 's, ToolRow>,
+    /// Script-tool execution data, keyed by tool entity.
+    pub scripts: Query<'w, 's, &'static ScriptTool>,
     pub commands: Commands<'w, 's>,
     pub send_agent_message: MessageWriter<'w, SendAgentMessage>,
     pub remove_agent: MessageWriter<'w, RemoveAgentRequest>,

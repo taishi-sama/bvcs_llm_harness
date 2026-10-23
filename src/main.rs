@@ -114,6 +114,8 @@ fn main() {
         .init_resource::<tools::ToolsDir>()
         .init_resource::<tools::MirrorStatus>()
         .init_resource::<tools::MirrorDebounce>()
+        .init_resource::<tools::script::ScriptRuntime>()
+        .init_resource::<tools::script::ToolSourceCache>()
         .init_resource::<ToolRounds>()
         .init_resource::<BackgroundPolicy>()
         .init_resource::<TextCollapseConfig>()
@@ -169,9 +171,12 @@ fn main() {
                 )
                     .chain(),
                 (
+                    tools::script::refresh_tool_sources,
                     poll_js_events,
+                    poll_script_events,
                     handle_task_result,
                     poll_js_host_requests,
+                    poll_script_host_requests,
                     execute_tool_calls,
                     auto_background_long_js_tasks,
                     apply_tool_results,

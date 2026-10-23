@@ -18,6 +18,7 @@ use std::{
     collections::VecDeque,
     fmt,
     panic::AssertUnwindSafe,
+    path::PathBuf,
     rc::Rc,
     sync::{
         Arc, Mutex,
@@ -33,11 +34,24 @@ use bevy::{
     prelude::{Component, Discard, Entity, Insert, On, Query, Resource},
 };
 use boa_engine::{
-    Context as JsContext, JsNativeError, JsResult, JsValue, Module, NativeFunction, Source,
+    Context as JsContext, JsNativeError, JsResult, JsString, JsValue, Module, NativeFunction,
+    Source,
+    builtins::promise::PromiseState,
     js_string,
     module::{ModuleLoader, ModuleRequest, Referrer},
 };
 use serde_json::{Map as JsonMap, Value};
+
+use crate::tools::script::{ToolSources, resolve_module};
+
+/// Where a context's `import` specifiers resolve.
+#[derive(Clone)]
+pub(crate) enum ModuleRoot {
+    /// The flat virtual filesystem (agent contexts).
+    Vfs,
+    /// The `.tools` tree (script workers).
+    Tools(Arc<ToolSources>),
+}
 
 // ---------------------------------------------------------------------------
 // Public channel types
@@ -201,6 +215,7 @@ impl HostDispatch for NoHost {
 
 struct VirtualModuleLoader {
     host: Rc<dyn HostDispatch>,
+    root: ModuleRoot,
 }
 
 impl fmt::Debug for VirtualModuleLoader {
@@ -212,25 +227,50 @@ impl fmt::Debug for VirtualModuleLoader {
 impl ModuleLoader for VirtualModuleLoader {
     async fn load_imported_module(
         self: Rc<Self>,
-        _referrer: Referrer,
+        referrer: Referrer,
         request: ModuleRequest,
         context: &RefCell<&mut JsContext>,
     ) -> JsResult<Module> {
-        // The virtual filesystem is flat, so a specifier is just a file name.
-        // Accept the common `./foo.js` spelling as a convenience.
         let specifier = request.specifier().to_std_string_escaped();
-        let path = specifier
-            .strip_prefix("./")
-            .unwrap_or(&specifier)
-            .to_owned();
+        match &self.root {
+            // The virtual filesystem is flat, so a specifier is just a file name.
+            // Accept the common `./foo.js` spelling as a convenience.
+            ModuleRoot::Vfs => {
+                let path = specifier
+                    .strip_prefix("./")
+                    .unwrap_or(&specifier)
+                    .to_owned();
 
-        let source = self
-            .host
-            .call(HostCommand::ReadFile { path })
-            .map_err(|err| JsNativeError::typ().with_message(err))?;
+                let source = self
+                    .host
+                    .call(HostCommand::ReadFile { path })
+                    .map_err(|err| JsNativeError::typ().with_message(err))?;
 
-        let mut context = context.borrow_mut();
-        Module::parse(Source::from_bytes(&source), None, &mut context)
+                let mut context = context.borrow_mut();
+                Module::parse(Source::from_bytes(&source), None, &mut context)
+            }
+            // `.tools` modules resolve inside the published snapshot and every
+            // returned module keeps its path so nested imports resolve.
+            ModuleRoot::Tools(sources) => {
+                let resolved = resolve_module(&specifier, referrer.path(), sources)
+                    .map_err(|err| JsNativeError::typ().with_message(err))?;
+                let source = sources
+                    .get(&resolved)
+                    .ok_or_else(|| {
+                        JsNativeError::typ().with_message(format!(
+                            "module `{resolved}` vanished from the `.tools` snapshot"
+                        ))
+                    })?
+                    .to_owned();
+                let path = PathBuf::from(&resolved);
+                let mut context = context.borrow_mut();
+                Module::parse(
+                    Source::from_bytes(&source).with_path(&path),
+                    None,
+                    &mut context,
+                )
+            }
+        }
     }
 }
 
@@ -243,15 +283,29 @@ pub(crate) struct JsSession {
     context: JsContext,
     output: Receiver<String>,
     dispatch: Rc<dyn HostDispatch>,
+    root: ModuleRoot,
 }
 
 impl JsSession {
     pub(crate) fn new(dispatch: Rc<dyn HostDispatch>) -> Result<Self, String> {
-        let (context, output) = build_context(dispatch.clone())?;
+        Self::new_with(dispatch, ModuleRoot::Vfs)
+    }
+
+    /// Fresh session whose imports resolve inside `.tools`.
+    pub(crate) fn new_tools(
+        dispatch: Rc<dyn HostDispatch>,
+        sources: Arc<ToolSources>,
+    ) -> Result<Self, String> {
+        Self::new_with(dispatch, ModuleRoot::Tools(sources))
+    }
+
+    fn new_with(dispatch: Rc<dyn HostDispatch>, root: ModuleRoot) -> Result<Self, String> {
+        let (context, output) = build_context_with(dispatch.clone(), root.clone())?;
         Ok(Self {
             context,
             output,
             dispatch,
+            root,
         })
     }
 
@@ -259,6 +313,11 @@ impl JsSession {
     #[cfg(test)]
     pub(crate) fn new_isolated() -> Result<Self, String> {
         Self::new(Rc::new(NoHost))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_tools_isolated(sources: Arc<ToolSources>) -> Result<Self, String> {
+        Self::new_tools(Rc::new(NoHost), sources)
     }
 
     pub(crate) fn eval(&mut self, code: &str) -> Result<String, String> {
@@ -273,21 +332,91 @@ impl JsSession {
             .run_jobs()
             .map_err(|err| format!("JavaScript async error: {err}"))?;
 
+        Ok(self.render(value))
+    }
+
+    /// Evaluate a `.tools` entry module and call its exported function with the
+    /// parsed arguments object.
+    ///
+    /// This is the script-tool equivalent of resetting the context and running
+    /// the module body: fresh globals, same `print`/`execute`/result rendering.
+    pub(crate) fn eval_module_call(
+        &mut self,
+        entry: &str,
+        export: &str,
+        arguments: &Value,
+    ) -> Result<String, String> {
+        let ModuleRoot::Tools(sources) = self.root.clone() else {
+            return Err("script session without `.tools` sources".to_owned());
+        };
+        let Some(source) = sources.get(entry).map(str::to_owned) else {
+            return Err(format!("missing tool source `{entry}`"));
+        };
+
+        self.output.try_iter().for_each(drop);
+
+        let path = PathBuf::from(entry);
+        let module = Module::parse(
+            Source::from_bytes(&source).with_path(&path),
+            None,
+            &mut self.context,
+        )
+        .map_err(|err| format!("could not parse `{entry}`: {err}"))?;
+
+        let promise = module.load_link_evaluate(&mut self.context);
+        self.context
+            .run_jobs()
+            .map_err(|err| format!("JavaScript async error: {err}"))?;
+        match promise.state() {
+            PromiseState::Fulfilled(_) => {}
+            PromiseState::Rejected(reason) => {
+                return Err(format!(
+                    "`{entry}` failed to evaluate: {}",
+                    reason.display()
+                ));
+            }
+            PromiseState::Pending => {
+                return Err(format!("`{entry}` did not finish evaluating"));
+            }
+        }
+
+        let namespace = module.namespace(&mut self.context);
+        let function = namespace
+            .get(JsString::from(export), &mut self.context)
+            .map_err(|err| format!("could not read export `{export}`: {err}"))?;
+        let Some(function) = function.as_callable() else {
+            return Err(format!("`{entry}` does not export a callable `{export}`"));
+        };
+
+        let argument = JsValue::from_json(arguments, &mut self.context)
+            .map_err(|err| format!("could not convert tool arguments: {err}"))?;
+        let value = function
+            .call(&JsValue::undefined(), &[argument], &mut self.context)
+            .map_err(|err| format!("`{export}` threw: {err}"))?;
+        self.context
+            .run_jobs()
+            .map_err(|err| format!("JavaScript async error: {err}"))?;
+
+        Ok(self.render(value))
+    }
+
+    /// Printed output followed by the last expression, matching `eval`.
+    fn render(&mut self, value: JsValue) -> String {
         let rendered = value
             .to_string(&mut self.context)
             .map(|text| text.to_std_string_escaped())
             .unwrap_or_else(|_| value.display().to_string());
         let printed = self.output.try_iter().collect::<Vec<_>>().join("\n");
 
-        Ok(match (printed.is_empty(), rendered == "undefined") {
+        match (printed.is_empty(), rendered == "undefined") {
             (true, _) => rendered,
             (false, true) => printed,
             (false, false) => format!("{printed}\n{rendered}"),
-        })
+        }
     }
 
     pub(crate) fn reset(&mut self) -> Result<String, String> {
-        let (context, output) = build_context(self.dispatch.clone())?;
+        let (context, output) = build_context_with(self.dispatch.clone(), self.root.clone())?;
         self.context = context;
         self.output = output;
         Ok("Dropped the whole JavaScript context for this agent. The next evaluation starts fresh."
@@ -334,7 +463,10 @@ fn is_js_identifier(value: &str) -> bool {
     chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '$')
 }
 
-fn build_context(dispatch: Rc<dyn HostDispatch>) -> Result<(JsContext, Receiver<String>), String> {
+fn build_context_with(
+    dispatch: Rc<dyn HostDispatch>,
+    root: ModuleRoot,
+) -> Result<(JsContext, Receiver<String>), String> {
     let (tx, rx) = mpsc::channel();
 
     // SAFETY: the closure only captures an `mpsc::Sender<String>`, which is not
@@ -386,7 +518,10 @@ fn build_context(dispatch: Rc<dyn HostDispatch>) -> Result<(JsContext, Receiver<
     };
 
     let mut context = JsContext::builder()
-        .module_loader(Rc::new(VirtualModuleLoader { host: dispatch }))
+        .module_loader(Rc::new(VirtualModuleLoader {
+            host: dispatch,
+            root,
+        }))
         .build()
         .map_err(|err| format!("failed to create JavaScript context: {err}"))?;
 

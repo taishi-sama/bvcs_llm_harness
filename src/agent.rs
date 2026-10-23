@@ -33,8 +33,9 @@ use crate::{
     js_runtime::{HostCommand, HostRequest, JsChannels, JsEvent, JsRuntimeHandle},
     messages::*,
     tools::{
-        AdvertisedTools, Execution, ToolWorld, advertised_tools, background_setting, execute_tool,
-        find, interpreter_task,
+        AdvertisedTools, Execution, ScriptHostRequest, ScriptRuntime, ScriptTask, ToolSourceCache,
+        ToolWorld, advertised_tools, background_setting, execute_tool, find, interpreter_task,
+        script::DEFAULT_SCRIPT_TIMEOUT,
     },
     transcript::{
         AgentTab, AgentView, CollapsibleText, RetryAgentButton, TextCollapseConfig,
@@ -1457,6 +1458,8 @@ pub(crate) fn execute_tool_calls(
     mut requests: MessageReader<RunToolCalls>,
     mut world: ToolWorld,
     js_handles: Query<&JsRuntimeHandle>,
+    script: Res<ScriptRuntime>,
+    sources: Res<ToolSourceCache>,
     mut rounds: ResMut<ToolRounds>,
     mut finished: MessageWriter<ToolRoundFinished>,
 ) {
@@ -1480,8 +1483,9 @@ pub(crate) fn execute_tool_calls(
             let arguments =
                 serde_json::from_str::<Value>(&call.toolcall_params).unwrap_or(Value::Null);
 
-            match find(&world, &call.tool_name).map(|tool| tool.execution) {
-                Some(Execution::Interpreter) => {
+            let found = find(&world, &call.tool_name);
+            match found {
+                Some(found) if matches!(found.execution, Execution::Interpreter) => {
                     // JavaScript tools run on the agent's own context thread.
                     let supports_background = matches!(
                         call.tool_name.as_str(),
@@ -1528,6 +1532,59 @@ pub(crate) fn execute_tool_calls(
                         Err(err) => {
                             results[call_index] = Some(ToolCallResult {
                                 result: err,
+                                is_error: true,
+                                tool_use_id: call.tool_use_id.clone(),
+                            });
+                            remaining -= 1;
+                        }
+                    }
+                }
+                Some(found) if matches!(found.execution, Execution::Script) => {
+                    let spec = world.scripts.get(found.entity).cloned();
+                    match spec {
+                        Ok(spec) => {
+                            let timeout = spec
+                                .timeout_ms
+                                .map(Duration::from_millis)
+                                .unwrap_or(DEFAULT_SCRIPT_TIMEOUT);
+                            let submitted = script.submit(
+                                request.agent,
+                                ScriptTask {
+                                    sources: sources.0.clone(),
+                                    entry: spec.entry,
+                                    export: spec.export,
+                                    arguments: arguments.clone(),
+                                    timeout,
+                                },
+                            );
+                            match submitted {
+                                Ok(request_id) => {
+                                    rounds.js_requests.insert(
+                                        request_id,
+                                        PendingJsRequest {
+                                            round_id,
+                                            call_index,
+                                            started_at: None,
+                                            auto_background: false,
+                                        },
+                                    );
+                                }
+                                Err(err) => {
+                                    results[call_index] = Some(ToolCallResult {
+                                        result: err,
+                                        is_error: true,
+                                        tool_use_id: call.tool_use_id.clone(),
+                                    });
+                                    remaining -= 1;
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            results[call_index] = Some(ToolCallResult {
+                                result: format!(
+                                    "script tool `{}` is missing its execution data",
+                                    call.tool_name
+                                ),
                                 is_error: true,
                                 tool_use_id: call.tool_use_id.clone(),
                             });
@@ -1604,34 +1661,97 @@ pub(crate) fn poll_js_events(
             continue;
         }
 
-        let Some(pending) = rounds.js_requests.remove(&request) else {
-            // The round was cancelled (or the agent failed) while JavaScript
-            // was still running. Nothing to apply.
-            continue;
+        complete_tool_request(&mut rounds, request, agent, result, &mut finished);
+    }
+}
+
+/// Apply one finished tool request to its round, if the round still exists.
+///
+/// Shared by the agent interpreter and script workers so both complete through
+/// exactly the same bookkeeping.
+pub(crate) fn complete_tool_request(
+    rounds: &mut ToolRounds,
+    request: u64,
+    agent: Entity,
+    result: Result<String, String>,
+    finished: &mut MessageWriter<ToolRoundFinished>,
+) {
+    let Some(pending) = rounds.js_requests.remove(&request) else {
+        // The round was cancelled (or the agent failed) while the call was
+        // still running. Nothing to apply.
+        return;
+    };
+    let round_id = pending.round_id;
+
+    {
+        let Some(round) = rounds.active.get_mut(&round_id) else {
+            return;
         };
-        let round_id = pending.round_id;
-
-        {
-            let Some(round) = rounds.active.get_mut(&round_id) else {
-                continue;
-            };
-            if round.agent != agent {
-                continue;
-            }
-
-            let (text, is_error) = match result {
-                Ok(text) => (text, false),
-                Err(err) => (err, true),
-            };
-            round.results[pending.call_index] = Some(ToolCallResult {
-                result: text,
-                is_error,
-                tool_use_id: round.calls[pending.call_index].tool_use_id.clone(),
-            });
-            round.remaining -= 1;
+        if round.agent != agent {
+            return;
         }
 
-        finish_round_if_ready(&mut rounds, round_id, &mut finished);
+        let (text, is_error) = match result {
+            Ok(text) => (text, false),
+            Err(err) => (err, true),
+        };
+        round.results[pending.call_index] = Some(ToolCallResult {
+            result: text,
+            is_error,
+            tool_use_id: round.calls[pending.call_index].tool_use_id.clone(),
+        });
+        round.remaining -= 1;
+    }
+
+    finish_round_if_ready(rounds, round_id, finished);
+}
+
+/// Drain completions from script workers.
+pub(crate) fn poll_script_events(
+    runtime: Res<ScriptRuntime>,
+    mut rounds: ResMut<ToolRounds>,
+    mut finished: MessageWriter<ToolRoundFinished>,
+) {
+    for event in runtime.drain_events() {
+        complete_tool_request(
+            &mut rounds,
+            event.request,
+            event.agent,
+            event.result,
+            &mut finished,
+        );
+    }
+}
+
+/// Handle `execute(...)` and module reads coming from script workers.
+pub(crate) fn poll_script_host_requests(runtime: Res<ScriptRuntime>, mut world: ToolWorld) {
+    for request in runtime.drain_host_requests() {
+        let ScriptHostRequest {
+            agent: agent_entity,
+            command,
+            reply,
+        } = request;
+
+        let (result, is_error) = match world.agents.get(agent_entity) {
+            Ok(agent) => {
+                let source_name = agent.name().to_owned();
+                match command {
+                    HostCommand::Tool { name, arguments } => {
+                        execute_tool(&mut world, &name, &arguments, agent_entity, &source_name)
+                    }
+                    HostCommand::ReadFile { path } => match world.fs.read(&path) {
+                        Ok(content) => (content, false),
+                        Err(err) => (err, true),
+                    },
+                }
+            }
+            Err(_) => (
+                format!("agent entity {agent_entity} no longer exists"),
+                true,
+            ),
+        };
+
+        let _ = reply.send(if is_error { Err(result) } else { Ok(result) });
     }
 }
 

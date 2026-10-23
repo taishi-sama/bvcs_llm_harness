@@ -17,6 +17,9 @@ const MAX_SEED_FILE: u64 = 1024 * 1024;
 #[derive(Default)]
 pub(crate) struct ToolsTree {
     files: BTreeMap<String, String>,
+    /// Bumped on every mutation so module-source snapshots can tell when they
+    /// are stale.
+    revision: u64,
     /// Paths whose mirror may be stale. Deleted paths stay here until a flush
     /// confirms the file is gone.
     dirty: BTreeSet<String>,
@@ -29,6 +32,10 @@ impl ToolsTree {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.files.is_empty()
+    }
+
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision
     }
 
     /// Sorted `(relative path, contents)` pairs.
@@ -48,6 +55,7 @@ impl ToolsTree {
     pub(crate) fn write(&mut self, relative: &str, content: String) {
         self.files.insert(relative.to_owned(), content);
         self.dirty.insert(relative.to_owned());
+        self.revision = self.revision.wrapping_add(1);
     }
 
     pub(crate) fn delete(&mut self, relative: &str) -> Result<usize, String> {
@@ -56,6 +64,7 @@ impl ToolsTree {
             .remove(relative)
             .ok_or_else(|| format!("No such file: `{relative}`"))?;
         self.dirty.insert(relative.to_owned());
+        self.revision = self.revision.wrapping_add(1);
         Ok(removed.len())
     }
 
@@ -71,6 +80,7 @@ impl ToolsTree {
     pub(crate) fn seed_from_dir(&mut self, root: &Path) -> Result<usize, String> {
         self.files.clear();
         self.dirty.clear();
+        self.revision = self.revision.wrapping_add(1);
         if !root.exists() {
             return Ok(0);
         }

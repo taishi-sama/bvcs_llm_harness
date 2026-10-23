@@ -38,6 +38,8 @@ pub(crate) enum Execution {
     Inline(ToolFn),
     /// Submitted to the agent's JavaScript thread and completed later.
     Interpreter,
+    /// Submitted to a fresh `.tools` context and completed later.
+    Script,
 }
 
 /// Whether a tool may only be reached by naming it explicitly.
@@ -86,6 +88,9 @@ pub(crate) struct ModelOnly;
 /// so `&mut ToolWorld` is free of the registry borrow.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Found {
+    /// The tool entity, for execution kinds that carry their own data
+    /// (`ScriptTool`).
+    pub entity: Entity,
     pub execution: Execution,
     /// Used by the origin checks that replace the old name-based routing.
     #[allow(dead_code, reason = "consumed by the gateway/origin checks")]
@@ -102,8 +107,9 @@ pub(crate) fn find(world: &ToolWorld<'_, '_>, name: &str) -> Option<Found> {
     world
         .tools
         .iter()
-        .find_map(|(entry, advertised, disabled, model_only)| {
+        .find_map(|(entity, entry, advertised, disabled, model_only)| {
             (entry.definition.name == name).then_some(Found {
+                entity,
                 execution: entry.execution,
                 availability: entry.availability,
                 advertised,

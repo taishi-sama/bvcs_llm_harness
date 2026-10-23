@@ -9,6 +9,7 @@
 
 pub(crate) mod manifest;
 pub(crate) mod mirror;
+pub(crate) mod script;
 pub(crate) mod tree;
 
 mod agent_tools;
@@ -36,6 +37,7 @@ pub(crate) use mirror::{
     MirrorDebounce, MirrorStatus, ToolsDir, flush_tool_mirror, seed_tool_tree,
 };
 pub(crate) use registry::{CallContext, Execution, find, register_static_tools};
+pub(crate) use script::{ScriptHostRequest, ScriptRuntime, ScriptTask, ToolSourceCache};
 pub(crate) use world::ToolWorld;
 
 /// Build the interpreter task for one JavaScript tool call.
@@ -833,6 +835,10 @@ pub(crate) fn execute_tool(
         Execution::Inline(handler) => handler(world, arguments, &call),
         Execution::Interpreter => (
             format!("tool `{name}` must run in the JavaScript interpreter"),
+            true,
+        ),
+        Execution::Script => (
+            format!("tool `{name}` must run as a script tool call"),
             true,
         ),
     }

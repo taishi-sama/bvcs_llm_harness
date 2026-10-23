@@ -54,8 +54,8 @@ pub(crate) fn search_tools(
     let mut hits: Vec<&ToolEntry> = world
         .tools
         .iter()
-        .filter(|(_, _, disabled, _)| disabled.is_none())
-        .filter(|(entry, _, _, _)| match regex.as_ref() {
+        .filter(|(_, _, _, disabled, _)| disabled.is_none())
+        .filter(|(_, entry, _, _, _)| match regex.as_ref() {
             None => true,
             Some(regex) => {
                 regex.is_match(&entry.definition.name)
@@ -67,7 +67,7 @@ pub(crate) fn search_tools(
                             .is_some_and(|text| regex.is_match(text)))
             }
         })
-        .map(|(entry, _, _, _)| entry)
+        .map(|(_, entry, _, _, _)| entry)
         .collect();
 
     hits.sort_by(|a, b| {

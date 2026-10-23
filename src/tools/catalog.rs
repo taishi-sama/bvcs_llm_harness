@@ -13,8 +13,7 @@ use serde_json::Value;
 use crate::{
     tools::{
         definitions,
-        registry::{Advertised, Availability, CallContext, DisabledTool, Execution, ToolEntry},
-        world::ToolWorld,
+        registry::{Advertised, Availability, DisabledTool, Execution, ToolEntry},
     },
     virtual_fs::VirtualFs,
 };
@@ -151,14 +150,17 @@ pub(crate) fn register_script_tools(vfs: Res<VirtualFs>, mut commands: Commands)
         commands.spawn((
             ToolEntry {
                 definition: spec.definition,
-                execution: Execution::Inline(script_unavailable),
+                execution: Execution::Script,
                 availability: Availability::AnyWay,
                 order: 1000 + spec.order,
                 tags: &["script"],
             },
-            DisabledTool {
-                reason: "script execution is not wired yet",
+            crate::tools::script::ScriptTool {
+                entry: spec.entry,
+                export: spec.export,
+                timeout_ms: spec.timeout_ms,
             },
+            Advertised,
         ));
     }
 
@@ -168,14 +170,6 @@ pub(crate) fn register_script_tools(vfs: Res<VirtualFs>, mut commands: Commands)
             libraries.len()
         );
     }
-}
-
-fn script_unavailable(
-    _world: &mut ToolWorld<'_, '_>,
-    _arguments: &Value,
-    _call: &CallContext<'_>,
-) -> (String, bool) {
-    ("script tools cannot run yet".to_owned(), true)
 }
 
 /// Every static tool, ready to be spawned.

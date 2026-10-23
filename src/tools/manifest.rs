@@ -210,6 +210,59 @@ pub(crate) fn scan_tools(tree: &ToolsTree, warnings: &mut Vec<String>) -> Vec<Sc
     specs
 }
 
+/// Resolve each top-level directory to its entry module for the script-tool
+/// module resolver. Manifests win; otherwise `index.js` then `main.js`.
+pub(crate) fn entry_index(tree: &ToolsTree) -> HashMap<String, String> {
+    let mut index = HashMap::new();
+
+    for (path, content) in tree.iter() {
+        if let Some(directory) = path.strip_suffix("/tool.json")
+            && !directory.contains('/')
+        {
+            if let Ok(raw) = serde_json::from_str::<RawTool>(content) {
+                let entry = format!("{directory}/{}", raw.entry);
+                if tree.read(&entry).is_ok() {
+                    index.insert(directory.to_owned(), entry);
+                }
+            }
+            continue;
+        }
+        if let Some(directory) = path.strip_suffix("/library.json")
+            && !directory.contains('/')
+            && let Ok(raw) = serde_json::from_str::<RawLibrary>(content)
+        {
+            let entry = format!("{directory}/{}", raw.entry);
+            if tree.read(&entry).is_ok() {
+                index.insert(directory.to_owned(), entry);
+            }
+        }
+    }
+
+    let mut directories: Vec<String> = tree
+        .iter()
+        .filter_map(|(path, _)| {
+            path.split_once('/')
+                .map(|(directory, _)| directory.to_owned())
+        })
+        .collect();
+    directories.sort_unstable();
+    directories.dedup();
+    for directory in directories {
+        if index.contains_key(&directory) {
+            continue;
+        }
+        for name in ["index.js", "main.js"] {
+            let entry = format!("{directory}/{name}");
+            if tree.read(&entry).is_ok() {
+                index.insert(directory, entry);
+                break;
+            }
+        }
+    }
+
+    index
+}
+
 /// Scan `library.json` manifests. Libraries have no entry in the model's tool
 /// list; they are importable from tool scripts.
 pub(crate) fn scan_libraries(tree: &ToolsTree, warnings: &mut Vec<String>) -> Vec<LibrarySpec> {
