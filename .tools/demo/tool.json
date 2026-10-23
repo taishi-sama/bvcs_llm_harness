@@ -1,0 +1,7 @@
+{
+  "name": "demo",
+  "description": "Demo script tool used to verify the .tools scan.",
+  "parameters": {
+    "message": {"type": "string", "description": "Text to echo"}
+  }
+}
