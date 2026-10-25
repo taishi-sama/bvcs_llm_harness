@@ -1,8 +1,32 @@
 //! Bevy messages shared by the transport, agent, and UI layers.
 
-use bevy::prelude::{Entity, Message};
+use bevy::prelude::{App, Entity, Message, Plugin};
 use llm_api::{stream::StreamEvent, usage::Usage};
 use llm_history_model::history::{Entry, ToolCall, ToolCallResult};
+
+/// Registers the complete message protocol exactly once.
+pub(crate) struct MessagesPlugin;
+
+impl Plugin for MessagesPlugin {
+    fn build(&self, app: &mut App) {
+        app.add_message::<StartAgentTurn>()
+            .add_message::<NewAgentRequested>()
+            .add_message::<CancelAgentRequest>()
+            .add_message::<RetryAgentTurn>()
+            .add_message::<StreamChunk>()
+            .add_message::<StreamEnded>()
+            .add_message::<StreamFailed>()
+            .add_message::<AgentStreamEvent>()
+            .add_message::<AgentTurnFinished>()
+            .add_message::<AgentFailed>()
+            .add_message::<RunToolCalls>()
+            .add_message::<ToolRoundFinished>()
+            .add_message::<SendAgentMessage>()
+            .add_message::<RemoveAgentRequest>()
+            .add_message::<RenameAgentRequest>()
+            .add_message::<TaskResult>();
+    }
+}
 
 /// Ask the agent coordinator to start a request for the current history.
 #[derive(Message)]

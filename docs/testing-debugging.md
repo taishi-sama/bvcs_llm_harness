@@ -54,6 +54,10 @@ The app registers `bevy_brp_extras`. With the MCP tools available:
    round), then screenshot again.
 7. `brp_shutdown({ app_name: "bvcs_llm_harness" })` when done.
 
+For chat control without touching the UI, use `brp_execute` with the
+`harness/*` methods documented in `docs/configuration.md`: list agents, read or
+switch the active agent, send a message, and fetch history.
+
 BRP launches log to `/tmp/bevy_brp_mcp_bvcs_llm_harness_port15702_*.log`; startup
 registration lines (`seeded N tool file(s)`, `registered script tool …`) are
 there. `RUST_LOG=info` in the app is the same stream.
@@ -66,10 +70,12 @@ Without MCP, the equivalent check is `cargo run` plus reading that log.
   failures, prompt-cache regressions, and rollbacks, including
   `previous_history`.
 - `brp_status`, `world_query`, `world_get_resources`, and
-  `brp_extras_get_diagnostics` inspect the live app. Reflected resources are
-  visible; most domain types are not `Reflect` yet, so logs are the fallback.
+  `brp_extras_get_diagnostics` inspect the live app. `AgentView`/`AssistantView`,
+  `ActiveAgent`, the agent UI markers, `TextCollapseConfig`,
+  `ToolRegistryStatus`, and `MirrorStatus` are reflected; agent conversation
+  data is available through `harness/list_agents` and `harness/get_history`.
 - Tool registry health is in `ToolRegistryStatus` (registered/broken/report).
-  It is not surfaced in the UI yet; read it over BRP once it is reflected.
+  It is not surfaced in the UI yet; read it over BRP.
 
 ## Debugging a tool call
 

@@ -104,8 +104,14 @@ agent does not “fix” a decision by accident.
 
 ### Tooling and UI
 
-- `ToolRegistryStatus` (registered/broken/report) is a resource only; it is not
-  shown in the UI yet and is not `Reflect`ed for BRP.
+- `ToolRegistryStatus` (registered/broken/report) and `MirrorStatus` are
+  reflected resources, so BRP can inspect them; they are still not shown in the
+  UI.
+- `Agent`, `AgentIndex`, and `AppConfig` are not reflected. Their fields include
+  provider/history types and the API token; agent state is exposed through the
+  `harness/*` BRP methods instead.
+- Buttons carry `Hovered` and a hover outline, but there is no hover-driven
+  background/border styling beyond that outline.
 - `CallContext.root` is carried but unused by handlers; it exists for future
   per-call accounting.
 - `ToolEntry.tags`, `Found.availability`, `Found.advertised`, and

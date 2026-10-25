@@ -2,7 +2,9 @@
 
 use bevy::{
     input_focus::tab_navigation::{TabGroup, TabIndex},
+    picking::hover::Hovered,
     prelude::*,
+    ui::Outline,
     ui_widgets::{Activate, Button},
 };
 
@@ -13,6 +15,15 @@ use crate::{
     virtual_fs::{VfsStateDir, VirtualFs},
 };
 
+/// Top-level shell: window layout, static controls, and the first agent.
+pub(crate) struct ShellPlugin;
+
+impl Plugin for ShellPlugin {
+    fn build(&self, app: &mut App) {
+        app.add_systems(Startup, setup);
+    }
+}
+
 fn spawn_action_button(
     commands: &mut Commands,
     label: &str,
@@ -22,6 +33,8 @@ fn spawn_action_button(
     commands
         .spawn((
             Button,
+            Hovered::default(),
+            Outline::new(px(2.), px(2.), Color::NONE),
             Node {
                 min_width: px(92.),
                 height: px(30.),
@@ -195,6 +208,8 @@ pub(crate) fn setup(mut commands: Commands, config: Res<AppConfig>, storage: Res
     let plus = commands
         .spawn((
             Button,
+            Hovered::default(),
+            Outline::new(px(2.), px(2.), Color::NONE),
             Node {
                 min_width: px(38.),
                 height: px(34.),

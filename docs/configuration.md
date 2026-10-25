@@ -71,6 +71,25 @@ The connector example uses the same variables.
 plugin's env var). It exposes world inspection and input simulation, which is
 how the app is driven in tests — see `docs/testing-debugging.md`.
 
+The app also registers `harness/*` methods for agent chat control:
+
+| Method | Parameters | Effect |
+| --- | --- | --- |
+| `harness/list_agents` | — | Every agent, sorted by name, with entity, active/pending state, turn id, and history length |
+| `harness/get_active_agent` | — | The active agent, or `null` |
+| `harness/set_active_agent` | `agent` name or `entity` id | Moves `ActiveAgent`, opening/closing the panel through the normal observers |
+| `harness/send_message` | `message`, optional `agent`/`entity`, `from`, `verbatim` | Queues a `SendAgentMessage` for the target (active agent by default) |
+| `harness/get_history` | optional `agent`/`entity`, `position`, `amount` | History window with type, sender, index, and the raw entry |
+
+`send_message` defaults `verbatim` to `true`, so the text appears exactly as a
+user message; `from` only matters when `verbatim` is `false`, which uses the
+cross-agent envelope. `get_history` defaults to the last 20 entries, caps
+`amount` at 1000, accepts negative `position` to count from the end, and reports
+the returned `start`/`end` plus the total history length.
+
+These reuse the same `activate_agent`, `SendAgentMessage`, and `history_view`
+paths as the UI and tools.
+
 ## Logging
 
 `RUST_LOG=info` shows startup registration, mirror seeding, and rescan

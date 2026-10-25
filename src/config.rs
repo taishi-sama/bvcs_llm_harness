@@ -2,7 +2,7 @@
 
 use std::env;
 
-use bevy::prelude::Resource;
+use bevy::prelude::{App, Plugin, Resource};
 use llm_api::{model_config::ModelKind, usage::UsageProvider};
 
 /// Which server-side streaming API to exercise.
@@ -72,10 +72,34 @@ pub(crate) struct AppConfig {
 }
 
 impl AppConfig {
+    /// Build the global configuration from the process environment.
+    pub(crate) fn from_env() -> Self {
+        let provider = Provider::from_env();
+        let model_name = env::var("MODEL").unwrap_or_else(|_| "qwen3.6-35b-a3b".to_owned());
+        let endpoint = env::var("ENDPOINT").unwrap_or_else(|_| provider.endpoint().to_owned());
+        let token = env::var("API_TOKEN").unwrap_or_default();
+        Self {
+            provider,
+            model_name,
+            endpoint,
+            token,
+            session_id: session_id_from_env(),
+        }
+    }
+
     /// Returns the token for an `Authorization: Bearer <token>` header.
     pub(crate) fn bearer_token(&self) -> Option<&str> {
         let token = self.token.trim();
         (!token.is_empty()).then_some(token)
+    }
+}
+
+/// Installs the environment-derived [`AppConfig`].
+pub(crate) struct ConfigPlugin;
+
+impl Plugin for ConfigPlugin {
+    fn build(&self, app: &mut App) {
+        app.insert_resource(AppConfig::from_env());
     }
 }
 

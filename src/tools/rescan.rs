@@ -85,7 +85,8 @@ impl RescanReport {
 }
 
 /// Registry health, exposed to the UI and BRP.
-#[derive(Resource, Default, Clone)]
+#[derive(Resource, Default, Clone, Reflect)]
+#[reflect(Resource)]
 pub(crate) struct ToolRegistryStatus {
     pub revision: u64,
     pub registered: usize,

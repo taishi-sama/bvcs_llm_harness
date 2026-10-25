@@ -24,17 +24,22 @@ mod world;
 
 use std::collections::HashMap;
 
-use bevy::prelude::Query;
+use bevy::{
+    ecs::schedule::IntoScheduleConfigs,
+    prelude::{App, Plugin, PreStartup, Query, Update},
+};
 use llm_api::generic_tool::{ParameterDescription, ParameterType, Tool};
 use llm_history_model::history::Entry;
 use serde_json::Value;
 
 use crate::{
+    AppSet,
     agent::{Agent, AgentIndex},
     js_runtime::JsTask,
     virtual_fs::VirtualFs,
 };
 
+pub(crate) use agent_tools::history_view;
 pub(crate) use catalog::{AdvertisedTools, advertised_tools, register_script_tools};
 pub(crate) use mirror::{
     MirrorDebounce, MirrorStatus, ToolsDir, flush_tool_mirror, seed_tool_tree,
@@ -44,6 +49,39 @@ pub(crate) use rescan::{ToolRegistryStatus, reconcile_script_tools};
 pub(crate) use schedule::background_started_message;
 pub(crate) use script::{ScriptHostRequest, ScriptRuntime, ScriptTask, ToolSourceCache};
 pub(crate) use world::ToolWorld;
+
+/// Tool catalog, execution resources, and the cross-thread tool pipeline.
+pub(crate) struct ToolsPlugin;
+
+impl Plugin for ToolsPlugin {
+    fn build(&self, app: &mut App) {
+        app.init_resource::<ToolsDir>()
+            .init_resource::<MirrorStatus>()
+            .init_resource::<MirrorDebounce>()
+            .init_resource::<ScriptRuntime>()
+            .init_resource::<ToolSourceCache>()
+            .init_resource::<ToolRegistryStatus>()
+            .init_resource::<schedule::ToolRounds>()
+            .init_resource::<schedule::AutoBackgroundPolicy>()
+            .add_systems(
+                PreStartup,
+                (seed_tool_tree, register_static_tools, register_script_tools).chain(),
+            )
+            .add_systems(
+                Update,
+                script::refresh_tool_sources.in_set(AppSet::ToolSources),
+            )
+            .add_systems(
+                Update,
+                schedule::auto_background_long_calls.in_set(AppSet::AutoBackground),
+            )
+            .add_systems(Update, flush_tool_mirror.in_set(AppSet::MirrorFlush))
+            .add_systems(
+                Update,
+                reconcile_script_tools.in_set(AppSet::ReconcileTools),
+            );
+    }
+}
 
 /// The tools handled by the agent's persistent JavaScript thread.
 ///

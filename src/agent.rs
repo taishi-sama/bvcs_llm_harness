@@ -9,6 +9,7 @@ use std::{
 };
 
 use bevy::{
+    ecs::schedule::IntoScheduleConfigs,
     input_focus::{FocusCause, InputFocus},
     log::error,
     prelude::*,
@@ -28,6 +29,7 @@ use serde_json::Value;
 use tokio::sync::watch;
 
 use crate::{
+    AppSet,
     config::{AppConfig, Provider},
     js_runtime::{HostCommand, HostRequest, JsChannels, JsEvent, JsRuntimeHandle},
     messages::*,
@@ -58,6 +60,75 @@ use crate::transcript::{
 
 /// Prevent accidental runaway agent spawning from exhausting UI/VRAM.
 pub(crate) const MAX_AGENTS: usize = 64;
+
+/// Agent state, turn loop, and the systems that drive them.
+///
+/// Requires `ShellPlugin` to have run its `Startup` setup for `AgentLayout`
+/// (the tab/panel roots).
+pub(crate) struct AgentPlugin;
+
+impl Plugin for AgentPlugin {
+    fn build(&self, app: &mut App) {
+        app.init_resource::<AgentRuntime>()
+            .init_resource::<AgentIndex>()
+            .add_observer(index_agent_on_insert)
+            .add_observer(index_agent_on_discard)
+            .add_observer(deactivate_removed_agent)
+            .add_systems(
+                Update,
+                (
+                    create_requested_agents,
+                    sync_retry_buttons,
+                    cancel_agent_turn,
+                    retry_agent_turn,
+                    submit_input,
+                    deliver_pending_messages,
+                )
+                    .chain()
+                    .in_set(AppSet::Input),
+            )
+            .add_systems(
+                Update,
+                (
+                    decode_stream_chunks,
+                    handle_stream_events,
+                    handle_turn_finished,
+                )
+                    .chain()
+                    .in_set(AppSet::Turn),
+            )
+            .add_systems(
+                Update,
+                (poll_js_events, poll_script_events, handle_task_result)
+                    .chain()
+                    .in_set(AppSet::PollEvents),
+            )
+            .add_systems(
+                Update,
+                (poll_js_host_requests, poll_script_host_requests)
+                    .chain()
+                    .in_set(AppSet::HostRequests),
+            )
+            .add_systems(Update, execute_tool_calls.in_set(AppSet::ExecuteTools))
+            .add_systems(Update, apply_tool_results.in_set(AppSet::ApplyResults))
+            .add_systems(
+                Update,
+                handle_send_agent_message.in_set(AppSet::SendAgentMessage),
+            )
+            .add_systems(
+                Update,
+                (start_agent_turn, handle_agent_failed)
+                    .chain()
+                    .in_set(AppSet::Resume),
+            )
+            .add_systems(
+                Update,
+                (rename_agents, remove_agents)
+                    .chain()
+                    .in_set(AppSet::AgentMaintenance),
+            );
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Agent components
@@ -168,6 +239,27 @@ impl Agent {
     /// Agent title as shown in tabs and used for cross-agent lookups.
     pub(crate) fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Whether a request is currently in flight.
+    pub(crate) fn is_pending(&self) -> bool {
+        self.pending
+    }
+
+    /// Turn id currently in flight, if any.
+    pub(crate) fn current_turn(&self) -> Option<u64> {
+        self.current_turn
+    }
+
+    /// Last unanswered user message, retained for Retry.
+    pub(crate) fn retry_message(&self) -> Option<&str> {
+        self.retry_message.as_deref()
+    }
+
+    /// Number of messages waiting for the next legal history boundary.
+    #[cfg(test)]
+    pub(crate) fn pending_message_count(&self) -> usize {
+        self.pending_messages.len()
     }
 
     /// Full conversation history, including the system prompt.
@@ -388,7 +480,8 @@ pub(crate) struct AgentLayout {
 ///
 /// The menu panel and all transcript cards live only while this component is
 /// present. Insert/remove observers in [`crate::transcript`] own that lifetime.
-#[derive(Component)]
+#[derive(Component, Reflect)]
+#[reflect(Component)]
 pub(crate) struct ActiveAgent;
 
 /// Move the active-agent marker to `next` (or clear it when `next` is `None`).
@@ -737,7 +830,7 @@ pub(crate) fn submit_input(
     if !keyboard.just_pressed(KeyCode::Enter) {
         return;
     }
-    let Some(agent_entity) = active.iter().next() else {
+    let Ok(agent_entity) = active.single() else {
         return;
     };
     let Ok((mut agent, view)) = agents.get_mut(agent_entity) else {

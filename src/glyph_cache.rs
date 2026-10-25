@@ -27,6 +27,17 @@ const DEFAULT_MAX_MB: u64 = 32;
 const DEFAULT_CHECK_INTERVAL_MS: u64 = 250;
 const DEFAULT_COOLDOWN_MS: u64 = 1_000;
 
+/// Installs the font-atlas limiter.
+pub(crate) struct GlyphCachePlugin;
+
+impl Plugin for GlyphCachePlugin {
+    fn build(&self, app: &mut App) {
+        app.init_resource::<GlyphCacheLimit>()
+            .add_systems(Startup, log_glyph_cache_limit)
+            .add_systems(Update, limit_glyph_cache);
+    }
+}
+
 /// Runtime limits for the shared font atlas cache.
 #[derive(Resource)]
 pub(crate) struct GlyphCacheLimit {

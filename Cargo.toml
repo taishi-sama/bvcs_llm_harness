@@ -18,6 +18,7 @@ futures-util = "0.3.34"
 llm_api = { path = "crates/llm_api" }
 llm_history_model = { path = "crates/llm_history_model" }
 bevy_brp_extras = "0.23.0"
+bevy_remote = "0.20.0"
 reqwest = { version = "0.13.4", features = ["json", "stream"] }
 serde_json = "1.0.151"
 serde = { version = "1", features = ["derive"] }

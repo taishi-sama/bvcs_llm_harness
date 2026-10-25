@@ -48,7 +48,7 @@ synchronous tools ends with the shared `tool_handlers!` macro from
 tools both spawn through `registry::spawn_tool`, so the `Advertised` and
 `ModelOnly` markers cannot drift between them.
 
-Registration runs in `PreStartup` (`src/main.rs`):
+Registration runs in `PreStartup` (`ToolsPlugin` in `src/tools.rs`):
 
 ```
 seed_tool_tree          // read ./.tools into VirtualFs::tools (no mirror writes)

@@ -31,7 +31,7 @@ use std::{
 
 use bevy::{
     log::{debug, error},
-    prelude::{Component, Discard, Entity, Insert, On, Query, Resource},
+    prelude::{App, Component, Discard, Entity, Insert, On, Plugin, Query, Resource},
 };
 use boa_engine::{
     Context as JsContext, JsNativeError, JsResult, JsString, JsValue, Module, NativeFunction,
@@ -42,7 +42,22 @@ use boa_engine::{
 };
 use serde_json::{Map as JsonMap, Value};
 
-use crate::tools::script::{ToolSources, resolve_module};
+use crate::{
+    agent::attach_js_runtime,
+    tools::script::{ToolSources, resolve_module},
+};
+
+/// Owns the global JS channels and the per-agent context-thread lifecycle.
+pub(crate) struct JsRuntimePlugin;
+
+impl Plugin for JsRuntimePlugin {
+    fn build(&self, app: &mut App) {
+        app.init_resource::<JsChannels>()
+            .add_observer(attach_js_runtime)
+            .add_observer(start_js_runtime)
+            .add_observer(stop_js_runtime);
+    }
+}
 
 /// Where a context's `import` specifiers resolve.
 #[derive(Clone)]

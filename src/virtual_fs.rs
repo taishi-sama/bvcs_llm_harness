@@ -6,13 +6,23 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use bevy::prelude::Resource;
+use bevy::prelude::{App, Plugin, Resource};
 use regex::Regex;
 
 use crate::{
     tools::tree::ToolsTree,
     vfs_path::{Mount, VfsPath},
 };
+
+/// Owns the in-memory filesystem and its Save/Load directory.
+pub(crate) struct VirtualFsPlugin;
+
+impl Plugin for VirtualFsPlugin {
+    fn build(&self, app: &mut App) {
+        app.init_resource::<VirtualFs>()
+            .init_resource::<VfsStateDir>();
+    }
+}
 
 /// Snapshot folder used by the Save/Load VFS buttons.
 ///

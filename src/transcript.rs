@@ -7,26 +7,65 @@
 use std::{collections::HashMap, env};
 
 use bevy::{
+    ecs::schedule::IntoScheduleConfigs,
     input::mouse::MouseScrollUnit,
     input_focus::{FocusCause, InputFocus, tab_navigation::TabIndex},
-    picking::events::{PointerClick, PointerScroll},
+    picking::{
+        events::{PointerClick, PointerScroll},
+        hover::Hovered,
+    },
     prelude::*,
     text::{EditableText, TextCursorStyle},
+    ui::{Outline, UiSystems},
     ui_widgets::{Activate, Button, TextInput},
 };
 use llm_api::{usage::Usage, wire_common::thinking_joined};
 use llm_history_model::history::{Entry, Thinking, ToolCallResult};
 
 use crate::{
+    AppSet,
     agent::{ActiveAgent, Agent, AgentLayout},
     messages::{CancelAgentRequest, RemoveAgentRequest, RetryAgentTurn},
     tool_display::{PresentedCall, ToolPresentation, present_call},
     tools::schedule::ToolRounds,
 };
 
+/// Transcript rendering, panels, collapsibles, and scrolling.
+pub(crate) struct TranscriptPlugin;
+
+impl Plugin for TranscriptPlugin {
+    fn build(&self, app: &mut App) {
+        app.init_resource::<TextCollapseConfig>()
+            .add_observer(open_active_agent_menu)
+            .add_observer(close_active_agent_menu)
+            .add_systems(Update, update_tool_activity.in_set(AppSet::ToolActivity))
+            .add_systems(Update, refresh_transcripts.in_set(AppSet::Transcripts))
+            .add_systems(PostUpdate, update_hover_outline)
+            .add_systems(PostUpdate, auto_scroll.after(UiSystems::Layout));
+    }
+}
+
+/// Brighten the outline of any button whose hover state changed.
+#[allow(
+    clippy::type_complexity,
+    reason = "the filter is part of the system contract"
+)]
+fn update_hover_outline(
+    mut buttons: Query<(&Hovered, &mut Outline), (With<Button>, Changed<Hovered>)>,
+) {
+    for (hovered, mut outline) in &mut buttons {
+        outline.color = if hovered.0 {
+            Color::srgb(0.45, 0.62, 0.88)
+        } else {
+            Color::NONE
+        };
+    }
+}
+
 /// Truncation limits for long reasoning and tool-call bodies. A body collapses
 /// when it exceeds either limit.
-#[derive(Resource, Clone, Debug)]
+#[derive(Resource, Clone, Debug, Reflect)]
+#[reflect(Resource)]
 pub(crate) struct TextCollapseConfig {
     pub(crate) max_chars: usize,
     pub(crate) max_lines: usize,
@@ -51,7 +90,8 @@ fn env_limit(name: &str) -> Option<usize> {
 }
 
 /// Entity handles for one agent's UI.
-#[derive(Component)]
+#[derive(Component, Reflect)]
+#[reflect(Component)]
 pub(crate) struct AgentView {
     pub(crate) panel: Entity,
     pub(crate) log: Entity,
@@ -97,7 +137,7 @@ impl AgentView {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Reflect)]
 pub(crate) struct AssistantView {
     pub(crate) card: Entity,
     pub(crate) thinking_container: Entity,
@@ -106,19 +146,22 @@ pub(crate) struct AssistantView {
 }
 
 /// The visible agent tab for [`Agent`].
-#[derive(Component)]
+#[derive(Component, Reflect)]
+#[reflect(Component)]
 pub(crate) struct AgentTab {
     pub(crate) agent: Entity,
 }
 
 /// Retry button belonging to one agent.
-#[derive(Component)]
+#[derive(Component, Reflect)]
+#[reflect(Component)]
 pub(crate) struct RetryAgentButton {
     pub(crate) agent: Entity,
 }
 
 /// Destructive button that removes the agent it belongs to.
-#[derive(Component)]
+#[derive(Component, Reflect)]
+#[reflect(Component)]
 pub(crate) struct KillAgentButton {
     pub(crate) agent: Entity,
 }
@@ -426,6 +469,8 @@ pub(crate) fn create_agent_panel(
     let retry = commands
         .spawn((
             Button,
+            Hovered::default(),
+            Outline::new(px(2.), px(2.), Color::NONE),
             RetryAgentButton { agent },
             Node {
                 min_width: px(82.),
@@ -462,6 +507,8 @@ pub(crate) fn create_agent_panel(
     let stop = commands
         .spawn((
             Button,
+            Hovered::default(),
+            Outline::new(px(2.), px(2.), Color::NONE),
             Node {
                 min_width: px(82.),
                 height: px(46.),
@@ -497,6 +544,8 @@ pub(crate) fn create_agent_panel(
     let kill = commands
         .spawn((
             Button,
+            Hovered::default(),
+            Outline::new(px(2.), px(2.), Color::NONE),
             KillAgentButton { agent },
             Node {
                 min_width: px(82.),
@@ -537,6 +586,8 @@ pub(crate) fn create_agent_panel(
     let scroll_to_bottom = commands
         .spawn((
             Button,
+            Hovered::default(),
+            Outline::new(px(2.), px(2.), Color::NONE),
             Node {
                 min_width: px(140.),
                 height: px(28.),
@@ -776,6 +827,8 @@ pub(crate) fn create_agent_tab(
     let tab = commands
         .spawn((
             Button,
+            Hovered::default(),
+            Outline::new(px(2.), px(2.), Color::NONE),
             AgentTab { agent },
             Node {
                 min_width: px(84.),
@@ -1813,6 +1866,29 @@ mod display_tests {
         assert_eq!(
             world.get::<Text>(assistant.thinking_body).unwrap().0,
             "reasoning"
+        );
+    }
+
+    #[test]
+    fn hover_state_toggles_button_outline() {
+        let mut app = App::new();
+        app.add_systems(Update, update_hover_outline);
+
+        let button = app
+            .world_mut()
+            .spawn((Button, Hovered(true), Outline::default()))
+            .id();
+        app.update();
+        assert_ne!(
+            app.world().get::<Outline>(button).unwrap().color,
+            Color::NONE
+        );
+
+        app.world_mut().entity_mut(button).insert(Hovered(false));
+        app.update();
+        assert_eq!(
+            app.world().get::<Outline>(button).unwrap().color,
+            Color::NONE
         );
     }
 

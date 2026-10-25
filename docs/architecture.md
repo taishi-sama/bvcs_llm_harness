@@ -49,9 +49,22 @@ Key resources:
 | `GlyphCacheLimit` | font atlas budget |
 | `JsChannels` | global interpreter channels and request ids |
 
-## Schedules
+## Plugins and schedules
 
-`main.rs` registers two chained `Update` groups, in this order:
+`src/main.rs` only assembles domain plugins:
+
+```
+ConfigPlugin → MessagesPlugin → VirtualFsPlugin → GlyphCachePlugin →
+JsRuntimePlugin → AgentPlugin → ToolsPlugin → TranscriptPlugin → ShellPlugin →
+HarnessBrpPlugin → BrpExtrasPlugin
+```
+
+Each plugin owns its resources, observers, messages, and systems. Cross-plugin
+ordering lives in one place: `AppSet` in `src/sets.rs`, chained once by
+`configure_update_sets`. Adding a phase means adding one enum variant, one line
+in the chain, and `.in_set(...)` on the systems in that phase. `ShellPlugin`
+creates the shared `AgentLayout` that `AgentPlugin` consumes; the BRP plugin
+depends on resources owned by `AgentPlugin`/`MessagesPlugin`.
 
 ```
 PreStartup:
@@ -60,25 +73,21 @@ PreStartup:
 Startup:
   setup (UI), log_glyph_cache_limit
 
-Update group A (turn/input path):
-  create_requested_agents, sync_retry_buttons, cancel_agent_turn,
-  retry_agent_turn, submit_input, deliver_pending_messages,
-  decode_stream_chunks, handle_stream_events, handle_turn_finished
-
-Update group B (async/tool path):
-  refresh_tool_sources, poll_js_events, poll_script_events,
-  handle_task_result, poll_js_host_requests, poll_script_host_requests,
-  execute_tool_calls, auto_background_long_calls, apply_tool_results,
-  update_tool_activity, flush_tool_mirror, handle_send_agent_message,
-  reconcile_script_tools, start_agent_turn, handle_agent_failed,
-  refresh_transcripts, rename_agents, remove_agents
+Update:
+  Input → Turn → ToolSources → PollEvents → HostRequests → ExecuteTools →
+  AutoBackground → ApplyResults → ToolActivity → MirrorFlush →
+  SendAgentMessage → ReconcileTools → Resume → Transcripts → AgentMaintenance
 
 PostUpdate:
-  auto_scroll (after UI layout)
+  auto_scroll (after UiSystems::Layout)
 ```
 
-The two groups are chained as well, so a turn finishing in group A dispatches
-its tools in group B in the same frame.
+`Input` covers agent creation and user input, `Turn` decodes a stream, the tool
+phases execute and commit one round, `Resume` starts the next request, and
+`Transcripts`/`AgentMaintenance` update the UI after the state settles.
+
+The tool phases run in the same frame as the turn phase that produced them, so a
+finished response dispatches its tool calls immediately.
 
 ## Messages
 
@@ -116,9 +125,11 @@ components or channel-drained buffers to avoid double-buffering.
 ## Module map
 
 ```
-src/main.rs         app wiring, schedules, brand of the UI
+src/main.rs         plugin assembly, clear color
+src/sets.rs         ordered AppSet phases for Update
 src/agent.rs        Agent component, turn loop, tool dispatch/completion
-src/config.rs       provider selection and AppConfig
+src/brp.rs          harness/* BRP methods for chat control and inspection
+src/config.rs       provider selection, AppConfig, ConfigPlugin
 src/transport.rs    HTTP streaming + provider request bodies
 src/messages.rs     Bevy message protocol
 src/virtual_fs.rs   flat root VFS + .tools mount

@@ -33,7 +33,8 @@ impl Default for ToolsDir {
 }
 
 /// Mirror health, exposed for the UI and BRP inspection.
-#[derive(Resource, Default)]
+#[derive(Resource, Default, Reflect)]
+#[reflect(Resource)]
 pub(crate) struct MirrorStatus {
     pub last_error: Option<String>,
     pub pending: usize,

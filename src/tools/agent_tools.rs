@@ -112,6 +112,49 @@ fn pretty_json(value: &Value, what: &str) -> (String, bool) {
     }
 }
 
+/// Shared per-entry metadata. `include_message` adds the raw entry for callers
+/// that need the full content.
+fn entry_payload(
+    entry: &Entry,
+    sender: String,
+    message_index: u64,
+    include_message: bool,
+) -> Value {
+    let mut payload = serde_json::json!({
+        "type": entry_type(entry),
+        "sender": sender,
+        "message_index": message_index,
+    });
+    if include_message {
+        payload["message"] = serde_json::json!(entry);
+    }
+    payload
+}
+
+/// One window of an agent's history, formatted for either the tool result or
+/// the BRP response. `include_message` adds the raw entry for external callers.
+pub(crate) fn history_view(
+    agent: &Agent,
+    position: Option<i64>,
+    amount: Option<u64>,
+    include_message: bool,
+) -> Vec<Value> {
+    let history = agent.history();
+    let (start, end) = history_window(history.len(), position, amount);
+    history[start..end]
+        .iter()
+        .enumerate()
+        .map(|(offset, entry)| {
+            entry_payload(
+                entry,
+                entry_sender(entry, agent.name()),
+                (start + offset) as u64,
+                include_message,
+            )
+        })
+        .collect()
+}
+
 fn get_agent_history(
     world: &mut ToolWorld<'_, '_>,
     arguments: &Value,
@@ -131,20 +174,7 @@ fn get_agent_history(
         Err(err) => return (err, true),
     };
 
-    let history = target.history();
-    let (start, end) = history_window(history.len(), position, amount);
-    let items = history[start..end]
-        .iter()
-        .enumerate()
-        .map(|(offset, entry)| {
-            serde_json::json!({
-                "type": entry_type(entry),
-                "sender": entry_sender(entry, target.name()),
-                "message_index": start + offset,
-            })
-        })
-        .collect::<Vec<_>>();
-
+    let items = history_view(target, position, amount, false);
     pretty_json(&Value::Array(items), "history")
 }
 
@@ -181,12 +211,7 @@ fn get_agent_message(
 
 /// Message view shared with `get_agent_history`'s per-item metadata.
 fn message_payload(entry: &Entry, sender: String, message_index: u64) -> Value {
-    serde_json::json!({
-        "type": entry_type(entry),
-        "sender": sender,
-        "message_index": message_index,
-        "message": entry,
-    })
+    entry_payload(entry, sender, message_index, true)
 }
 
 fn spawn_agent(
