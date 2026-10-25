@@ -121,13 +121,17 @@ components or channel-drained buffers to avoid double-buffering.
    results rather than panics.
 5. **Determinism where it is cached.** Tool order is `(order, name)`; schemas
    sort parameters; history is committed in call order.
+6. **Change detection first.** `refresh_transcripts` only visits agents whose
+   `Agent` changed; per-frame UI systems compare before writing text/colors so
+   unchanged frames do not dirty the UI.
 
 ## Module map
 
 ```
 src/main.rs         plugin assembly, clear color
 src/sets.rs         ordered AppSet phases for Update
-src/agent.rs        Agent component, turn loop, tool dispatch/completion
+src/agent.rs        Agent component, state, observers, input, cache diagnostics
+src/agent/          turn, stream decoding, tool dispatch, rename/removal
 src/brp.rs          harness/* BRP methods for chat control and inspection
 src/config.rs       provider selection, AppConfig, ConfigPlugin
 src/transport.rs    HTTP streaming + provider request bodies
@@ -135,10 +139,11 @@ src/messages.rs     Bevy message protocol
 src/virtual_fs.rs   flat root VFS + .tools mount
 src/vfs_path.rs     path parsing/validation
 src/js_runtime.rs   Boa contexts, execute/module plumbing
-src/tools.rs        tool definitions + inline dispatch
-src/tools/          registry, catalog, world, schedule, fs, agents,
-                    search, script, manifest, tree, mirror, rescan
-src/transcript.rs   chat cards, collapsibles, tabs, stats, tool activity
+src/tools.rs        tool execution, argument helpers, plugin
+src/tools/          definitions, registry, catalog, world, schedule, fs,
+                    agents, search, script, manifest, tree, mirror, rescan
+src/transcript.rs   panels, tabs, collapsibles, text input
+src/transcript/render.rs  cards, live updates, scrolling, stats
 src/tool_display.rs display-only tool-call naming and result presentation
 src/shell.rs        top-level layout and VFS Save/Load
 crates/llm_api      provider adapters, streaming decoders, schemas, usage

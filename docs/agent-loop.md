@@ -107,10 +107,10 @@ envelopes so the provider sees them in order without breaking role alternation.
 
 | Concern | File |
 | --- | --- |
-| Turn start/commit | `src/agent.rs` (`start_agent_turn`, `handle_turn_finished`) |
-| Streaming/decoding | `src/agent.rs` (`decode_stream_chunks`), `src/transport.rs` |
-| Tool round application | `src/agent.rs` (`apply_tool_results`) |
+| Turn start/commit | `src/agent/turn.rs` (`start_agent_turn`, `handle_turn_finished`) |
+| Streaming/decoding | `src/agent/stream.rs` (`decode_stream_chunks`), `src/transport.rs` |
+| Tool round application | `src/agent/tool_dispatch.rs` (`apply_tool_results`) |
 | History model/validation | `crates/llm_history_model`, `crates/llm_api/src/validation.rs` |
-| UI rendering | `src/transcript.rs` |
+| UI rendering | `src/transcript.rs`, `src/transcript/render.rs` |
 | Tool-call presentation (`execute` unwrapping) | `src/tool_display.rs` |
 | Provider request bodies | `src/transport.rs` + `crates/llm_api/src/{openai_responses,openai_completions,anthropic}` |

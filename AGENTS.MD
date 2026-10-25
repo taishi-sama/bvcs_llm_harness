@@ -43,5 +43,6 @@ cargo fmt --check
 ```
 
 Three invariants worth repeating: the Bevy main loop never blocks on HTTP or a
-Boa heap; tool metadata has one source (`definitions()` in `src/tools.rs`); the
+Boa heap; tool metadata has one source (`definitions()` in
+`src/tools/definitions.rs`); the
 in-memory `.tools` tree is authoritative and disk is a best-effort mirror.

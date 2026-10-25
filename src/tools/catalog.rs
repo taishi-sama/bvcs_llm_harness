@@ -1,6 +1,6 @@
 //! Static tool catalog and advertisement policy.
 //!
-//! Definitions still live in [`crate::tools::tools`]; this module only decides
+//! Definitions live in [`crate::tools::definitions`]; this module only decides
 //! how each one is exposed and carried out. Splitting the policy out keeps the
 //! model-facing trim reviewable in one small table instead of being spread
 //! across the definitions.

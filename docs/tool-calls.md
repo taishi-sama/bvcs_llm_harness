@@ -31,7 +31,8 @@ enum Execution {
 }
 ```
 
-Definitions live in exactly one place: `definitions()` in `src/tools.rs`.
+Definitions live in exactly one place: `definitions()` in
+`src/tools/definitions.rs`.
 Exposure policy lives in `src/tools/catalog.rs`:
 
 - `policy(name)` — advertised or manual, `order`, `tags`, `model_only`, and
@@ -85,7 +86,7 @@ assistant stream
   → AgentTurnFinished
   → handle_turn_finished
   → RunToolCalls { agent, turn_id, tool_call: Vec<ToolCall> }
-  → execute_tool_calls                      (src/agent.rs)
+  → execute_tool_calls                      (src/agent/tool_dispatch.rs)
       ├─ parse toolcall_params as JSON     (empty → Null; invalid → error result)
       ├─ root = (round_id << 32) | call_index
       ├─ rounds.open_budget(root, agent)   (2000 nested calls)
@@ -163,7 +164,7 @@ Request ids:
   all agent contexts
 - script: `1 << 63 | counter`, guaranteed disjoint from interpreter ids
 
-Completion routing (`route_async_result` in `src/agent.rs`):
+Completion routing (`route_async_result` in `src/agent/tool_dispatch.rs`):
 
 ```
 poll_js_events / poll_script_events
@@ -253,7 +254,7 @@ running (bounded by Boa's loop iteration limit, `10_000_000`).
 
 ### Inline tool (Rust, main loop)
 
-1. Add a `Tool` to `definitions()` in `src/tools.rs`:
+1. Add a `Tool` to `definitions()` in `src/tools/definitions.rs`:
    - mark optional parameters `required: false`
    - use `ParameterType::Object` for a generic object argument
 2. Write the handler in a domain module (`src/tools/fs.rs`,
@@ -345,13 +346,13 @@ call starts.
 
 | Concern | File |
 | --- | --- |
-| Definitions | `src/tools.rs` (`definitions`) |
+| Definitions | `src/tools/definitions.rs` (`definitions`) |
 | Exposure policy, registration, gateway definitions | `src/tools/catalog.rs` |
 | Uniform handler-registration macro | `src/tools/registration.rs` |
 | Tool entity spawn + markers | `src/tools/registry.rs` |
 | Handler context | `src/tools/world.rs` |
 | Round/budget/detach bookkeeping | `src/tools/schedule.rs` |
-| Model dispatch, host bridges, completion routing | `src/agent.rs` |
+| Model dispatch, host bridges, completion routing | `src/agent/tool_dispatch.rs` |
 | Script runtime, module resolver, sources | `src/tools/script.rs` |
 | Tool manifests and entry index | `src/tools/manifest.rs` |
 | `.tools` tree and mirror | `src/tools/tree.rs`, `src/tools/mirror.rs` |
