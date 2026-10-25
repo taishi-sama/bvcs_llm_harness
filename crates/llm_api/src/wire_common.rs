@@ -128,31 +128,18 @@ pub fn thinking_joined(thinking: &[Thinking]) -> Option<String> {
 mod tests {
     use super::*;
     use crate::generic_tool::ParameterDescription;
+    use crate::test_support::tool;
     use std::collections::HashMap;
 
     fn sample_tool() -> Tool {
-        let mut parameters = HashMap::new();
-        parameters.insert(
-            "city".to_owned(),
-            ParameterDescription {
-                r#type: ParameterType::String,
-                description: "City name".to_owned(),
-                required: true,
-            },
-        );
-        parameters.insert(
-            "days".to_owned(),
-            ParameterDescription {
-                r#type: ParameterType::Number,
-                description: "Forecast length".to_owned(),
-                required: true,
-            },
-        );
-        Tool {
-            name: "get_weather".to_owned(),
-            parameters,
-            description: None,
-        }
+        tool(
+            "get_weather",
+            None,
+            &[
+                ("city", ParameterType::String, "City name", true),
+                ("days", ParameterType::Number, "Forecast length", true),
+            ],
+        )
     }
 
     #[test]

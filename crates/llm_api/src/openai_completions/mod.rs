@@ -373,6 +373,7 @@ pub fn to_completions_input(
 mod tests {
     use super::*;
     use crate::model_config::ModelKind;
+    use crate::test_support::text_user;
     use llm_history_model::history::ImageMIME;
     use llm_history_model::history::{
         Image, ResponseBlock, ToolCall as HistoryToolCall, ToolCallResult,
@@ -389,15 +390,6 @@ mod tests {
             },
             tools: Default::default(),
             max_tokens: None,
-        }
-    }
-
-    fn text_user(t: &str) -> Entry {
-        Entry::UserMessage {
-            content: MessageContent {
-                text: Some(t.into()),
-                image: None,
-            },
         }
     }
 

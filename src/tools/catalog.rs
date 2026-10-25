@@ -8,7 +8,6 @@
 use bevy::log::{info, warn};
 use bevy::prelude::{Commands, Query, Res, With, Without};
 use llm_api::generic_tool::Tool;
-use serde_json::Value;
 
 use crate::{
     tools::{
@@ -39,6 +38,7 @@ struct Policy {
     availability: Availability,
     order: u32,
     tags: &'static [&'static str],
+    auto_background: bool,
     model_only: bool,
 }
 
@@ -48,6 +48,7 @@ const fn advertises(order: u32, tags: &'static [&'static str]) -> Policy {
         availability: Availability::AnyWay,
         order,
         tags,
+        auto_background: false,
         model_only: false,
     }
 }
@@ -58,6 +59,7 @@ const fn manual(order: u32, tags: &'static [&'static str]) -> Policy {
         availability: Availability::OnlyManual,
         order,
         tags,
+        auto_background: false,
         model_only: false,
     }
 }
@@ -67,6 +69,12 @@ impl Policy {
     /// the interpreter itself).
     const fn model_only(mut self) -> Self {
         self.model_only = true;
+        self
+    }
+
+    /// Tools that opt into the global auto-background grace period by default.
+    const fn auto_background(mut self) -> Self {
+        self.auto_background = true;
         self
     }
 }
@@ -88,8 +96,8 @@ fn policy(name: &str) -> Policy {
         "fs_sed" => advertises(16, &["fs"]),
         "fs_delete" => manual(17, &["fs"]),
 
-        "eval_javascript" => advertises(20, &["js"]).model_only(),
-        "run_javascript" => advertises(21, &["js"]).model_only(),
+        "eval_javascript" => advertises(20, &["js"]).model_only().auto_background(),
+        "run_javascript" => advertises(21, &["js"]).model_only().auto_background(),
         "eval_javascript_reset_context" => manual(22, &["js"]),
 
         "send_message_to_agent" => advertises(30, &["agent"]),
@@ -125,22 +133,12 @@ fn execution(name: &str) -> Execution {
     if crate::tools::is_js_tool(name) {
         return Execution::Interpreter;
     }
-    // A definition with no handler is a bug; `every_definition_has_a_handler`
-    // fails in tests rather than letting the model hit this at runtime.
-    Execution::Inline(inline_handler(name).unwrap_or(no_handler))
-}
-
-fn no_handler(
-    _world: &mut crate::tools::world::ToolWorld<'_, '_>,
-    _arguments: &Value,
-    _call: &crate::tools::registry::CallContext<'_>,
-) -> (String, bool) {
-    ("tool has no registered handler".to_owned(), true)
-}
-
-/// Tools that opt into the global auto-background grace period by default.
-pub(crate) fn auto_background(name: &str) -> bool {
-    matches!(name, "run_javascript" | "eval_javascript")
+    match inline_handler(name) {
+        Some(handler) => Execution::Inline(handler),
+        // A definition with no handler is a bug; `every_definition_has_a_handler`
+        // fails in tests rather than letting the model hit this at runtime.
+        None => Execution::Missing,
+    }
 }
 
 /// Whether a definition has a real handler.
@@ -149,7 +147,7 @@ pub(crate) fn auto_background(name: &str) -> bool {
 /// an execution module, which would otherwise surface only as a runtime error.
 #[cfg(test)]
 pub(crate) fn is_implemented(name: &str) -> bool {
-    inline_handler(name).is_some() || name == "execute" || crate::tools::is_js_tool(name)
+    !matches!(execution(name), Execution::Missing)
 }
 
 /// Register script tools found under `.tools`.
@@ -192,11 +190,12 @@ pub(crate) fn static_tools() -> Vec<StaticTool> {
                 availability,
                 order,
                 tags,
+                auto_background,
                 model_only,
             } = policy(&definition.name);
             StaticTool {
                 execution: execution(&definition.name),
-                auto_background: auto_background(&definition.name),
+                auto_background,
                 model_only,
                 definition,
                 availability,

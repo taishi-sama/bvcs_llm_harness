@@ -14,14 +14,15 @@ use std::{
 
 use bevy::log::{info, warn};
 use bevy::prelude::*;
-use llm_api::generic_tool::{ParameterDescription, ParameterType, Tool};
+use llm_api::generic_tool::Tool;
 use serde_json::Value;
 
 use crate::{
     tools::{
+        CallContext, bool_option,
         manifest::{self, ScriptToolSpec},
         registration::tool_handlers,
-        registry::{Advertised, Availability, Execution, ToolEntry},
+        registry::{Availability, Execution, ToolEntry},
         script::ScriptTool,
         tree::ToolsTree,
         world::ToolWorld,
@@ -40,34 +41,9 @@ pub(crate) struct RescanReport {
 }
 
 impl RescanReport {
-    pub(crate) fn render(&self) -> String {
-        let mut output = format!(
-            "{} script tool(s) found in `.tools` ({} added, {} removed, {} changed); {} broken manifest(s); {} library(ies)",
-            self.registered.len(),
-            self.added.len(),
-            self.removed.len(),
-            self.changed.len(),
-            self.broken.len(),
-            self.libraries
-        );
-        if !self.added.is_empty() {
-            output.push_str(&format!("\nadded: {}", self.added.join(", ")));
-        }
-        if !self.removed.is_empty() {
-            output.push_str(&format!("\nremoved: {}", self.removed.join(", ")));
-        }
-        if !self.changed.is_empty() {
-            output.push_str(&format!("\nchanged: {}", self.changed.join(", ")));
-        }
-        for broken in &self.broken {
-            output.push_str(&format!("\nbroken: {broken}"));
-        }
-        output
-    }
-
-    /// One-line summary of what this pass changed, for the "last automatic
-    /// change" note in a later `rescan_tools` result.
-    fn diff_summary(&self) -> String {
+    /// Added/removed/changed lines, shared by the rendered report and the
+    /// one-line automatic-change summary.
+    fn diff_parts(&self) -> Vec<String> {
         let mut parts = Vec::new();
         if !self.added.is_empty() {
             parts.push(format!("added: {}", self.added.join(", ")));
@@ -78,11 +54,33 @@ impl RescanReport {
         if !self.changed.is_empty() {
             parts.push(format!("changed: {}", self.changed.join(", ")));
         }
-        if parts.is_empty() {
-            String::new()
-        } else {
-            parts.join("; ")
+        parts
+    }
+
+    pub(crate) fn render(&self) -> String {
+        let mut output = format!(
+            "{} script tool(s) found in `.tools` ({} added, {} removed, {} changed); {} broken manifest(s); {} library(ies)",
+            self.registered.len(),
+            self.added.len(),
+            self.removed.len(),
+            self.changed.len(),
+            self.broken.len(),
+            self.libraries
+        );
+        for part in self.diff_parts() {
+            output.push('\n');
+            output.push_str(&part);
         }
+        for broken in &self.broken {
+            output.push_str(&format!("\nbroken: {broken}"));
+        }
+        output
+    }
+
+    /// One-line summary of what this pass changed, for the "last automatic
+    /// change" note in a later `rescan_tools` result.
+    fn diff_summary(&self) -> String {
+        self.diff_parts().join("; ")
     }
 }
 
@@ -135,7 +133,8 @@ fn script_tool_entry(spec: &ScriptToolSpec) -> (ToolEntry, ScriptTool) {
 pub(crate) fn spawn_script_tool(commands: &mut Commands, spec: ScriptToolSpec) -> u64 {
     let (entry, script) = script_tool_entry(&spec);
     let fingerprint = script.fingerprint;
-    commands.spawn((entry, script, Advertised));
+    let entity = crate::tools::registry::spawn_tool(commands, entry, true, false);
+    commands.entity(entity).insert(script);
     fingerprint
 }
 
@@ -263,12 +262,9 @@ fn record_rescan_intent(
 pub(crate) fn rescan_tools(
     world: &mut ToolWorld<'_, '_>,
     arguments: &Value,
-    _call: &crate::tools::registry::CallContext<'_>,
+    _call: &CallContext<'_>,
 ) -> (String, bool) {
-    let apply = match arguments.get("apply") {
-        None | Some(Value::Null) => true,
-        value => crate::tools::is_truthy(value),
-    };
+    let apply = bool_option(arguments, "apply", true);
     let source = arguments
         .get("source")
         .and_then(Value::as_str)
@@ -328,42 +324,6 @@ pub(crate) fn rescan_tools(
     (output, false)
 }
 
-/// Definition for the `rescan_tools` tool.
-pub(crate) fn rescan_tool_definition() -> Tool {
-    Tool {
-        name: "rescan_tools".into(),
-        description: Some(
-            "Reconcile `.tools` script tools with the live registry. Reports how many tools \
-             the scan found plus added/removed/changed from this pass. Hot reload applies \
-             changes after tool calls and before the next request, so an empty diff is \
-             followed by the last automatic change. `apply` defaults to true: it asks that \
-             reconciler to run even if a dry run already recorded the revision. Set it to \
-             false for a dry run that records the revision and prevents the automatic apply. \
-             `source` is `vfs` (default, use in-memory edits) or `disk` (reload `./.tools` \
-             first, discarding unmirrored in-memory edits)."
-                .into(),
-        ),
-        parameters: HashMap::from([
-            (
-                "apply".to_owned(),
-                ParameterDescription {
-                    r#type: ParameterType::Boolean,
-                    description: "Apply the diff to the registry (default true)".into(),
-                    required: false,
-                },
-            ),
-            (
-                "source".to_owned(),
-                ParameterDescription {
-                    r#type: ParameterType::String,
-                    description: "`vfs` (default) or `disk`".into(),
-                    required: false,
-                },
-            ),
-        ]),
-    }
-}
-
 tool_handlers! {
     "rescan_tools" => rescan_tools,
 }
@@ -371,6 +331,7 @@ tool_handlers! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::registry::Advertised;
 
     fn write_tool(vfs: &mut VirtualFs, name: &str, description: &str) {
         vfs.write(

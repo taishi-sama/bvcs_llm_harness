@@ -530,21 +530,9 @@ pub(crate) fn create_agent(
 
     let (tab, tab_label) = create_agent_tab(commands, layout.tabs, agent_entity, &name, tab_index);
 
-    commands.entity(agent_entity).insert(AgentView {
-        panel: Entity::PLACEHOLDER,
-        log: Entity::PLACEHOLDER,
-        input: Entity::PLACEHOLDER,
-        status: Entity::PLACEHOLDER,
-        stats: Entity::PLACEHOLDER,
-        tool_activity: Entity::PLACEHOLDER,
-        tab_label,
-        assistant: None,
-        transcript_visible: false,
-        rendered_entries: 0,
-        scroll_to_bottom: false,
-        follow_tail: true,
-        draft: String::new(),
-    });
+    commands
+        .entity(agent_entity)
+        .insert(AgentView::new(Entity::PLACEHOLDER, tab_label));
 
     // Select this tab when clicked.
     commands.entity(tab).observe(
@@ -1837,6 +1825,10 @@ fn dispatch_gateway(
             }
         }
         Execution::Gateway => unreachable!("checked above"),
+        Execution::Missing => {
+            rounds.refund_budget(root);
+            gateway_error(format!("tool `{target_name}` has no registered handler"))
+        }
     }
 }
 
@@ -1999,6 +1991,11 @@ fn handle_host_tool(
             js_handles,
             reply,
             Err(format!("tool `{name}` can only be called by the model")),
+        ),
+        Execution::Missing => reply_now(
+            js_handles,
+            reply,
+            Err(format!("tool `{name}` has no registered handler")),
         ),
         Execution::Script => {
             if let Err(err) = validate_script_arguments(world, name, arguments) {
@@ -2552,18 +2549,7 @@ mod removal_tests {
                 Agent::new(name.to_owned(), Provider::Responses, "model".to_owned()),
                 AgentView {
                     panel,
-                    log: Entity::PLACEHOLDER,
-                    input: Entity::PLACEHOLDER,
-                    status: Entity::PLACEHOLDER,
-                    stats: Entity::PLACEHOLDER,
-                    tool_activity: Entity::PLACEHOLDER,
-                    tab_label: Entity::PLACEHOLDER,
-                    assistant: None,
-                    transcript_visible: false,
-                    rendered_entries: 0,
-                    scroll_to_bottom: false,
-                    follow_tail: true,
-                    draft: String::new(),
+                    ..AgentView::new(Entity::PLACEHOLDER, Entity::PLACEHOLDER)
                 },
             ))
             .id();
@@ -2854,13 +2840,7 @@ mod cancel_tests {
             .spawn((
                 Agent::new("Worker".to_owned(), Provider::Responses, "model".to_owned()),
                 AgentView {
-                    panel: Entity::PLACEHOLDER,
-                    log: Entity::PLACEHOLDER,
-                    input: Entity::PLACEHOLDER,
                     status,
-                    stats: Entity::PLACEHOLDER,
-                    tool_activity: Entity::PLACEHOLDER,
-                    tab_label: Entity::PLACEHOLDER,
                     assistant: Some(AssistantView {
                         card: live_card,
                         thinking_container: Entity::PLACEHOLDER,
@@ -2869,9 +2849,7 @@ mod cancel_tests {
                     }),
                     transcript_visible: true,
                     rendered_entries: 3,
-                    scroll_to_bottom: false,
-                    follow_tail: true,
-                    draft: String::new(),
+                    ..AgentView::new(Entity::PLACEHOLDER, Entity::PLACEHOLDER)
                 },
             ))
             .id();
@@ -2939,19 +2917,9 @@ mod rename_tests {
             .spawn((
                 Agent::new("Old".to_owned(), Provider::Responses, "model".to_owned()),
                 AgentView {
-                    panel: Entity::PLACEHOLDER,
-                    log: Entity::PLACEHOLDER,
-                    input: Entity::PLACEHOLDER,
                     status,
-                    stats: Entity::PLACEHOLDER,
-                    tool_activity: Entity::PLACEHOLDER,
                     tab_label,
-                    assistant: None,
-                    transcript_visible: false,
-                    rendered_entries: 0,
-                    scroll_to_bottom: false,
-                    follow_tail: true,
-                    draft: String::new(),
+                    ..AgentView::new(Entity::PLACEHOLDER, Entity::PLACEHOLDER)
                 },
             ))
             .id();
@@ -3006,13 +2974,8 @@ mod empty_response_tests {
             agent_ref.pending = true;
         }
         app.world_mut().entity_mut(agent).insert(AgentView {
-            panel: Entity::PLACEHOLDER,
             log,
-            input: Entity::PLACEHOLDER,
             status,
-            stats: Entity::PLACEHOLDER,
-            tool_activity: Entity::PLACEHOLDER,
-            tab_label: Entity::PLACEHOLDER,
             assistant: Some(AssistantView {
                 card: live_card,
                 thinking_container: Entity::PLACEHOLDER,
@@ -3021,9 +2984,7 @@ mod empty_response_tests {
             }),
             transcript_visible: true,
             rendered_entries: 1,
-            scroll_to_bottom: false,
-            follow_tail: true,
-            draft: String::new(),
+            ..AgentView::new(Entity::PLACEHOLDER, Entity::PLACEHOLDER)
         });
 
         app.add_message::<AgentTurnFinished>();

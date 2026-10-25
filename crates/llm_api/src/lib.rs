@@ -8,3 +8,6 @@ pub mod stream;
 pub mod usage;
 pub mod validation;
 pub mod wire_common;
+
+#[cfg(test)]
+pub(crate) mod test_support;

@@ -208,7 +208,7 @@ impl MessagesResponse {
 mod tests {
     use super::*;
     use crate::model_config::{ModelConfig, ModelKind};
-    use crate::validation::validate_entries;
+    use crate::test_support::{text_user, validated_assistant_history};
     use llm_history_model::history::Entry as E;
     use llm_history_model::history::{ResponseBlock, ToolCallResult};
 
@@ -226,21 +226,10 @@ mod tests {
         }
     }
 
-    fn text_user(t: &str) -> E {
-        E::UserMessage {
-            content: llm_history_model::history::MessageContent {
-                text: Some(t.into()),
-                image: None,
-            },
-        }
-    }
-
     /// Response entries are assistant-side; they validate only when appended
     /// onto an existing user-first history.
     fn validated_history(entries: Vec<E>) {
-        let mut history = vec![text_user("hi")];
-        history.extend(entries);
-        assert_eq!(validate_entries(&history, &config()), Ok(()));
+        validated_assistant_history(entries, &config());
     }
 
     #[test]

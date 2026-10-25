@@ -387,7 +387,8 @@ mod tests {
     use super::*;
     use crate::model_config::{ModelConfig, ModelKind};
     use crate::stream::{finish_draft, finish_draft_for};
-    use llm_history_model::history::{Entry, MessageContent, Thinking};
+    use crate::test_support::text_user;
+    use llm_history_model::history::{Entry, Thinking};
 
     fn config() -> ModelConfig {
         ModelConfig {
@@ -400,15 +401,6 @@ mod tests {
             },
             tools: Default::default(),
             max_tokens: Some(1024),
-        }
-    }
-
-    fn text_user(t: &str) -> Entry {
-        Entry::UserMessage {
-            content: MessageContent {
-                text: Some(t.into()),
-                image: None,
-            },
         }
     }
 

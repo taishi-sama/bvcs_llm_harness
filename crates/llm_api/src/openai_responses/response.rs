@@ -352,7 +352,7 @@ impl ResponsesResponse {
 mod tests {
     use super::*;
     use crate::model_config::{ModelConfig, ModelKind};
-    use crate::validation::validate_entries;
+    use crate::test_support::{text_user, validated_assistant_history};
 
     fn config() -> ModelConfig {
         ModelConfig {
@@ -383,22 +383,10 @@ mod tests {
         "usage":{"input_tokens":21,"output_tokens":247,"total_tokens":268,"input_tokens_details":{"cached_tokens":0}}
     }"#;
 
-    fn text_user(t: &str) -> Entry {
-        Entry::UserMessage {
-            content: llm_history_model::history::MessageContent {
-                text: Some(t.into()),
-                image: None,
-            },
-        }
-    }
-
     /// Response entries are assistant-side; they validate only when appended
     /// onto an existing user-first history.
     fn validated_history(resp_entries: Vec<Entry>) -> Vec<Entry> {
-        let mut history = vec![text_user("hi")];
-        history.extend(resp_entries);
-        assert_eq!(validate_entries(&history, &config()), Ok(()));
-        history
+        validated_assistant_history(resp_entries, &config())
     }
 
     #[test]

@@ -57,24 +57,15 @@ pub fn tools_to_completions(tools: &[Tool]) -> Vec<CompletionTool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::generic_tool::{ParameterDescription, ParameterType};
-    use std::collections::HashMap;
+    use crate::generic_tool::ParameterType;
+    use crate::test_support::tool;
 
     fn sample() -> Tool {
-        let mut parameters = HashMap::new();
-        parameters.insert(
-            "city".to_owned(),
-            ParameterDescription {
-                r#type: ParameterType::String,
-                description: "City name".to_owned(),
-                required: true,
-            },
-        );
-        Tool {
-            name: "get_weather".to_owned(),
-            parameters,
-            description: Some("Get the weather".to_owned()),
-        }
+        tool(
+            "get_weather",
+            Some("Get the weather"),
+            &[("city", ParameterType::String, "City name", true)],
+        )
     }
 
     #[test]
@@ -94,11 +85,7 @@ mod tests {
 
     #[test]
     fn no_argument_tools_still_include_parameters() {
-        let wire = tools_to_completions(&[Tool {
-            name: "t".into(),
-            parameters: HashMap::new(),
-            description: None,
-        }]);
+        let wire = tools_to_completions(&[tool("t", None, &[])]);
         let value = serde_json::to_value(&wire[0]).unwrap();
         assert!(value["function"].get("description").is_none());
         assert_eq!(

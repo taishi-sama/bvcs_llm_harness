@@ -405,6 +405,7 @@ pub fn to_anthropic_messages<'a>(
 mod tests {
     use super::*;
     use crate::model_config::{AnthropicThinking, AnthropicThinkingDisplay, ModelKind};
+    use crate::test_support::text_user;
     use llm_history_model::history::ImageMIME;
     use llm_history_model::history::{
         Image, MessageContent, ResponseBlock, ToolCall as HistoryToolCall, ToolCallResult,
@@ -421,15 +422,6 @@ mod tests {
             },
             tools: Default::default(),
             max_tokens: Some(1024),
-        }
-    }
-
-    fn text_user(t: &str) -> Entry {
-        Entry::UserMessage {
-            content: MessageContent {
-                text: Some(t.into()),
-                image: None,
-            },
         }
     }
 

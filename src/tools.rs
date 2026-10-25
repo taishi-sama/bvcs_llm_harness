@@ -45,6 +45,37 @@ pub(crate) use schedule::background_started_message;
 pub(crate) use script::{ScriptHostRequest, ScriptRuntime, ScriptTask, ToolSourceCache};
 pub(crate) use world::ToolWorld;
 
+/// The tools handled by the agent's persistent JavaScript thread.
+///
+/// One enum keeps the name list, the task constructor, and [`is_js_tool`] from
+/// drifting apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum JsTool {
+    RunJavascript,
+    EvalJavascript,
+    ResetContext,
+}
+
+impl JsTool {
+    pub(crate) const ALL: [Self; 3] = [
+        Self::RunJavascript,
+        Self::EvalJavascript,
+        Self::ResetContext,
+    ];
+
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::RunJavascript => "run_javascript",
+            Self::EvalJavascript => "eval_javascript",
+            Self::ResetContext => "eval_javascript_reset_context",
+        }
+    }
+
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|tool| tool.name() == name)
+    }
+}
+
 /// Build the interpreter task for one JavaScript tool call.
 pub(crate) fn interpreter_task(
     name: &str,
@@ -53,8 +84,9 @@ pub(crate) fn interpreter_task(
     depth: u32,
     root: u64,
 ) -> Result<JsTask, String> {
-    match name {
-        "run_javascript" => {
+    let tool = JsTool::from_name(name).ok_or_else(|| format!("not a JavaScript tool: {name}"))?;
+    match tool {
+        JsTool::RunJavascript => {
             let file = arguments
                 .get("file")
                 .and_then(Value::as_str)
@@ -67,7 +99,7 @@ pub(crate) fn interpreter_task(
                 root,
             })
         }
-        "eval_javascript" => {
+        JsTool::EvalJavascript => {
             let code = arguments
                 .get("code")
                 .and_then(Value::as_str)
@@ -79,7 +111,7 @@ pub(crate) fn interpreter_task(
                 root,
             })
         }
-        "eval_javascript_reset_context" => {
+        JsTool::ResetContext => {
             let symbol = arguments
                 .get("symbol")
                 .and_then(Value::as_str)
@@ -90,20 +122,13 @@ pub(crate) fn interpreter_task(
                 symbol: (!symbol.is_empty()).then_some(symbol),
             })
         }
-        other => Err(format!("not a JavaScript tool: {other}")),
     }
 }
 
-/// Tools that run JavaScript. They are handled by the async JS runtime instead
-/// of [`execute_tool`], which keeps JavaScript from recursively starting itself.
-pub(crate) const JS_TOOLS: &[&str] = &[
-    "run_javascript",
-    "eval_javascript",
-    "eval_javascript_reset_context",
-];
-
+/// Whether `name` is handled by the async JS runtime rather than
+/// [`execute_tool`], which keeps JavaScript from recursively starting itself.
 pub(crate) fn is_js_tool(name: &str) -> bool {
-    JS_TOOLS.contains(&name)
+    JsTool::from_name(name).is_some()
 }
 
 /// First message for an agent created with an initial prompt.
@@ -136,6 +161,20 @@ pub(crate) fn optional_i64(arguments: &Value, name: &str) -> Result<Option<i64>,
             .map(Some)
             .ok_or_else(|| format!("`{name}` must be an integer")),
     }
+}
+
+/// Required string argument.
+pub(crate) fn required_str<'a>(arguments: &'a Value, name: &str) -> Result<&'a str, String> {
+    arguments
+        .get(name)
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("missing required string parameter `{name}`"))
+}
+
+/// Optional string argument. Non-string values count as absent, matching the
+/// permissive policy used by the inline tools.
+pub(crate) fn optional_str<'a>(arguments: &'a Value, name: &str) -> Option<&'a str> {
+    arguments.get(name).and_then(Value::as_str)
 }
 
 /// Boolean option with a default when the argument is omitted or null.
@@ -229,6 +268,13 @@ pub(crate) fn user_message_sender(text: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Sorted copy of the agent names used in messages and diagnostics.
+pub(crate) fn sorted_agent_names(index: &AgentIndex) -> Vec<String> {
+    let mut names = index.by_name.keys().cloned().collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
 /// Look up an agent by title, with a helpful error listing what exists.
 fn history_agent<'a>(
     name: &str,
@@ -236,11 +282,9 @@ fn history_agent<'a>(
     agents: &'a Query<&Agent>,
 ) -> Result<&'a Agent, String> {
     let Some(entity) = index.by_name.get(name) else {
-        let mut names = index.by_name.keys().cloned().collect::<Vec<_>>();
-        names.sort();
         return Err(format!(
             "No agent named `{name}`. Available agents: {}",
-            names.join(", ")
+            sorted_agent_names(index).join(", ")
         ));
     };
     agents
@@ -352,7 +396,38 @@ const fn json_type_name(value: &Value) -> &'static str {
 /// descriptions, and parameter schemas; exposure is decided by `catalog`.
 pub(crate) fn definitions() -> Vec<Tool> {
     vec![
-        crate::tools::rescan::rescan_tool_definition(),
+        Tool {
+            name: "rescan_tools".into(),
+            description: Some(
+                "Reconcile `.tools` script tools with the live registry. Reports how many tools \
+                 the scan found plus added/removed/changed from this pass. Hot reload applies \
+                 changes after tool calls and before the next request, so an empty diff is \
+                 followed by the last automatic change. `apply` defaults to true: it asks that \
+                 reconciler to run even if a dry run already recorded the revision. Set it to \
+                 false for a dry run that records the revision and prevents the automatic apply. \
+                 `source` is `vfs` (default, use in-memory edits) or `disk` (reload `./.tools` \
+                 first, discarding unmirrored in-memory edits)."
+                    .into(),
+            ),
+            parameters: HashMap::from([
+                (
+                    "apply".to_owned(),
+                    ParameterDescription {
+                        r#type: ParameterType::Boolean,
+                        description: "Apply the diff to the registry (default true)".into(),
+                        required: false,
+                    },
+                ),
+                (
+                    "source".to_owned(),
+                    ParameterDescription {
+                        r#type: ParameterType::String,
+                        description: "`vfs` (default) or `disk`".into(),
+                        required: false,
+                    },
+                ),
+            ]),
+        },
         Tool {
             name: "execute".into(),
             description: Some(
@@ -1013,6 +1088,7 @@ pub(crate) fn execute_tool(
             format!("tool `{name}` can only be called by the model"),
             true,
         ),
+        Execution::Missing => ("tool has no registered handler".to_owned(), true),
     }
 }
 
@@ -1030,10 +1106,11 @@ mod tests {
     #[test]
     fn javascript_tools_are_registered_as_interpreter_tools() {
         let tools = static_tools();
-        for name in JS_TOOLS {
+        for tool in JsTool::ALL {
+            let name = tool.name();
             let entry = tools
                 .iter()
-                .find(|entry| entry.definition.name == *name)
+                .find(|entry| entry.definition.name == name)
                 .expect("JavaScript tool should be registered");
             assert!(
                 matches!(entry.execution, Execution::Interpreter),
@@ -1065,44 +1142,49 @@ mod tests {
     }
 
     #[test]
-    fn advertisement_policy_matches_the_trim() {
-        let tools = static_tools();
-        let advertised = |name: &str| {
-            tools
-                .iter()
-                .find(|entry| entry.definition.name == name)
-                .unwrap_or_else(|| panic!("`{name}` is not registered"))
-                .advertised
-        };
+    fn registration_flags_match_the_policy_table() {
+        // (name, advertised, model_only, auto_background)
+        const EXPECTED: &[(&str, bool, bool, bool)] = &[
+            ("execute", true, true, false),
+            ("search_tools", true, false, false),
+            ("rescan_tools", true, false, false),
+            ("fs_read", true, false, false),
+            ("fs_grep", true, false, false),
+            ("fs_sed", true, false, false),
+            ("fs_ls", true, false, false),
+            ("fs_write", true, false, false),
+            ("fs_edit_lines", true, false, false),
+            ("fs_edit_pattern", true, false, false),
+            ("fs_delete", false, false, false),
+            ("run_javascript", true, true, true),
+            ("eval_javascript", true, true, true),
+            ("eval_javascript_reset_context", false, false, false),
+            ("send_message_to_agent", true, false, false),
+            ("list_agents", false, false, false),
+            ("get_agent_history", false, false, false),
+            ("get_agent_message", false, false, false),
+            ("spawn_agent", true, true, false),
+            ("rename_self", true, true, false),
+            ("end_agent", false, true, false),
+        ];
 
-        for name in [
-            "execute",
-            "rescan_tools",
-            "search_tools",
-            "fs_read",
-            "fs_write",
-            "fs_edit_pattern",
-            "fs_edit_lines",
-            "fs_ls",
-            "fs_grep",
-            "fs_sed",
-            "eval_javascript",
-            "run_javascript",
-            "send_message_to_agent",
-            "spawn_agent",
-            "rename_self",
-        ] {
-            assert!(advertised(name), "`{name}` should be advertised");
-        }
-        for name in [
-            "fs_delete",
-            "eval_javascript_reset_context",
-            "list_agents",
-            "get_agent_history",
-            "get_agent_message",
-            "end_agent",
-        ] {
-            assert!(!advertised(name), "`{name}` should be hidden");
+        let tools = static_tools();
+        assert_eq!(
+            tools.len(),
+            EXPECTED.len(),
+            "catalog/policy table size mismatch"
+        );
+        for (name, advertised, model_only, auto_background) in EXPECTED {
+            let entry = tools
+                .iter()
+                .find(|entry| entry.definition.name == *name)
+                .unwrap_or_else(|| panic!("`{name}` is not registered"));
+            assert_eq!(entry.advertised, *advertised, "`{name}` advertised");
+            assert_eq!(entry.model_only, *model_only, "`{name}` model_only");
+            assert_eq!(
+                entry.auto_background, *auto_background,
+                "`{name}` auto_background"
+            );
         }
     }
 

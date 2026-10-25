@@ -340,6 +340,7 @@ pub fn to_responses_input<'a>(
 mod tests {
     use super::*;
     use crate::model_config::ModelKind;
+    use crate::test_support::text_user;
     use llm_history_model::history::ImageMIME;
     use llm_history_model::history::{Image, MessageContent, ToolCall, ToolCallResult};
     use serde_json::{Value, json};
@@ -355,15 +356,6 @@ mod tests {
             },
             tools: Default::default(),
             max_tokens: None,
-        }
-    }
-
-    fn text_user(t: &str) -> Entry {
-        Entry::UserMessage {
-            content: MessageContent {
-                text: Some(t.into()),
-                image: None,
-            },
         }
     }
 

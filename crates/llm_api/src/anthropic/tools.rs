@@ -36,24 +36,15 @@ pub fn tools_to_anthropic(tools: &[Tool]) -> Vec<AnthropicTool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::generic_tool::{ParameterDescription, ParameterType};
-    use std::collections::HashMap;
+    use crate::generic_tool::ParameterType;
+    use crate::test_support::tool;
 
     fn sample() -> Tool {
-        let mut parameters = HashMap::new();
-        parameters.insert(
-            "ticker".to_owned(),
-            ParameterDescription {
-                r#type: ParameterType::String,
-                description: "Ticker symbol".to_owned(),
-                required: true,
-            },
-        );
-        Tool {
-            name: "get_stock_price".to_owned(),
-            parameters,
-            description: Some("Get the current stock price.".to_owned()),
-        }
+        tool(
+            "get_stock_price",
+            Some("Get the current stock price."),
+            &[("ticker", ParameterType::String, "Ticker symbol", true)],
+        )
     }
 
     #[test]
@@ -78,11 +69,7 @@ mod tests {
 
     #[test]
     fn omits_description_when_absent() {
-        let wire = tools_to_anthropic(&[Tool {
-            name: "t".into(),
-            parameters: HashMap::new(),
-            description: None,
-        }]);
+        let wire = tools_to_anthropic(&[tool("t", None, &[])]);
         let value = serde_json::to_value(&wire[0]).unwrap();
         assert!(value.get("description").is_none());
     }

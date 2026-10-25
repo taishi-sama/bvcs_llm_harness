@@ -76,6 +76,27 @@ pub(crate) struct AgentView {
     pub(crate) draft: String,
 }
 
+impl AgentView {
+    /// A view with every UI handle unset except the log and tab label.
+    pub(crate) fn new(log: Entity, tab_label: Entity) -> Self {
+        Self {
+            panel: Entity::PLACEHOLDER,
+            log,
+            input: Entity::PLACEHOLDER,
+            status: Entity::PLACEHOLDER,
+            stats: Entity::PLACEHOLDER,
+            tool_activity: Entity::PLACEHOLDER,
+            tab_label,
+            assistant: None,
+            transcript_visible: false,
+            rendered_entries: 0,
+            scroll_to_bottom: false,
+            follow_tail: true,
+            draft: String::new(),
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct AssistantView {
     pub(crate) card: Entity,
@@ -1441,19 +1462,8 @@ mod transcript_tests {
 
     fn agent_view(log: Entity) -> AgentView {
         AgentView {
-            panel: Entity::PLACEHOLDER,
-            log,
-            input: Entity::PLACEHOLDER,
-            status: Entity::PLACEHOLDER,
-            stats: Entity::PLACEHOLDER,
-            tool_activity: Entity::PLACEHOLDER,
-            tab_label: Entity::PLACEHOLDER,
-            assistant: None,
             transcript_visible: true,
-            rendered_entries: 0,
-            scroll_to_bottom: false,
-            follow_tail: true,
-            draft: String::new(),
+            ..AgentView::new(log, Entity::PLACEHOLDER)
         }
     }
 

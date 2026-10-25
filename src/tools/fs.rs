@@ -6,8 +6,9 @@
 use serde_json::Value;
 
 use crate::tools::{
-    DEFAULT_GREP_MATCHES, MAX_GREP_CONTEXT, MAX_GREP_MATCHES, bool_option, optional_u64,
-    registration::tool_handlers, registry::CallContext, required_u64, world::ToolWorld,
+    DEFAULT_GREP_MATCHES, MAX_GREP_CONTEXT, MAX_GREP_MATCHES, bool_option, optional_str,
+    optional_u64, registration::tool_handlers, registry::CallContext, required_str, required_u64,
+    world::ToolWorld,
 };
 
 fn fs_read(
@@ -15,18 +16,19 @@ fn fs_read(
     arguments: &Value,
     _call: &CallContext<'_>,
 ) -> (String, bool) {
-    match arguments.get("path").and_then(Value::as_str) {
-        Some(path) => match (
-            optional_u64(arguments, "offset"),
-            required_u64(arguments, "limit"),
-        ) {
-            (Ok(offset), Ok(limit)) => match world.fs.read_range(path, offset, Some(limit)) {
-                Ok(content) => (content, false),
-                Err(err) => (err, true),
-            },
-            (Err(err), _) | (_, Err(err)) => (err, true),
+    let path = match required_str(arguments, "path") {
+        Ok(path) => path,
+        Err(err) => return (err, true),
+    };
+    match (
+        optional_u64(arguments, "offset"),
+        required_u64(arguments, "limit"),
+    ) {
+        (Ok(offset), Ok(limit)) => match world.fs.read_range(path, offset, Some(limit)) {
+            Ok(content) => (content, false),
+            Err(err) => (err, true),
         },
-        None => ("missing required string parameter `path`".to_owned(), true),
+        (Err(err), _) | (_, Err(err)) => (err, true),
     }
 }
 
@@ -35,16 +37,11 @@ fn fs_grep(
     arguments: &Value,
     _call: &CallContext<'_>,
 ) -> (String, bool) {
-    let Some(pattern) = arguments.get("pattern").and_then(Value::as_str) else {
-        return (
-            "missing required string parameter `pattern`".to_owned(),
-            true,
-        );
+    let pattern = match required_str(arguments, "pattern") {
+        Ok(pattern) => pattern,
+        Err(err) => return (err, true),
     };
-    let path = arguments
-        .get("path")
-        .and_then(Value::as_str)
-        .filter(|path| !path.is_empty());
+    let path = optional_str(arguments, "path").filter(|path| !path.is_empty());
     let context = match optional_u64(arguments, "context") {
         Ok(context) => context.unwrap_or(0).min(MAX_GREP_CONTEXT) as usize,
         Err(err) => return (err, true),
@@ -83,27 +80,26 @@ fn fs_sed(
     arguments: &Value,
     _call: &CallContext<'_>,
 ) -> (String, bool) {
-    match arguments.get("path").and_then(Value::as_str) {
-        Some(path) => {
-            let start = match optional_u64(arguments, "start_line") {
-                Ok(start) => start,
-                Err(err) => return (err, true),
-            };
-            let end = match optional_u64(arguments, "end_line") {
-                Ok(end) => end,
-                Err(err) => return (err, true),
-            };
-            match world.fs.line_range(
-                path,
-                start,
-                end,
-                bool_option(arguments, "line_numbers", true),
-            ) {
-                Ok(output) => (output, false),
-                Err(err) => (err, true),
-            }
-        }
-        None => ("missing required string parameter `path`".to_owned(), true),
+    let path = match required_str(arguments, "path") {
+        Ok(path) => path,
+        Err(err) => return (err, true),
+    };
+    let start = match optional_u64(arguments, "start_line") {
+        Ok(start) => start,
+        Err(err) => return (err, true),
+    };
+    let end = match optional_u64(arguments, "end_line") {
+        Ok(end) => end,
+        Err(err) => return (err, true),
+    };
+    match world.fs.line_range(
+        path,
+        start,
+        end,
+        bool_option(arguments, "line_numbers", true),
+    ) {
+        Ok(output) => (output, false),
+        Err(err) => (err, true),
     }
 }
 
@@ -140,14 +136,13 @@ fn fs_edit_lines(
     arguments: &Value,
     _call: &CallContext<'_>,
 ) -> (String, bool) {
-    let Some(path) = arguments.get("path").and_then(Value::as_str) else {
-        return ("missing required string parameter `path`".to_owned(), true);
+    let path = match required_str(arguments, "path") {
+        Ok(path) => path,
+        Err(err) => return (err, true),
     };
-    let Some(content) = arguments.get("content").and_then(Value::as_str) else {
-        return (
-            "missing required string parameter `content`".to_owned(),
-            true,
-        );
+    let content = match required_str(arguments, "content") {
+        Ok(content) => content,
+        Err(err) => return (err, true),
     };
     let start = match required_u64(arguments, "start_line") {
         Ok(start) => start,
@@ -196,12 +191,13 @@ fn fs_delete(
     arguments: &Value,
     _call: &CallContext<'_>,
 ) -> (String, bool) {
-    match arguments.get("path").and_then(Value::as_str) {
-        Some(path) => match world.fs.delete(path) {
-            Ok(message) => (message, false),
-            Err(err) => (err, true),
-        },
-        None => ("missing required string parameter `path`".to_owned(), true),
+    let path = match required_str(arguments, "path") {
+        Ok(path) => path,
+        Err(err) => return (err, true),
+    };
+    match world.fs.delete(path) {
+        Ok(message) => (message, false),
+        Err(err) => (err, true),
     }
 }
 

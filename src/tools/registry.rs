@@ -50,6 +50,9 @@ pub(crate) enum Execution {
     Script,
     /// The model-facing `execute` tool: dispatches another tool by name.
     Gateway,
+    /// No handler is wired up for this definition. Tests reject this state;
+    /// at runtime it reports the same error as a direct call.
+    Missing,
 }
 
 /// Whether a tool may only be reached by naming it explicitly.
@@ -133,6 +136,26 @@ pub(crate) fn find(world: &ToolWorld<'_, '_>, name: &str) -> Option<Found> {
         })
 }
 
+/// Spawn one tool entity and apply the registration markers.
+///
+/// Both the static catalog and `.tools` reconciler go through this so
+/// advertisement and model-only policy cannot drift between them.
+pub(crate) fn spawn_tool(
+    commands: &mut Commands,
+    entry: ToolEntry,
+    advertised: bool,
+    model_only: bool,
+) -> Entity {
+    let mut entity = commands.spawn(entry);
+    if advertised {
+        entity.insert(Advertised);
+    }
+    if model_only {
+        entity.insert(ModelOnly);
+    }
+    entity.id()
+}
+
 /// Spawn one entity per statically registered tool.
 ///
 /// Runs in `PreStartup`, so every `Startup` consumer already sees the whole
@@ -149,19 +172,18 @@ pub(crate) fn register_static_tools(mut commands: Commands) {
         model_only,
     } in static_tools()
     {
-        let mut entity = commands.spawn(ToolEntry {
-            definition,
-            execution,
-            availability,
-            order,
-            tags,
-            auto_background,
-        });
-        if advertised {
-            entity.insert(Advertised);
-        }
-        if model_only {
-            entity.insert(ModelOnly);
-        }
+        spawn_tool(
+            &mut commands,
+            ToolEntry {
+                definition,
+                execution,
+                availability,
+                order,
+                tags,
+                auto_background,
+            },
+            advertised,
+            model_only,
+        );
     }
 }

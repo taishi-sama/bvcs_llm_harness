@@ -408,8 +408,9 @@ pub fn validate_entries(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{assistant_text, system_message, text_user, tool_call, tool_result};
     use llm_history_model::history::{
-        DraftBlock, Image, ImageMIME, MessageContent, SystemMessageKind, ToolCall, ToolCallResult,
+        DraftBlock, Image, ImageMIME, MessageContent, ToolCall, ToolCallResult,
     };
 
     fn openai_config() -> ModelConfig {
@@ -437,47 +438,6 @@ mod tests {
             },
             tools: Default::default(),
             max_tokens: Some(1024),
-        }
-    }
-
-    fn text_user(t: &str) -> Entry {
-        Entry::UserMessage {
-            content: MessageContent {
-                text: Some(t.into()),
-                image: None,
-            },
-        }
-    }
-
-    fn assistant_text(t: &str) -> Entry {
-        Entry::response_text(t)
-    }
-
-    fn system_message(content: &str) -> Entry {
-        Entry::SystemMessage {
-            kind: SystemMessageKind::Environment,
-            content: content.into(),
-        }
-    }
-
-    fn tool_call(id: &str) -> Entry {
-        Entry::ResponseToolCall {
-            blocks: Vec::new(),
-            tool_call: vec![ToolCall {
-                tool_name: "get_weather".into(),
-                toolcall_params: r#"{"city":"Oslo"}"#.into(),
-                tool_use_id: id.into(),
-            }],
-        }
-    }
-
-    fn tool_result(id: &str) -> Entry {
-        Entry::ToolCallResult {
-            tool_call: vec![ToolCallResult {
-                result: "sunny".into(),
-                is_error: false,
-                tool_use_id: id.into(),
-            }],
         }
     }
 

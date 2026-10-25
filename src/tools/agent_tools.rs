@@ -3,16 +3,17 @@
 //! Registered through the shared `tool_handlers!` macro, which generates the
 //! `handler` lookup used by `catalog::execution`.
 
+use bevy::prelude::Query;
 use llm_history_model::history::Entry;
 use serde_json::Value;
 
 use crate::{
-    agent::{MAX_AGENTS, create_agent},
+    agent::{Agent, AgentIndex, MAX_AGENTS, create_agent},
     messages::{RemoveAgentRequest, RenameAgentRequest, SendAgentMessage},
     tools::{
         entry_sender, entry_type, history_agent, history_window, initial_task_message,
         optional_i64, optional_u64, registration::tool_handlers, registry::CallContext,
-        world::ToolWorld,
+        required_u64, sorted_agent_names, world::ToolWorld,
     },
 };
 
@@ -44,12 +45,10 @@ fn send_message_to_agent(
                     false,
                 )
             } else {
-                let mut names = world.index.by_name.keys().cloned().collect::<Vec<_>>();
-                names.sort();
                 (
                     format!(
                         "No agent named `{target_name}`. Available agents: {}",
-                        names.join(", ")
+                        sorted_agent_names(&world.index).join(", ")
                     ),
                     true,
                 )
@@ -67,8 +66,7 @@ fn list_agents(
     _arguments: &Value,
     call: &CallContext<'_>,
 ) -> (String, bool) {
-    let mut names = world.index.by_name.keys().cloned().collect::<Vec<_>>();
-    names.sort();
+    let names = sorted_agent_names(&world.index);
     let available = names
         .into_iter()
         .map(|name| {
@@ -94,16 +92,36 @@ fn history_target_name<'a>(arguments: &'a Value, source_agent: &'a str) -> &'a s
         .unwrap_or(source_agent)
 }
 
+/// Resolve the agent whose history a tool call wants to read.
+fn resolve_history_target<'a>(
+    arguments: &Value,
+    source_agent: &str,
+    index: &AgentIndex,
+    agents: &'a Query<&Agent>,
+) -> Result<(String, &'a Agent), String> {
+    let target_name = history_target_name(arguments, source_agent).to_owned();
+    let target = history_agent(&target_name, index, agents)?;
+    Ok((target_name, target))
+}
+
+/// Pretty-print a tool response payload.
+fn pretty_json(value: &Value, what: &str) -> (String, bool) {
+    match serde_json::to_string_pretty(value) {
+        Ok(json) => (json, false),
+        Err(err) => (format!("could not serialize {what}: {err}"), true),
+    }
+}
+
 fn get_agent_history(
     world: &mut ToolWorld<'_, '_>,
     arguments: &Value,
     call: &CallContext<'_>,
 ) -> (String, bool) {
-    let target_name = history_target_name(arguments, call.source_agent);
-    let target = match history_agent(target_name, &world.index, &world.agents) {
-        Ok(target) => target,
-        Err(err) => return (err, true),
-    };
+    let (_, target) =
+        match resolve_history_target(arguments, call.source_agent, &world.index, &world.agents) {
+            Ok(target) => target,
+            Err(err) => return (err, true),
+        };
     let position = match optional_i64(arguments, "position") {
         Ok(position) => position,
         Err(err) => return (err, true),
@@ -127,10 +145,7 @@ fn get_agent_history(
         })
         .collect::<Vec<_>>();
 
-    match serde_json::to_string_pretty(&items) {
-        Ok(json) => (json, false),
-        Err(err) => (format!("could not serialize history: {err}"), true),
-    }
+    pretty_json(&Value::Array(items), "history")
 }
 
 fn get_agent_message(
@@ -138,24 +153,14 @@ fn get_agent_message(
     arguments: &Value,
     call: &CallContext<'_>,
 ) -> (String, bool) {
-    let target_name = history_target_name(arguments, call.source_agent);
-    let target = match history_agent(target_name, &world.index, &world.agents) {
-        Ok(target) => target,
+    let (target_name, target) =
+        match resolve_history_target(arguments, call.source_agent, &world.index, &world.agents) {
+            Ok(target) => target,
+            Err(err) => return (err, true),
+        };
+    let message_index = match required_u64(arguments, "index") {
+        Ok(index) => index,
         Err(err) => return (err, true),
-    };
-    let message_index = match arguments.get("index") {
-        None | Some(Value::Null) => {
-            return (
-                "missing required integer parameter `index`".to_owned(),
-                true,
-            );
-        }
-        Some(value) => match value.as_u64() {
-            Some(index) => index,
-            None => {
-                return ("`index` must be a non-negative integer".to_owned(), true);
-            }
-        },
     };
 
     let history = target.history();
@@ -171,10 +176,7 @@ fn get_agent_message(
     };
 
     let payload = message_payload(entry, entry_sender(entry, target.name()), message_index);
-    match serde_json::to_string_pretty(&payload) {
-        Ok(json) => (json, false),
-        Err(err) => (format!("could not serialize message: {err}"), true),
-    }
+    pretty_json(&payload, "message")
 }
 
 /// Message view shared with `get_agent_history`'s per-item metadata.

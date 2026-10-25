@@ -19,7 +19,7 @@ A tool is an **ECS entity**, not an entry in a central map.
 | Discovery policy | `ToolEntry.availability: Availability` | `src/tools/registry.rs` |
 | Default auto-background participation | `ToolEntry.auto_background: bool` | `src/tools/registry.rs` |
 
-`Execution` has four cases:
+`Execution` has five cases:
 
 ```rust
 enum Execution {
@@ -27,22 +27,26 @@ enum Execution {
     Interpreter,      // submitted to the agent's persistent Boa thread
     Script,           // submitted to a fresh .tools Boa context
     Gateway,          // the model-facing `execute` tool
+    Missing,          // definition with no handler; rejected by tests
 }
 ```
 
 Definitions live in exactly one place: `definitions()` in `src/tools.rs`.
 Exposure policy lives in `src/tools/catalog.rs`:
 
-- `policy(name)` — advertised or manual, `order`, `tags`, and `model_only`
+- `policy(name)` — advertised or manual, `order`, `tags`, `model_only`, and
+  `auto_background`
 - `execution(name)` — which `Execution` the name maps to
-- `auto_background(name)`, `is_implemented(name)`
+- `is_implemented(name)` — whether `execution` resolved a real handler
 
 Inline handler registration is uniform. Every module that implements
 synchronous tools ends with the shared `tool_handlers!` macro from
 `src/tools/registration.rs`, which generates that module's
 `handler(name) -> Option<ToolFn>` lookup. `catalog::execution` chains the lookups
-(`fs`, `agent_tools`, `search`, `rescan`) through `inline_handler` and falls back
-to `no_handler` only for a definition that was never wired up.
+(`fs`, `agent_tools`, `search`, `rescan`) through `inline_handler` and returns
+`Execution::Missing` for a definition that was never wired up. Static and script
+tools both spawn through `registry::spawn_tool`, so the `Advertised` and
+`ModelOnly` markers cannot drift between them.
 
 Registration runs in `PreStartup` (`src/main.rs`):
 
@@ -90,7 +94,8 @@ assistant stream
       ├─ Execution::Inline     → execute_tool(&mut world, name, args, &CallContext)
       ├─ Execution::Gateway    → dispatch_gateway(...)
       ├─ Execution::Interpreter→ interpreter_task(...) → JsRuntimeHandle::submit
-      └─ Execution::Script     → ScriptRuntime::submit
+      ├─ Execution::Script     → ScriptRuntime::submit
+      └─ Execution::Missing    → "tool has no registered handler" result
       │
       ├─ sync results fill results[call_index]; remaining -= 1
       ├─ async results are tracked:
@@ -111,6 +116,8 @@ assistant stream
 3. `Execution::Inline(handler)` → call with `ToolWorld` and `CallContext`
 4. `Interpreter` / `Script` / `Gateway` reached here are rejected — those are
    dispatched by `execute_tool_calls` (model path) or handled by the gateway.
+5. `Execution::Missing` reports `tool has no registered handler`; tests reject
+   that state before it can reach the model.
 
 Every handler returns `(String, bool)` where the bool is `is_error`. Handlers
 must use `world.commands` for world mutation and messages; they never panic.
@@ -277,11 +284,11 @@ running (bounded by Boa's loop iteration limit, `10_000_000`).
    branch to add in `catalog::execution`.
 5. Add policy in `catalog::policy(name)` (`advertises` or `manual`). Chain
    `.model_only()` when scripts and JavaScript must not call the tool (agent
-   lifecycle and the interpreter itself).
-6. If it needs the global background grace, return `true` from
-   `catalog::auto_background(name)`.
-7. Tests: `every_definition_has_a_handler`, the advertisement trim test, plus a
-   handler-level test. If it mutates the world, drive it through an `App` test.
+   lifecycle and the interpreter itself), and `.auto_background()` to opt into
+   the global background grace period.
+6. Tests: `every_definition_has_a_handler`,
+   `registration_flags_match_the_policy_table`, plus a handler-level test. If it
+   mutates the world, drive it through an `App` test.
 
 ### Async tool (own thread or existing runtime)
 
@@ -341,7 +348,7 @@ call starts.
 | Definitions | `src/tools.rs` (`definitions`) |
 | Exposure policy, registration, gateway definitions | `src/tools/catalog.rs` |
 | Uniform handler-registration macro | `src/tools/registration.rs` |
-| Entity components, `find`, static spawn | `src/tools/registry.rs` |
+| Tool entity spawn + markers | `src/tools/registry.rs` |
 | Handler context | `src/tools/world.rs` |
 | Round/budget/detach bookkeeping | `src/tools/schedule.rs` |
 | Model dispatch, host bridges, completion routing | `src/agent.rs` |

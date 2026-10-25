@@ -23,13 +23,16 @@ thread-bound, not part of unit tests.
 - Boa behavior is tested through `JsSession::new_isolated` /
   `new_tools_isolated`, which use a refusing host. That covers imports, fresh
   contexts, `execute` and result rendering without a Bevy app.
-- Test helpers live in the module they test; avoid shared fixtures that two
-  subsystems can drift from.
+- Provider-neutral test constructors (`text_user`, `tool_call`, `tool`,
+  `validated_assistant_history`) live in `llm_api::test_support`; provider
+  `config()` helpers stay local to their module. Main-crate UI tests reuse
+  `AgentView::new` instead of spelling every placeholder field. Avoid sharing a
+  fixture that two subsystems genuinely need to configure differently.
 
 When adding a tool, add at least:
 
 1. `every_definition_has_a_handler` still passes (definition → execution).
-2. the advertisement trim test reflects your policy choice.
+2. `registration_flags_match_the_policy_table` reflects your policy choice.
 3. a handler or App-level test for the happy path and one error path.
 
 ## Driving the app with BRP

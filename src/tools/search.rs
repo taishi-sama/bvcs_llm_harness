@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use crate::tools::registration::tool_handlers;
 use crate::tools::registry::ToolEntry;
-use crate::tools::{is_truthy, world::ToolWorld};
+use crate::tools::{CallContext, bool_option, optional_u64, world::ToolWorld};
 
 const DEFAULT_MAX: u64 = 20;
 const MAX_RESULTS: u64 = 100;
@@ -22,7 +22,7 @@ const MAX_FILTER_LEN: usize = 256;
 pub(crate) fn search_tools(
     world: &mut ToolWorld<'_, '_>,
     args: &Value,
-    _call: &crate::tools::registry::CallContext<'_>,
+    _call: &CallContext<'_>,
 ) -> (String, bool) {
     let filter = args
         .get("filter")
@@ -36,15 +36,15 @@ pub(crate) fn search_tools(
         );
     }
 
-    let requested_max = args.get("max").and_then(Value::as_u64);
+    let requested_max = match optional_u64(args, "max") {
+        Ok(max) => max,
+        Err(err) => return (err, true),
+    };
     if requested_max == Some(0) {
         return ("`max` must be at least 1".to_owned(), true);
     }
     let max = requested_max.unwrap_or(DEFAULT_MAX).min(MAX_RESULTS) as usize;
-    let descriptions = match args.get("search_descriptions") {
-        None | Some(Value::Null) => true,
-        value => is_truthy(value),
-    };
+    let descriptions = bool_option(args, "search_descriptions", true);
 
     let regex = if filter.is_empty() {
         None
