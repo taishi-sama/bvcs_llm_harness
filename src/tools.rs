@@ -61,6 +61,7 @@ pub(crate) fn interpreter_task(
             let source = fs.read(file)?;
             Ok(JsTask::Eval {
                 source,
+                name: Some(file.to_owned()),
                 depth,
                 root,
             })
@@ -72,6 +73,7 @@ pub(crate) fn interpreter_task(
                 .ok_or_else(|| "missing required string parameter `code`".to_owned())?;
             Ok(JsTask::Eval {
                 source: code.to_owned(),
+                name: None,
                 depth,
                 root,
             })
@@ -260,6 +262,91 @@ pub(crate) fn is_truthy(value: Option<&Value>) -> bool {
     }
 }
 
+/// Validate one script tool's arguments against its advertised manifest.
+///
+/// Built-in tools keep their hand-written checks. Script tools previously used
+/// `parameters` for documentation only, so a missing required argument produced
+/// a plausible but wrong answer instead of an error. Unknown keys are passed
+/// through (the same permissive policy as the built-ins).
+pub(crate) fn validate_script_arguments(
+    world: &ToolWorld<'_, '_>,
+    name: &str,
+    arguments: &Value,
+) -> Result<(), String> {
+    let Some(found) = find(world, name) else {
+        return Ok(());
+    };
+    let Ok((_, entry, _, _, _)) = world.tools.get(found.entity) else {
+        return Ok(());
+    };
+    validate_manifest_arguments(&entry.definition, arguments)
+}
+
+fn validate_manifest_arguments(definition: &Tool, arguments: &Value) -> Result<(), String> {
+    let empty = serde_json::Map::new();
+    let values = match arguments {
+        Value::Object(values) => values,
+        Value::Null => &empty,
+        other => {
+            return Err(format!(
+                "`{}` arguments must be a JSON object, not {}",
+                definition.name,
+                json_type_name(other)
+            ));
+        }
+    };
+
+    for (name, parameter) in &definition.parameters {
+        match values.get(name) {
+            None | Some(Value::Null) if parameter.required => {
+                return Err(format!(
+                    "missing required {} parameter `{name}`",
+                    parameter_type_name(&parameter.r#type)
+                ));
+            }
+            None | Some(Value::Null) => {}
+            Some(value) if !argument_matches(&parameter.r#type, value) => {
+                return Err(format!(
+                    "`{name}` must be a {}",
+                    parameter_type_name(&parameter.r#type)
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+
+    Ok(())
+}
+
+const fn parameter_type_name(parameter_type: &ParameterType) -> &'static str {
+    match parameter_type {
+        ParameterType::String => "string",
+        ParameterType::Number => "number",
+        ParameterType::Boolean => "boolean",
+        ParameterType::Object => "object",
+    }
+}
+
+fn argument_matches(parameter_type: &ParameterType, value: &Value) -> bool {
+    match parameter_type {
+        ParameterType::String => value.is_string(),
+        ParameterType::Number => value.is_number(),
+        ParameterType::Boolean => value.is_boolean(),
+        ParameterType::Object => value.is_object(),
+    }
+}
+
+const fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
 /// Every tool definition. This is the single source of truth for names,
 /// descriptions, and parameter schemas; exposure is decided by `catalog`.
 pub(crate) fn definitions() -> Vec<Tool> {
@@ -332,7 +419,7 @@ pub(crate) fn definitions() -> Vec<Tool> {
                     "max".to_owned(),
                     ParameterDescription {
                         r#type: ParameterType::Number,
-                        description: "Maximum number of matches to return (default 20, max 100)"
+                        description: "Maximum number of matches to return (default 20, min 1, max 100)"
                             .into(),
                         required: false,
                     },
@@ -351,9 +438,11 @@ pub(crate) fn definitions() -> Vec<Tool> {
         Tool {
             name: "fs_read".into(),
             description: Some(
-                "Read a file from the shared virtual flat filesystem. Every LLM Agent sees \
-                 the same files. Paths are plain file names without directories. Use `offset` \
-                 and the required `limit` to read a byte range instead of the whole file."
+                "Read a file from the shared virtual filesystem. Every LLM Agent sees \
+                 the same files. Root paths are plain file names; `.tools/<dir>/<file>` is \
+                 the only hierarchical mount. Use `offset` and the required `limit` to read \
+                 a byte range. A result shorter than `limit` means the range reached end of \
+                 file; there is no truncation marker."
                     .into(),
             ),
             parameters: HashMap::from([
@@ -432,7 +521,7 @@ pub(crate) fn definitions() -> Vec<Tool> {
                     "max_matches".to_owned(),
                     ParameterDescription {
                         r#type: ParameterType::Number,
-                        description: "Optional maximum number of matching lines to report (default 200)"
+                        description: "Optional maximum number of matching lines to report (default 200, min 1, max 5000)"
                             .into(),
                         required: false,
                     },
@@ -487,8 +576,9 @@ pub(crate) fn definitions() -> Vec<Tool> {
         Tool {
             name: "fs_ls".into(),
             description: Some(
-                "List files in the shared virtual flat filesystem with their sizes and line \
-                 counts. Every LLM Agent sees the same files."
+                "List files in the shared virtual filesystem with their sizes and line \
+                 counts: root files first, then every `.tools` key. Every LLM Agent sees the \
+                 same files."
                     .into(),
             ),
             parameters: HashMap::new(),
@@ -496,8 +586,9 @@ pub(crate) fn definitions() -> Vec<Tool> {
         Tool {
             name: "fs_write".into(),
             description: Some(
-                "Create or overwrite a file in the shared virtual flat filesystem. Every LLM \
-                 Agent sees the same files. Paths are plain file names without directories."
+                "Create or overwrite a file in the shared virtual filesystem. Every LLM \
+                 Agent sees the same files. Root paths are plain file names; \
+                 `.tools/<dir>/<file>` is the only hierarchical mount."
                     .into(),
             ),
             parameters: HashMap::from([
@@ -616,7 +707,11 @@ pub(crate) fn definitions() -> Vec<Tool> {
         },
         Tool {
             name: "fs_delete".into(),
-            description: Some("Delete a file from the shared virtual flat filesystem.".into()),
+            description: Some(
+                "Delete a file from the shared virtual filesystem: a root file name or \
+                 `.tools/<dir>/<file>`."
+                    .into(),
+            ),
             parameters: HashMap::from([(
                 "path".to_owned(),
                 ParameterDescription {
@@ -689,7 +784,7 @@ pub(crate) fn definitions() -> Vec<Tool> {
                     ParameterDescription {
                         r#type: ParameterType::String,
                         description: "JavaScript source code to execute".into(),
-                        required: false,
+                        required: true,
                     },
                 ),
                 (
@@ -708,7 +803,8 @@ pub(crate) fn definitions() -> Vec<Tool> {
             description: Some(
                 "Drop JavaScript state for this LLM Agent. Pass `symbol` to remove one \
                  configurable global variable, or omit/empty `symbol` to drop the whole \
-                 persistent context. Lexical let/const bindings cannot be removed individually."
+                 persistent context. Lexical let/const bindings and non-configurable var \
+                 bindings cannot be removed individually."
                     .into(),
             ),
             parameters: HashMap::from([(
@@ -735,7 +831,7 @@ pub(crate) fn definitions() -> Vec<Tool> {
                     ParameterDescription {
                         r#type: ParameterType::String,
                         description: "Exact target agent title, for example `LLM Agent 2`".into(),
-                        required: false,
+                        required: true,
                     },
                 ),
                 (
@@ -743,7 +839,7 @@ pub(crate) fn definitions() -> Vec<Tool> {
                     ParameterDescription {
                         r#type: ParameterType::String,
                         description: "Message to send to the target agent".into(),
-                        required: false,
+                        required: true,
                     },
                 ),
             ]),
@@ -797,6 +893,7 @@ pub(crate) fn definitions() -> Vec<Tool> {
             name: "get_agent_message".into(),
             description: Some(
                 "Read one message from an agent's conversation history, serialized as JSON. \
+                 The result has `type`, `sender`, `message_index`, and the raw `message`. \
                  Omit `agent` to read this agent's history. Use the `message_index` values from \
                  get_agent_history."
                     .into(),
@@ -860,7 +957,7 @@ pub(crate) fn definitions() -> Vec<Tool> {
                 ParameterDescription {
                     r#type: ParameterType::String,
                     description: "New unique name for this agent".into(),
-                    required: false,
+                    required: true,
                 },
             )]),
         },
@@ -1069,6 +1166,10 @@ mod tests {
             ("fs_write", "content"),
             ("fs_edit_pattern", "pattern"),
             ("get_agent_message", "index"),
+            ("eval_javascript", "code"),
+            ("send_message_to_agent", "agent"),
+            ("send_message_to_agent", "message"),
+            ("rename_self", "name"),
         ] {
             assert!(
                 parameter(tool, name).required,
@@ -1087,6 +1188,69 @@ mod tests {
         for (name, parameter) in &search.parameters {
             assert!(!parameter.required, "`{name}` should be optional");
         }
+    }
+
+    #[test]
+    fn script_manifest_arguments_are_validated() {
+        let tool = Tool {
+            name: "demo".into(),
+            description: None,
+            parameters: HashMap::from([
+                (
+                    "text".to_owned(),
+                    ParameterDescription {
+                        r#type: ParameterType::String,
+                        description: String::new(),
+                        required: true,
+                    },
+                ),
+                (
+                    "count".to_owned(),
+                    ParameterDescription {
+                        r#type: ParameterType::Number,
+                        description: String::new(),
+                        required: false,
+                    },
+                ),
+            ]),
+        };
+
+        assert!(validate_manifest_arguments(&tool, &serde_json::json!({ "text": "hi" })).is_ok());
+        assert!(
+            validate_manifest_arguments(&tool, &serde_json::json!({ "text": "hi", "count": 2 }))
+                .is_ok()
+        );
+        assert!(
+            validate_manifest_arguments(&tool, &Value::Null)
+                .unwrap_err()
+                .contains("missing required string parameter `text`")
+        );
+        assert!(
+            validate_manifest_arguments(&tool, &serde_json::json!({ "text": 1 }))
+                .unwrap_err()
+                .contains("`text` must be a string")
+        );
+        assert!(
+            validate_manifest_arguments(
+                &tool,
+                &serde_json::json!({ "text": "hi", "count": "two" })
+            )
+            .unwrap_err()
+            .contains("`count` must be a number")
+        );
+        assert!(
+            validate_manifest_arguments(&tool, &serde_json::json!("hi"))
+                .unwrap_err()
+                .contains("must be a JSON object")
+        );
+
+        let no_parameters = Tool {
+            name: "noparams".into(),
+            description: None,
+            parameters: HashMap::new(),
+        };
+        assert!(validate_manifest_arguments(&no_parameters, &serde_json::json!({})).is_ok());
+        assert!(validate_manifest_arguments(&no_parameters, &Value::Null).is_ok());
     }
 
     #[test]

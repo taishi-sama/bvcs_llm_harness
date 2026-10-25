@@ -42,7 +42,7 @@ module directory resolved by convention.
 | --- | --- | --- |
 | `name` | required | must equal the directory name; unique among all tools |
 | `description` | `Tool defined in .tools/<dir>` | model-facing |
-| `parameters` | `{}` | `type` is `string` / `number` / `boolean`; `required` defaults `true` |
+| `parameters` | `{}` | `type` is `string` / `number` / `boolean`; `description` is required; `required` defaults `true` |
 | `entry` | `main.js` | must be a `.js` file that exists in the tree |
 | `export` | `main` | exported function the host calls |
 | `order` | `500` | advertisement order; script tools start at `1000 + order` |
@@ -82,10 +82,12 @@ A call is exactly “reset the context, evaluate the entry module, call
 - a fresh Boa context per call (no globals or module state leak between calls)
 - the same `print`/`console`, `execute(tool, args)`, result rendering, and error
   formatting as `eval_javascript`
-- `main` is called synchronously with one argument: the parsed JSON arguments
-  object
-- the result is printed output followed by the returned expression; a `throw`
-  becomes an error result
+- arguments are validated against the manifest before the context is created:
+  missing required parameters and wrong declared types are errors; unknown keys
+  are passed through
+- `main` is called with one argument: the parsed JSON arguments object
+- a returned promise is awaited; printed output is followed by the returned
+  value, and a `throw` (or rejected promise) becomes an error result
 - libraries are instantiated per call, so they cannot hold cross-call state.
   Persist data through the VFS tools instead.
 
@@ -118,17 +120,26 @@ Disk edits made outside the harness are invisible until an explicit rescan:
 
 ## Live registration and rescan
 
-- `reconcile_script_tools` runs every frame but does work only when
-  `VirtualFs::tools().revision` changes. It fingerprints each manifest
+- `reconcile_script_tools` runs after tool calls and before the next request's
+  schema is built. It does work only when `VirtualFs::tools().revision` changes
+  (or a rescan requested a forced apply). It fingerprints each manifest
   (definition + entry + export + order), then spawns / updates / despawns tool
   entities and updates `ToolRegistryStatus`.
-- `rescan_tools(apply = true, source = "vfs" | "disk")` performs the same diff
-  on demand and returns a report: registered / added / removed / changed /
-  broken / libraries. `apply: false` is a dry run; it records the revision so
-  the automatic reconciler does not apply it later.
+- `rescan_tools(apply = true, source = "vfs" | "disk")` returns the same diff and
+  asks the automatic reconciler to apply it after tool calls, before the next
+  request. The first number is how many valid script tools the scan found in
+  `.tools`, not the live registry size. Because hot reload usually applied the
+  change already, an empty diff is followed by the last automatic change.
+- `apply: false` is a dry run; it records the revision so the automatic
+  reconciler does not apply that diff, and a later dry run cancels an earlier
+  pending apply in the same frame. Deletions stay registered (and advertised)
+  until an explicit apply, so a call can fail with "missing tool source" in the
+  meantime.
 - Broken manifests never abort the scan: they are skipped and reported (invalid
   JSON, name/dir mismatch, missing or non-`.js` entry, duplicate name, collision
-  with a built-in or a JavaScript host tool).
+  with a built-in or a JavaScript host tool). JSON syntax errors carry a
+  line/column; typed field errors mention that nested objects such as parameters
+  are checked too.
 
 ## Example
 

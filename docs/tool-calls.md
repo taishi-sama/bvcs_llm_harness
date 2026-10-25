@@ -58,8 +58,10 @@ agent.model_config(advertised_tools(&tools))
 
 `advertised_tools` queries `With<Advertised>, Without<DisabledTool>`, sorts by
 `(order, name)` (stable across archetype changes, which matters for prompt
-caching), and clones the definitions. The schema is therefore a snapshot per
-turn: changes made during a turn apply to the next request.
+caching), and clones the definitions. The schema is a snapshot per request:
+`reconcile_script_tools` runs after tool calls and before `start_agent_turn`, so
+a manifest written or deleted by a tool call is reflected in the next request of
+the same turn.
 
 `search_tools` can expose non-advertised tools, but it does not change what is
 advertised. The model can still name any registered tool; the harness
@@ -284,11 +286,13 @@ Create:
 .tools/<name>/main.js     # export function main(args) { ... }
 ```
 
-The reconciler registers it automatically on the next frame after the tree
-changes, or run `rescan_tools` (`apply = true`, `source = "vfs"`, or `"disk"` to
-reload `./.tools` first). Script tools run in a fresh Boa context per call;
-imports resolve relative to the referrer, then bare names via manifest entries
-or `index.js`/`main.js`.
+The reconciler registers it automatically after tool calls and before the next
+request. `rescan_tools` (`apply = true`, `source = "vfs"`, or `"disk"` to reload
+`./.tools`) reports the diff and asks that reconciler to apply it. Script tools
+run in a fresh Boa context per call; imports resolve relative to the referrer,
+then bare names via manifest entries or `index.js`/`main.js`. Arguments are
+checked against the manifest (required parameters and declared types) before the
+call starts.
 
 ## 10. Invariants and gotchas
 
@@ -306,7 +310,7 @@ or `index.js`/`main.js`.
 - Results are written by `call_index`; never append to a round.
 - A tool that needs another tool's result must not detach it.
 - Script sources are snapshotted (`ToolSources`); an edit applies to the next
-  call, not the one running.
+  frame/turn, not to a call in the same assistant batch.
 - `.tools` writes go through `VfsPath` validation and are mirrored to disk
   best-effort; the in-memory tree is the source of truth.
 - `end_agent` queues removal; the round still commits, then the agent is

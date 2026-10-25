@@ -17,9 +17,10 @@ agent does not “fix” a decision by accident.
   dispatches any tool with the same depth/budget/background rules as the
   JavaScript global. Direct tool calls remain possible; the gateway is not the
   only path.
-- **Discovery is not access control.** `OnlyManual` tools and script tools are
-  not advertised, but the model can name any registered tool. `search_tools`
-  makes hidden tools discoverable. There is no per-agent allowlist yet.
+- **Discovery is not access control.** `OnlyManual` tools are not advertised;
+  script tools are advertised from their manifests like built-ins. The model
+  can name any registered tool. `search_tools` makes hidden tools discoverable.
+  There is no per-agent allowlist yet.
 - **`.tools` is VFS-first.** The in-memory tree is authoritative; disk is a
   best-effort mirror. Boot seeds with mirroring suppressed. External disk edits
   require `rescan_tools(source: "disk")`.
@@ -40,6 +41,12 @@ agent does not “fix” a decision by accident.
   drops bookkeeping; the thread finishes and its result is discarded. A true
   cancellation would need a subprocess boundary.
 - Script concurrency is capped at 32 live calls; beyond that, calls fail fast.
+  A recursive script tool consumes one slot per level (the parent blocks on the
+  child), so it reaches this concurrency cap before `MAX_TOOL_DEPTH`; the error
+  describes the slot limit, not the nesting.
+- Script-tool arguments are validated against the manifest for required
+  parameters and declared types. Unknown keys are still passed through, the same
+  permissive policy as the built-ins.
 - Script host calls block their worker until the main loop answers. All current
   paths answer (errors included), but a new host command must do the same or
   the worker hangs.
@@ -52,8 +59,21 @@ agent does not “fix” a decision by accident.
 - There is no filesystem watcher. Disk edits are picked up at boot or with
   `rescan_tools(source: "disk")`.
 - `rescan_tools(apply: false, source: "disk")` records the new revision so the
-  automatic reconciler does not apply the dry run. A later unrelated edit
-  triggers reconciliation of the earlier dry-run diff too.
+  automatic reconciler does not apply the dry run; a later dry run also cancels
+  an earlier pending apply in the same frame. A later unrelated edit triggers
+  reconciliation of the earlier dry-run diff too. A dry run does not update the
+  live `ToolRegistryStatus` counts.
+- The automatic reconciler runs after tool calls and before the next request is
+  built. `rescan_tools` usually therefore reports `0 added / 0 removed /
+  0 changed` and appends the last applied diff ("last automatic change: …").
+  The first number is how many valid script tools the scan found in `.tools`,
+  not the live registry size.
+- A tool created and called in the same assistant batch is not visible to the
+  second call: entity spawns are applied at the next sync point. Create it in
+  one turn and call it in the next.
+- The scanner validates the manifest and that the entry file exists, but it does
+  not parse the module to verify the exported function. A missing `main` export
+  is reported at call time (`… does not export a callable 'main'`).
 - Reconciliation keys by tool name. A rename is a remove + add; a temporary
   name collision is reported and the second manifest is skipped.
 - `order` ties are broken by name; a manifest cannot force a position against a
@@ -70,6 +90,17 @@ agent does not “fix” a decision by accident.
   directory-only listing may be preferred later.
 - `.tools` data files are seeded and mirrored, but scripts reading them must use
   `fs_read` (there is no host filesystem access inside a script).
+- A `main.js` (or other source) without a `tool.json` is a plain importable
+  module, not a broken tool. Only a manifest without its entry is reported as
+  broken.
+- Save writes `.vfs_state/manifest` and prunes files listed by the previous save
+  that are no longer in the VFS. Files that no Save recorded (including a legacy
+  state directory) are never pruned and Load still imports them. Snapshot writes
+  are atomic and refuse symlinked target files; the state root itself is trusted
+  as configured.
+- `fs_read` is an exact byte-range API: it returns `min(limit, EOF - offset)`
+  bytes with no truncation marker. A short result means EOF; use `fs_ls` when the
+  size is needed up front.
 
 ### Tooling and UI
 
@@ -82,6 +113,11 @@ agent does not “fix” a decision by accident.
   JavaScript/script origins, but not for direct model calls (intended).
 - No per-agent tool visibility or allowlist. Every agent sees the same
   advertised set.
+- `end_agent` deliberately takes no target: an agent can only end itself.
+  Removing a peer is an operator action (the per-agent Kill button).
+- History `sender` is derived, not stored: a response entry is labelled with the
+  agent's current title, so a rename rewrites those labels. User-message
+  envelopes keep the sender name that was written when they were delivered.
 - `execute` and `search_tools` are advertised; the catalog is otherwise
   trimmed. Adjust `catalog::policy` if schema size becomes a problem.
 - The transcript presents `execute` as the tool it targets, but nested

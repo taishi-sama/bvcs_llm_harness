@@ -105,6 +105,16 @@ pub(crate) struct LibrarySpec {
     pub entry: String,
 }
 
+/// Parse a manifest in two steps so JSON syntax errors (trailing commas,
+/// unquoted keys) are reported as such instead of surfacing as a confusing
+/// "missing field" from the typed deserializer.
+fn parse_manifest<T: serde::de::DeserializeOwned>(path: &str, raw: &str) -> Result<T, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|err| format!("`{path}` is invalid JSON: {err}"))?;
+    serde_json::from_value(value)
+        .map_err(|err| format!("`{path}` is invalid: {err} (check nested objects too, if any)"))
+}
+
 /// Scan the tree for tool manifests. Invalid manifests are reported and
 /// skipped; they never abort the scan.
 pub(crate) fn scan_tools(tree: &ToolsTree, warnings: &mut Vec<String>) -> Vec<ScriptToolSpec> {
@@ -132,10 +142,10 @@ pub(crate) fn scan_tools(tree: &ToolsTree, warnings: &mut Vec<String>) -> Vec<Sc
         let Some((_, raw)) = tree.iter().find(|(path, _)| *path == manifest_path) else {
             continue;
         };
-        let parsed: RawTool = match serde_json::from_str(raw) {
+        let parsed: RawTool = match parse_manifest(manifest_path, raw) {
             Ok(parsed) => parsed,
             Err(err) => {
-                warnings.push(format!("`{manifest_path}` is invalid: {err}"));
+                warnings.push(err);
                 continue;
             }
         };
@@ -287,10 +297,10 @@ pub(crate) fn scan_libraries(tree: &ToolsTree, warnings: &mut Vec<String>) -> Ve
         let Some((_, raw)) = tree.iter().find(|(path, _)| *path == manifest_path) else {
             continue;
         };
-        let entry = match serde_json::from_str::<RawLibrary>(raw) {
+        let entry = match parse_manifest::<RawLibrary>(manifest_path, raw) {
             Ok(parsed) => parsed.entry,
             Err(err) => {
-                warnings.push(format!("`{manifest_path}` is invalid: {err}"));
+                warnings.push(err);
                 continue;
             }
         };
@@ -349,6 +359,33 @@ mod tests {
         assert!(spec.definition.parameters["query"].required);
         assert!(!spec.definition.parameters["limit"].required);
         assert_eq!(warnings.len(), 3, "{warnings:?}");
+    }
+
+    #[test]
+    fn manifest_errors_distinguish_syntax_from_missing_fields() {
+        let mut tree = ToolsTree::default();
+        write(
+            &mut tree,
+            "trailing/tool.json",
+            r#"{"name":"trailing","description":"x",}"#,
+        );
+        write(
+            &mut tree,
+            "nested/tool.json",
+            r#"{"name":"nested","description":"x","parameters":{"x":{"type":"string"}}}"#,
+        );
+
+        let mut warnings = Vec::new();
+        let specs = scan_tools(&tree, &mut warnings);
+        assert!(specs.is_empty());
+        assert!(
+            warnings.iter().any(|w| w.contains("invalid JSON")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("nested objects")),
+            "{warnings:?}"
+        );
     }
 
     #[test]

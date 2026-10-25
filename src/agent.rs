@@ -41,6 +41,7 @@ use crate::{
             complete_tool_request, finish_round_if_ready, parse_background_after,
             resolve_auto_background, send_nested_reply,
         },
+        validate_script_arguments,
     },
     transcript::{
         AgentTab, AgentView, CollapsibleText, RetryAgentButton, TextCollapseConfig,
@@ -1471,6 +1472,16 @@ pub(crate) fn execute_tool_calls(
                     }
                 }
                 Some(found) if matches!(found.execution, Execution::Script) => {
+                    if let Err(err) = validate_script_arguments(&world, &call.tool_name, &arguments)
+                    {
+                        results[call_index] = Some(ToolCallResult {
+                            result: err,
+                            is_error: true,
+                            tool_use_id: call.tool_use_id.clone(),
+                        });
+                        remaining -= 1;
+                        continue;
+                    }
                     let auto = resolve_auto_background(
                         AutoBackground::Default,
                         found.auto_background,
@@ -1786,6 +1797,10 @@ fn dispatch_gateway(
             }
         }
         Execution::Script => {
+            if let Err(err) = validate_script_arguments(world, &target_name, &target_arguments) {
+                rounds.refund_budget(root);
+                return gateway_error(err);
+            }
             let Ok(spec) = world.scripts.get(found.entity).cloned() else {
                 rounds.refund_budget(root);
                 return gateway_error(format!(
@@ -1986,6 +2001,9 @@ fn handle_host_tool(
             Err(format!("tool `{name}` can only be called by the model")),
         ),
         Execution::Script => {
+            if let Err(err) = validate_script_arguments(world, name, arguments) {
+                return reply_now(js_handles, reply, Err(err));
+            }
             let Ok(spec) = world.scripts.get(found.entity).cloned() else {
                 return reply_now(
                     js_handles,
@@ -2780,6 +2798,7 @@ mod background_tests {
             .expect("handle attached by observer")
             .submit(JsTask::Eval {
                 source: "6 * 7".to_owned(),
+                name: None,
                 depth: 0,
                 root: 0,
             })

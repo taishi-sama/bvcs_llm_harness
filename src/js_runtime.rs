@@ -30,7 +30,7 @@ use std::{
 };
 
 use bevy::{
-    log::error,
+    log::{debug, error},
     prelude::{Component, Discard, Entity, Insert, On, Query, Resource},
 };
 use boa_engine::{
@@ -63,6 +63,8 @@ pub(crate) enum ModuleRoot {
 pub(crate) enum JsTask {
     Eval {
         source: String,
+        /// Source name used in stack traces. `None` means `eval_javascript`.
+        name: Option<String>,
         /// Nesting below the model's root call.
         depth: u32,
         root: u64,
@@ -351,17 +353,31 @@ impl JsSession {
     }
 
     pub(crate) fn eval(&mut self, code: &str) -> Result<String, String> {
+        self.eval_named(code, None)
+    }
+
+    /// Evaluate with an optional source name, used in stack traces.
+    pub(crate) fn eval_named(&mut self, code: &str, name: Option<&str>) -> Result<String, String> {
         // Drop anything left over from an earlier evaluation before running.
         self.output.try_iter().for_each(drop);
 
+        match self.eval_inner(code, name) {
+            Ok(value) => Ok(value),
+            Err(err) => Err(self.with_printed_output(err)),
+        }
+    }
+
+    fn eval_inner(&mut self, code: &str, name: Option<&str>) -> Result<String, String> {
+        let path = PathBuf::from(name.unwrap_or("<eval_javascript>"));
         let value = self
             .context
-            .eval(Source::from_bytes(code))
+            .eval(Source::from_bytes(code).with_path(&path))
             .map_err(|err| format!("JavaScript error: {err}"))?;
         self.context
             .run_jobs()
             .map_err(|err| format!("JavaScript async error: {err}"))?;
 
+        let value = settle_promise(value)?;
         Ok(self.render(value))
     }
 
@@ -376,14 +392,26 @@ impl JsSession {
         export: &str,
         arguments: &Value,
     ) -> Result<String, String> {
+        self.output.try_iter().for_each(drop);
+
+        match self.eval_module_call_inner(entry, export, arguments) {
+            Ok(value) => Ok(value),
+            Err(err) => Err(self.with_printed_output(err)),
+        }
+    }
+
+    fn eval_module_call_inner(
+        &mut self,
+        entry: &str,
+        export: &str,
+        arguments: &Value,
+    ) -> Result<String, String> {
         let ModuleRoot::Tools(sources) = self.root.clone() else {
             return Err("script session without `.tools` sources".to_owned());
         };
         let Some(source) = sources.get(entry).map(str::to_owned) else {
             return Err(format!("missing tool source `{entry}`"));
         };
-
-        self.output.try_iter().for_each(drop);
 
         let path = PathBuf::from(entry);
         let module = Module::parse(
@@ -418,6 +446,15 @@ impl JsSession {
             return Err(format!("`{entry}` does not export a callable `{export}`"));
         };
 
+        // `main` documents one argument: an object. A model call with no
+        // arguments arrives as JSON null; normalize it here so scripts can
+        // always use `args.foo` without a guard.
+        let empty = Value::Object(serde_json::Map::new());
+        let arguments = if arguments.is_null() {
+            &empty
+        } else {
+            arguments
+        };
         let argument = JsValue::from_json(arguments, &mut self.context)
             .map_err(|err| format!("could not convert tool arguments: {err}"))?;
         let value = function
@@ -427,21 +464,31 @@ impl JsSession {
             .run_jobs()
             .map_err(|err| format!("JavaScript async error: {err}"))?;
 
+        // `main` may be async: wait for the returned promise instead of
+        // stringifying it as `[object Promise]`.
+        let value = settle_promise(value)?;
         Ok(self.render(value))
     }
 
     /// Printed output followed by the last expression, matching `eval`.
     fn render(&mut self, value: JsValue) -> String {
-        let rendered = value
-            .to_string(&mut self.context)
-            .map(|text| text.to_std_string_escaped())
-            .unwrap_or_else(|_| value.display().to_string());
+        let rendered = value_to_text(&value, &mut self.context);
         let printed = self.output.try_iter().collect::<Vec<_>>().join("\n");
 
         match (printed.is_empty(), rendered == "undefined") {
             (true, _) => rendered,
             (false, true) => printed,
             (false, false) => format!("{printed}\n{rendered}"),
+        }
+    }
+
+    /// Keep stdout that was produced before a failure.
+    fn with_printed_output(&mut self, err: String) -> String {
+        let printed = self.output.try_iter().collect::<Vec<_>>().join("\n");
+        if printed.is_empty() {
+            err
+        } else {
+            format!("{printed}\n{err}")
         }
     }
 
@@ -468,9 +515,16 @@ impl JsSession {
         }
 
         // `delete` only removes configurable global-object properties. Lexical
-        // bindings (`let`/`const`) and non-configurable `var` bindings survive,
-        // which the follow-up `typeof` check detects.
-        self.eval(&format!("delete globalThis.{symbol}"))?;
+        // bindings (`let`/`const`) and non-configurable `var` bindings survive;
+        // in strict mode deleting the latter throws a `TypeError`, so treat any
+        // delete failure as "could not drop" instead of leaking the raw error.
+        if let Err(err) = self.eval(&format!("delete globalThis.{symbol}")) {
+            debug!("could not delete `{symbol}`: {err}");
+            return Ok(format!(
+                "Could not drop `{symbol}`: it is a lexical or non-configurable binding. \
+                 Reset the whole context instead."
+            ));
+        }
         let after = self.eval(&format!("typeof {symbol}"))?;
 
         if after == "undefined" {
@@ -482,6 +536,45 @@ impl JsSession {
             ))
         }
     }
+}
+
+/// If `value` is a promise, return its settled value instead of stringifying
+/// the promise object. `run_jobs` must already have drained the job queue.
+fn settle_promise(value: JsValue) -> Result<JsValue, String> {
+    let Some(promise) = value.as_promise() else {
+        return Ok(value);
+    };
+    match promise.state() {
+        PromiseState::Fulfilled(value) => Ok(value),
+        PromiseState::Rejected(reason) => {
+            Err(format!("JavaScript promise rejected: {}", reason.display()))
+        }
+        PromiseState::Pending => Err("JavaScript promise did not settle".to_owned()),
+    }
+}
+
+/// Human-readable rendering used by `print`/`console.*` and the final result.
+///
+/// Plain objects and arrays become JSON so debugging and tool composition do
+/// not collapse to `[object Object]` / `1,2,3`. Values with a meaningful
+/// `toString` (errors, dates, promises) keep it.
+fn value_to_text(value: &JsValue, context: &mut JsContext) -> String {
+    let text = value
+        .to_string(context)
+        .map(|text| text.to_std_string_escaped())
+        .unwrap_or_else(|_| value.display().to_string());
+
+    if value.is_object() {
+        let is_array = value.as_object().is_some_and(|object| object.is_array());
+        if (is_array || text == "[object Object]")
+            && let Ok(Some(json)) = value.to_json(context)
+            && let Ok(json) = serde_json::to_string(&json)
+        {
+            return json;
+        }
+    }
+
+    text
 }
 
 fn is_js_identifier(value: &str) -> bool {
@@ -512,12 +605,7 @@ fn build_context_with(
         NativeFunction::from_closure(move |_this, args, context| {
             let line = args
                 .iter()
-                .map(|value| {
-                    value
-                        .to_string(context)
-                        .map(|text| text.to_std_string_escaped())
-                        .unwrap_or_else(|_| value.display().to_string())
-                })
+                .map(|value| value_to_text(value, context))
                 .collect::<Vec<_>>()
                 .join(" ");
             let _ = tx.send(line);
@@ -835,11 +923,12 @@ fn run_task(session: &mut JsSession, task: JsTask) -> Result<String, String> {
     match task {
         JsTask::Eval {
             source,
+            name,
             depth,
             root,
         } => {
             session.set_origin(depth, root);
-            session.eval(&source)
+            session.eval_named(&source, name.as_deref())
         }
         JsTask::Reset { symbol } => match symbol.as_deref().map(str::trim) {
             Some(symbol) if !symbol.is_empty() => session.drop_symbol(symbol),
@@ -912,6 +1001,111 @@ mod tests {
     }
 
     #[test]
+    fn non_configurable_binding_cannot_be_dropped() {
+        let mut session = JsSession::new_isolated().unwrap();
+        session.eval("var value = 7").unwrap();
+        let message = session.drop_symbol("value").unwrap();
+        assert!(message.contains("Could not drop"), "{message}");
+        assert_eq!(session.eval("value").unwrap(), "7");
+    }
+
+    #[test]
+    fn objects_and_arrays_render_as_json() {
+        let mut session = JsSession::new_isolated().unwrap();
+        let rendered = session.eval("({b: [2, 3], a: 1})").unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&rendered).unwrap(),
+            serde_json::json!({ "a": 1, "b": [2, 3] })
+        );
+        assert_eq!(session.eval("[1, 2, 3]").unwrap(), "[1,2,3]");
+        assert_eq!(session.eval("'text'").unwrap(), "text");
+        assert_eq!(session.eval("undefined").unwrap(), "undefined");
+    }
+
+    #[test]
+    fn console_log_inspects_objects() {
+        let mut session = JsSession::new_isolated().unwrap();
+        let output = session.eval("console.log({a: 1, b: [1, 2]})").unwrap();
+        assert!(output.contains("\"a\":1"), "{output}");
+        assert!(output.contains("\"b\":[1,2]"), "{output}");
+    }
+
+    #[test]
+    fn rejected_promises_are_errors() {
+        let mut session = JsSession::new_isolated().unwrap();
+        let err = session
+            .eval("Promise.reject(new Error('nope'))")
+            .unwrap_err();
+        assert!(err.contains("nope"), "{err}");
+    }
+
+    #[test]
+    fn stdout_is_kept_when_an_evaluation_fails() {
+        let mut session = JsSession::new_isolated().unwrap();
+        let err = session
+            .eval("print('line one'); throw new Error('boom')")
+            .unwrap_err();
+        assert!(err.starts_with("line one\n"), "{err}");
+        assert!(err.contains("boom"), "{err}");
+    }
+
+    #[test]
+    fn eval_errors_name_the_source() {
+        let mut session = JsSession::new_isolated().unwrap();
+        let err = session.eval("throw new Error('boom')").unwrap_err();
+        assert!(err.contains("<eval_javascript>"), "{err}");
+    }
+
+    fn tool_sources(entry: &str, source: &str) -> Arc<ToolSources> {
+        let mut tree = crate::tools::tree::ToolsTree::default();
+        tree.write(entry, source.to_owned());
+        Arc::new(ToolSources::build(&tree))
+    }
+
+    #[test]
+    fn async_script_main_is_awaited() {
+        let sources = tool_sources(
+            "tool/main.js",
+            "export async function main() { return 'async-result'; }",
+        );
+        let mut session = JsSession::new_tools_isolated(sources).unwrap();
+        assert_eq!(
+            session
+                .eval_module_call("tool/main.js", "main", &Value::Null)
+                .unwrap(),
+            "async-result"
+        );
+    }
+
+    #[test]
+    fn rejected_script_main_is_an_error() {
+        let sources = tool_sources(
+            "tool/main.js",
+            "export async function main() { throw new Error('nope'); }",
+        );
+        let mut session = JsSession::new_tools_isolated(sources).unwrap();
+        let err = session
+            .eval_module_call("tool/main.js", "main", &Value::Null)
+            .unwrap_err();
+        assert!(err.contains("nope"), "{err}");
+    }
+
+    #[test]
+    fn script_main_gets_an_object_when_arguments_are_null() {
+        let sources = tool_sources(
+            "tool/main.js",
+            "export function main(args) { return typeof args + ':' + JSON.stringify(args); }",
+        );
+        let mut session = JsSession::new_tools_isolated(sources).unwrap();
+        assert_eq!(
+            session
+                .eval_module_call("tool/main.js", "main", &Value::Null)
+                .unwrap(),
+            "object:{}"
+        );
+    }
+
+    #[test]
     fn context_thread_answers_eval_requests() {
         let channels = JsChannels::default();
         let agent = Entity::PLACEHOLDER;
@@ -921,6 +1115,7 @@ mod tests {
         let request = handle
             .submit(JsTask::Eval {
                 source: "6 * 7".to_owned(),
+                name: None,
                 depth: 0,
                 root: 0,
             })
@@ -944,6 +1139,7 @@ mod tests {
             .unwrap()
             .submit(JsTask::Eval {
                 source: "40 + 2".to_owned(),
+                name: None,
                 depth: 0,
                 root: 0,
             })
@@ -969,6 +1165,7 @@ mod tests {
             .unwrap()
             .submit(JsTask::Eval {
                 source: "var value = 7; value".to_owned(),
+                name: None,
                 depth: 0,
                 root: 0,
             })
@@ -986,6 +1183,7 @@ mod tests {
             .unwrap()
             .submit(JsTask::Eval {
                 source: "typeof value".to_owned(),
+                name: None,
                 depth: 0,
                 root: 0,
             })
@@ -1007,6 +1205,7 @@ mod tests {
         let request = handle
             .submit(JsTask::Eval {
                 source: "execute('get_weather', { city: 'Paris' })".to_owned(),
+                name: None,
                 depth: 0,
                 root: 0,
             })
@@ -1131,6 +1330,7 @@ mod id_tests {
         let first_id = first
             .submit(JsTask::Eval {
                 source: "1".to_owned(),
+                name: None,
                 depth: 0,
                 root: 0,
             })
@@ -1138,6 +1338,7 @@ mod id_tests {
         let second_id = second
             .submit(JsTask::Eval {
                 source: "2".to_owned(),
+                name: None,
                 depth: 0,
                 root: 0,
             })

@@ -56,6 +56,85 @@ fn split_virtual_file(content: &str) -> (Vec<String>, bool) {
     )
 }
 
+/// Directory (inside the snapshot root) that holds the manifest. Load ignores
+/// subdirectories, so this file never becomes part of the virtual filesystem.
+const SNAPSHOT_DIR: &str = ".vfs_state";
+/// Manifest file written by [`VirtualFs::save_to_dir`]. It lists the files in
+/// the snapshot so a later save can prune entries the VFS no longer has.
+const SNAPSHOT_MANIFEST: &str = "manifest";
+/// Manifest location used by the first version of the snapshot support. It is
+/// skipped on Load so it cannot become a virtual file.
+const LEGACY_SNAPSHOT_MANIFEST: &str = ".vfs_state_manifest";
+
+fn snapshot_manifest_path(dir: &Path) -> PathBuf {
+    dir.join(SNAPSHOT_DIR).join(SNAPSHOT_MANIFEST)
+}
+
+fn read_snapshot_manifest(dir: &Path) -> Vec<String> {
+    let path = snapshot_manifest_path(dir);
+    let Ok(metadata) = fs::symlink_metadata(&path) else {
+        return Vec::new();
+    };
+    if !metadata.file_type().is_file() {
+        return Vec::new();
+    }
+    fs::read_to_string(&path)
+        .map(|text| {
+            text.lines()
+                .map(|line| line.trim_end_matches('\r'))
+                .filter(|line| is_plain_name(line))
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn is_plain_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.chars().any(char::is_control)
+}
+
+/// Atomic snapshot write. A symlink planted at the target or temp path is not
+/// followed (the target is refused; the temp is removed and recreated).
+fn write_snapshot_file(dir: &Path, name: &str, content: &[u8]) -> Result<(), String> {
+    use std::io::Write as _;
+
+    let target = dir.join(name);
+    if let Ok(metadata) = fs::symlink_metadata(&target)
+        && metadata.file_type().is_symlink()
+    {
+        return Err(format!(
+            "refusing to write `{}`: it is a symlink",
+            target.display()
+        ));
+    }
+
+    let temp = dir.join(format!(".{name}.vfs-tmp"));
+    let _ = fs::remove_file(&temp);
+    let result = (|| -> Result<(), String> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+            .map_err(|err| format!("could not create `{}`: {err}", temp.display()))?;
+        file.write_all(content)
+            .map_err(|err| format!("could not write `{}`: {err}", temp.display()))?;
+        file.sync_all()
+            .map_err(|err| format!("could not flush `{}`: {err}", temp.display()))?;
+        drop(file);
+        fs::rename(&temp, &target)
+            .map_err(|err| format!("could not replace `{}`: {err}", target.display()))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
 impl VirtualFs {
     /// The `.tools` source tree (mounted, not part of the flat root).
     pub(crate) fn tools(&self) -> &ToolsTree {
@@ -104,8 +183,16 @@ impl VirtualFs {
                 .files
                 .remove(&path.relative())
                 .map(|content| content.len())
-                .ok_or_else(|| format!("No such file: `{}`", path.display())),
-            Mount::Tools => self.tools.delete(&path.relative()),
+                .ok_or_else(|| {
+                    format!(
+                        "No such file: `{}`. Use fs_ls to list files.",
+                        path.display()
+                    )
+                }),
+            Mount::Tools => self
+                .tools
+                .delete(&path.relative())
+                .map_err(|err| format!("{err}. Use fs_ls to list files.")),
         }
     }
 
@@ -186,8 +273,13 @@ impl VirtualFs {
             None => content.len(),
         };
         if !content.is_char_boundary(end) {
+            let range = if offset.is_some() {
+                "`offset` + `limit`"
+            } else {
+                "`limit`"
+            };
             return Err(format!(
-                "`offset` + `limit` ends at byte {end}, which is not on a UTF-8 character boundary in `{name}`"
+                "{range} ends at byte {end}, which is not on a UTF-8 character boundary in `{name}`"
             ));
         }
 
@@ -288,7 +380,7 @@ impl VirtualFs {
                 }
 
                 for (group, (start, end)) in windows.into_iter().enumerate() {
-                    if group > 0 {
+                    if group > 0 && context > 0 {
                         output.push_str("--\n");
                     }
                     for index in start..end {
@@ -312,7 +404,7 @@ impl VirtualFs {
         }
         if truncated {
             output.push_str(&format!(
-                "... (truncated at {found} matches; increase max_matches for more)\n"
+                "... (truncated at {found} matches; limit {max_matches}, raise max_matches or narrow the pattern)\n"
             ));
         }
 
@@ -375,18 +467,75 @@ impl VirtualFs {
     }
 
     /// Write every virtual file into `dir`, creating the directory if needed.
-    /// Existing files with the same names are overwritten.
+    /// Existing files with the same names are overwritten atomically.
+    ///
+    /// Each save records the names it wrote in `.vfs_state/manifest` and removes
+    /// files listed by the previous save that are no longer in the VFS, so a
+    /// snapshot does not resurrect a file it deleted. Files that no Save has
+    /// recorded (including a legacy state directory) are never pruned; clean
+    /// them manually if needed. Target-file symlinks are refused rather than
+    /// followed.
     pub(crate) fn save_to_dir(&self, dir: &Path) -> Result<String, String> {
         fs::create_dir_all(dir)
             .map_err(|err| format!("could not create `{}`: {err}", dir.display()))?;
 
+        let snapshot_dir = dir.join(SNAPSHOT_DIR);
+        match fs::symlink_metadata(&snapshot_dir) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!(
+                    "refusing to use `{}`: it is a symlink",
+                    snapshot_dir.display()
+                ));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(format!(
+                    "`{}` exists and is not a directory",
+                    snapshot_dir.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&snapshot_dir).map_err(|err| {
+                    format!("could not create `{}`: {err}", snapshot_dir.display())
+                })?;
+            }
+            Err(err) => {
+                return Err(format!(
+                    "could not inspect `{}`: {err}",
+                    snapshot_dir.display()
+                ));
+            }
+        }
+
+        let previous = read_snapshot_manifest(dir);
         let mut names = self.files.keys().collect::<Vec<_>>();
         names.sort_unstable();
         for name in &names {
-            let path = dir.join(name);
-            fs::write(&path, self.files[*name].as_bytes())
-                .map_err(|err| format!("could not write `{}`: {err}", path.display()))?;
+            write_snapshot_file(dir, name, self.files[*name].as_bytes())?;
         }
+
+        for old in previous {
+            if self.files.contains_key(&old) || !is_plain_name(&old) {
+                continue;
+            }
+            let path = dir.join(&old);
+            // Remove regular files only; a symlink is not ours to follow or
+            // delete (and `remove_file` on one would just unlink it anyway).
+            if let Ok(metadata) = fs::symlink_metadata(&path)
+                && metadata.file_type().is_file()
+            {
+                fs::remove_file(&path)
+                    .map_err(|err| format!("could not remove `{}`: {err}", path.display()))?;
+            }
+        }
+
+        let manifest = names
+            .iter()
+            .map(|name| name.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let manifest = format!("{manifest}\n");
+        write_snapshot_file(&snapshot_dir, SNAPSHOT_MANIFEST, manifest.as_bytes())?;
 
         Ok(format!(
             "Saved {} file(s) to `{}`.",
@@ -421,6 +570,9 @@ impl VirtualFs {
                     name
                 )
             })?;
+            if name == LEGACY_SNAPSHOT_MANIFEST {
+                continue;
+            }
             let content = fs::read_to_string(entry.path()).map_err(|err| {
                 format!(
                     "could not read `{}` as UTF-8 text: {err}",
@@ -626,6 +778,8 @@ mod tests {
 
         fs.delete("notes.txt").unwrap();
         assert!(fs.read("notes.txt").is_err());
+        let err = fs.delete("notes.txt").unwrap_err();
+        assert!(err.contains("Use fs_ls"), "{err}");
         assert_eq!(fs.list(), "Virtual filesystem is empty.");
     }
 
@@ -730,7 +884,9 @@ mod tests {
 
         assert_eq!(fs.read_range("u.txt", None, Some(2)).unwrap(), "é");
         assert!(fs.read_range("u.txt", Some(1), None).is_err());
-        assert!(fs.read_range("u.txt", None, Some(1)).is_err());
+        let err = fs.read_range("u.txt", None, Some(1)).unwrap_err();
+        assert!(err.contains("`limit` ends at byte 1"), "{err}");
+        assert!(!err.contains("offset"), "{err}");
     }
 
     #[test]
@@ -768,10 +924,15 @@ mod tests {
         assert!(!merged.contains("--"), "{merged}");
         assert_eq!(merged.lines().count(), 5, "{merged}");
 
+        let separate = fs.grep("match", None, 0, false, 200).unwrap();
+        assert!(!separate.contains("--"), "{separate}");
+        assert_eq!(separate.lines().count(), 2, "{separate}");
+
         let truncated = fs.grep("match", None, 0, false, 1).unwrap();
         assert!(truncated.contains("m.txt:2:match"), "{truncated}");
         assert!(!truncated.contains("m.txt:4:match"), "{truncated}");
         assert!(truncated.contains("truncated at 1 matches"), "{truncated}");
+        assert!(truncated.contains("limit 1"), "{truncated}");
     }
 
     #[test]
@@ -820,6 +981,71 @@ mod tests {
         assert_eq!(loaded.read("a.txt").unwrap(), "alpha\n");
         assert_eq!(loaded.read("b.txt").unwrap(), "beta");
         assert!(loaded.read("stale.txt").is_err());
+
+        // A later save removes files written by the previous snapshot that the
+        // VFS no longer has, so Load cannot resurrect deleted files.
+        saved.delete("a.txt").unwrap();
+        saved.save_to_dir(&dir).unwrap();
+        assert!(!dir.join("a.txt").exists());
+        let mut reloaded = VirtualFs::default();
+        let message = reloaded.load_from_dir(&dir).unwrap();
+        assert!(message.contains("Loaded 1 file(s)"), "{message}");
+        assert_eq!(reloaded.read("b.txt").unwrap(), "beta");
+        assert!(reloaded.read("a.txt").is_err());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_prunes_only_previous_files_and_ignores_traversal() {
+        let dir =
+            std::env::temp_dir().join(format!("bvcs_vfs_snapshot_safe_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("stale.txt"), "stale").unwrap();
+        fs::write(dir.join("victim.txt"), "old").unwrap();
+        fs::create_dir_all(dir.join(SNAPSHOT_DIR)).unwrap();
+        fs::write(
+            dir.join(SNAPSHOT_DIR).join(SNAPSHOT_MANIFEST),
+            "../escape.txt\r\nvictim.txt\r\nsub/x.txt\r\n",
+        )
+        .unwrap();
+
+        let mut vfs = VirtualFs::default();
+        vfs.write("a.txt", "alpha".into()).unwrap();
+        vfs.save_to_dir(&dir).unwrap();
+
+        assert!(
+            dir.join("stale.txt").exists(),
+            "files never recorded in a manifest are left alone"
+        );
+        assert!(
+            !dir.join("victim.txt").exists(),
+            "a previous snapshot file is pruned"
+        );
+        assert!(dir.join("a.txt").exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_refuses_to_follow_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir =
+            std::env::temp_dir().join(format!("bvcs_vfs_snapshot_link_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target.txt");
+        fs::write(&target, "keep").unwrap();
+        symlink(&target, dir.join("a.txt")).unwrap();
+
+        let mut vfs = VirtualFs::default();
+        vfs.write("a.txt", "overwrite".into()).unwrap();
+        let err = vfs.save_to_dir(&dir).unwrap_err();
+        assert!(err.contains("symlink"), "{err}");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "keep");
 
         let _ = fs::remove_dir_all(&dir);
     }

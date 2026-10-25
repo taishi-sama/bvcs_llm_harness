@@ -32,11 +32,11 @@ pub(crate) fn search_tools(
         );
     }
 
-    let max = args
-        .get("max")
-        .and_then(Value::as_u64)
-        .unwrap_or(DEFAULT_MAX)
-        .clamp(1, MAX_RESULTS) as usize;
+    let requested_max = args.get("max").and_then(Value::as_u64);
+    if requested_max == Some(0) {
+        return ("`max` must be at least 1".to_owned(), true);
+    }
+    let max = requested_max.unwrap_or(DEFAULT_MAX).min(MAX_RESULTS) as usize;
     let descriptions = match args.get("search_descriptions") {
         None | Some(Value::Null) => true,
         value => is_truthy(value),
@@ -90,6 +90,13 @@ pub(crate) fn search_tools(
         .join("\n");
     if total > shown {
         output.push_str(&format!("\n({shown} of {total} matches shown)"));
+    }
+    if let Some(requested) = requested_max
+        && requested > MAX_RESULTS
+    {
+        output.push_str(&format!(
+            "\n(`max` clamped from {requested} to {MAX_RESULTS})"
+        ));
     }
     (output, false)
 }

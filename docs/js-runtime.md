@@ -26,7 +26,7 @@ request ids are unique across agents (tool rounds key on them).
 
 ```rust
 enum JsTask {
-    Eval { source, depth, root },   // depth/root are used by execute()
+    Eval { source, name: Option<String>, depth, root },  // name is for stack traces
     Reset { symbol: Option<String> },
 }
 ```
@@ -50,7 +50,28 @@ execute(tool_name, args, background_after)
 - Nested calls never detach; `background_after` is rejected for them.
 
 `print`/`console.log/info/warn/error` append to a per-session channel that is
-drained after each evaluation.
+drained after each evaluation. Plain objects and arrays are printed as JSON, not
+as `[object Object]`, so `console.log({a: 1})` shows `{"a":1}`. Values without a
+JSON form (Map, Set, cycles, BigInt) keep their JS string form.
+
+## Results
+
+`eval_javascript`, `run_javascript`, and a script tool's `main` render their
+final value as text:
+
+- strings as-is; numbers/booleans/null via `toString`
+- plain serializable objects and arrays as JSON (`{"a":1}`, `[1,2]`); Map, Set,
+  cyclic and BigInt-containing values fall back to JS string conversion
+- a returned promise is awaited (the job queue is drained) and its fulfilled
+  value is rendered; a rejection is an error and a promise that never settles is
+  an error instead of `[object Promise]`. Only the final value is observed: an
+  unhandled rejection in the middle of a script (`Promise.reject("x"); 1`) is
+  still ignored
+- printed output is prepended to the value; if evaluation throws, output
+  produced before the failure is still prepended to the error text
+
+`eval_javascript` sources are named `<eval_javascript>` in stack traces;
+`run_javascript` uses the virtual file's path.
 
 ## Host bridge
 
@@ -83,8 +104,9 @@ to a `tool.json`/`library.json` entry, then `index.js`, then `main.js`, then a
 - `eval_javascript_reset_context` rebuilds the whole `Context` through
   `build_context_with` (fresh globals, same dispatch and module root).
 - With `symbol`, it checks `typeof`, `delete globalThis.<name>`, then checks
-  again. Lexical (`let`/`const`) and non-configurable bindings survive and are
-  reported.
+  again. Lexical (`let`/`const`) bindings and non-configurable `var` bindings
+  survive; a failed delete returns "Could not drop …" rather than leaking a
+  strict-mode `TypeError`.
 
 ## Errors, limits, cancellation
 
@@ -93,9 +115,11 @@ to a `tool.json`/`library.json` entry, then `index.js`, then `main.js`, then a
 - A panic inside a context task is caught (`catch_unwind`), reported, and the
   context is reset rather than poisoning the thread.
 - `runtime_limits_mut().set_loop_iteration_limit(10_000_000)` is the only bound
-  on runaway CPU. There is **no wall-clock timeout** by design; long work is
-  expected to be detached (root calls only) and its result delivered as a
-  message.
+  on runaway CPU. The resulting `RuntimeLimitError` cannot be caught from
+  JavaScript; it aborts the evaluation. Output printed before the abort is
+  included in the returned error, but the value is lost. There is **no
+  wall-clock timeout** by design; long work is expected to be detached (root
+  calls only) and its result delivered as a message.
 - Worker shutdown is a `JsCommand::Shutdown`; a context cannot be killed while
   evaluating, so removal waits for it to finish.
 

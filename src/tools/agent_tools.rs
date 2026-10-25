@@ -4,6 +4,7 @@
 //! entry point used by `catalog::execution`.
 
 use bevy::prelude::Entity;
+use llm_history_model::history::Entry;
 use serde_json::Value;
 
 use crate::{
@@ -147,11 +148,19 @@ fn get_agent_message(
         Ok(target) => target,
         Err(err) => return (err, true),
     };
-    let Some(message_index) = arguments.get("index").and_then(Value::as_u64) else {
-        return (
-            "missing required non-negative integer parameter `index`".to_owned(),
-            true,
-        );
+    let message_index = match arguments.get("index") {
+        None | Some(Value::Null) => {
+            return (
+                "missing required integer parameter `index`".to_owned(),
+                true,
+            );
+        }
+        Some(value) => match value.as_u64() {
+            Some(index) => index,
+            None => {
+                return ("`index` must be a non-negative integer".to_owned(), true);
+            }
+        },
     };
 
     let history = target.history();
@@ -166,10 +175,21 @@ fn get_agent_message(
         );
     };
 
-    match serde_json::to_string_pretty(entry) {
+    let payload = message_payload(entry, entry_sender(entry, target.name()), message_index);
+    match serde_json::to_string_pretty(&payload) {
         Ok(json) => (json, false),
         Err(err) => (format!("could not serialize message: {err}"), true),
     }
+}
+
+/// Message view shared with `get_agent_history`'s per-item metadata.
+fn message_payload(entry: &Entry, sender: String, message_index: u64) -> Value {
+    serde_json::json!({
+        "type": entry_type(entry),
+        "sender": sender,
+        "message_index": message_index,
+        "message": entry,
+    })
 }
 
 fn spawn_agent(
@@ -346,5 +366,23 @@ mod tests {
             history_target_name(&serde_json::json!({ "agent": "Worker" }), "LLM Agent 1"),
             "Worker"
         );
+    }
+
+    #[test]
+    fn message_payload_has_the_history_metadata() {
+        use llm_history_model::history::MessageContent;
+
+        let entry = Entry::UserMessage {
+            content: MessageContent {
+                text: Some("hello".to_owned()),
+                image: None,
+            },
+        };
+        let payload = message_payload(&entry, "user".to_owned(), 3);
+
+        assert_eq!(payload["type"], "user_message");
+        assert_eq!(payload["sender"], "user");
+        assert_eq!(payload["message_index"], 3);
+        assert!(!payload["message"].is_null());
     }
 }

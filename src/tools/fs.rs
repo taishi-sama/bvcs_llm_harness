@@ -51,7 +51,11 @@ fn fs_grep(
         Ok(context) => context.unwrap_or(0).min(MAX_GREP_CONTEXT) as usize,
         Err(err) => return (err, true),
     };
+    let requested_max_matches = arguments.get("max_matches").and_then(Value::as_u64);
     let max_matches = match optional_u64(arguments, "max_matches") {
+        Ok(Some(0)) => {
+            return ("`max_matches` must be at least 1".to_owned(), true);
+        }
         Ok(max_matches) => max_matches
             .unwrap_or(DEFAULT_GREP_MATCHES)
             .min(MAX_GREP_MATCHES) as usize,
@@ -64,7 +68,14 @@ fn fs_grep(
         bool_option(arguments, "ignore_case", false),
         max_matches,
     ) {
-        Ok(output) => (output, false),
+        Ok(mut output) => {
+            if requested_max_matches.is_some_and(|requested| requested > MAX_GREP_MATCHES)
+                && !output.starts_with("No matches")
+            {
+                output.push_str(&format!("\n(`max_matches` clamped to {MAX_GREP_MATCHES})"));
+            }
+            (output, false)
+        }
         Err(err) => (err, true),
     }
 }
@@ -131,22 +142,26 @@ fn fs_edit_lines(
     arguments: &Value,
     _call: &CallContext<'_>,
 ) -> (String, bool) {
-    match (
-        arguments.get("path").and_then(Value::as_str),
-        arguments.get("start_line").and_then(Value::as_u64),
-        arguments.get("end_line").and_then(Value::as_u64),
-        arguments.get("content").and_then(Value::as_str),
-    ) {
-        (Some(path), Some(start), Some(end), Some(content)) => {
-            match world.fs.edit_lines(path, start, end, content.to_owned()) {
-                Ok(message) => (message, false),
-                Err(err) => (err, true),
-            }
-        }
-        _ => (
-            "missing required parameters `path`, `start_line`, `end_line`, `content`".to_owned(),
+    let Some(path) = arguments.get("path").and_then(Value::as_str) else {
+        return ("missing required string parameter `path`".to_owned(), true);
+    };
+    let Some(content) = arguments.get("content").and_then(Value::as_str) else {
+        return (
+            "missing required string parameter `content`".to_owned(),
             true,
-        ),
+        );
+    };
+    let start = match required_u64(arguments, "start_line") {
+        Ok(start) => start,
+        Err(err) => return (err, true),
+    };
+    let end = match required_u64(arguments, "end_line") {
+        Ok(end) => end,
+        Err(err) => return (err, true),
+    };
+    match world.fs.edit_lines(path, start, end, content.to_owned()) {
+        Ok(message) => (message, false),
+        Err(err) => (err, true),
     }
 }
 

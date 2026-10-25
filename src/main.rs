@@ -175,7 +175,6 @@ fn main() {
                     .chain(),
                 (
                     tools::script::refresh_tool_sources,
-                    tools::reconcile_script_tools,
                     poll_js_events,
                     poll_script_events,
                     handle_task_result,
@@ -187,6 +186,10 @@ fn main() {
                     update_tool_activity,
                     tools::flush_tool_mirror,
                     handle_send_agent_message,
+                    // Reconcile after tool calls so a manifest created or
+                    // deleted earlier in this frame is in the registry before
+                    // the next request's schema is built.
+                    tools::reconcile_script_tools,
                     start_agent_turn,
                     handle_agent_failed,
                     refresh_transcripts,

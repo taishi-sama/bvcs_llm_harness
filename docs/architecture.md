@@ -66,12 +66,12 @@ Update group A (turn/input path):
   decode_stream_chunks, handle_stream_events, handle_turn_finished
 
 Update group B (async/tool path):
-  refresh_tool_sources, reconcile_script_tools, poll_js_events,
-  poll_script_events, handle_task_result, poll_js_host_requests,
-  poll_script_host_requests, execute_tool_calls,
-  auto_background_long_calls, apply_tool_results, update_tool_activity,
-  flush_tool_mirror, handle_send_agent_message, start_agent_turn,
-  handle_agent_failed, refresh_transcripts, rename_agents, remove_agents
+  refresh_tool_sources, poll_js_events, poll_script_events,
+  handle_task_result, poll_js_host_requests, poll_script_host_requests,
+  execute_tool_calls, auto_background_long_calls, apply_tool_results,
+  update_tool_activity, flush_tool_mirror, handle_send_agent_message,
+  reconcile_script_tools, start_agent_turn, handle_agent_failed,
+  refresh_transcripts, rename_agents, remove_agents
 
 PostUpdate:
   auto_scroll (after UI layout)
@@ -96,9 +96,12 @@ components or channel-drained buffers to avoid double-buffering.
 
 ## Principles
 
-1. **Snapshots per request.** The model-facing tool list, the `.tools` sources,
-   and the request body are built once when a turn starts. Registry edits apply
-   to the next turn, never to a request in flight.
+1. **Snapshots per request.** The model-facing tool list and request body are
+   built when a request starts; `.tools` sources are snapshotted per script
+   call. `reconcile_script_tools` runs after tool calls and before
+   `start_agent_turn`, so a registry edit made by a tool call is in the next
+   request of the same turn. A script call in the same assistant batch still
+   uses the source snapshot taken at the start of that frame.
 2. **Single source of truth.** Tool metadata lives only in `definitions()`;
    script tools are entities reconciled from manifests; the `.tools` tree is
    the truth and disk is a best-effort mirror.

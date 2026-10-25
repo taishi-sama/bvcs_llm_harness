@@ -38,7 +38,7 @@ pub(crate) struct RescanReport {
 impl RescanReport {
     pub(crate) fn render(&self) -> String {
         let mut output = format!(
-            "{} script tool(s) registered ({} added, {} removed, {} changed); {} broken manifest(s); {} library(ies)",
+            "{} script tool(s) found in `.tools` ({} added, {} removed, {} changed); {} broken manifest(s); {} library(ies)",
             self.registered.len(),
             self.added.len(),
             self.removed.len(),
@@ -60,6 +60,26 @@ impl RescanReport {
         }
         output
     }
+
+    /// One-line summary of what this pass changed, for the "last automatic
+    /// change" note in a later `rescan_tools` result.
+    fn diff_summary(&self) -> String {
+        let mut parts = Vec::new();
+        if !self.added.is_empty() {
+            parts.push(format!("added: {}", self.added.join(", ")));
+        }
+        if !self.removed.is_empty() {
+            parts.push(format!("removed: {}", self.removed.join(", ")));
+        }
+        if !self.changed.is_empty() {
+            parts.push(format!("changed: {}", self.changed.join(", ")));
+        }
+        if parts.is_empty() {
+            String::new()
+        } else {
+            parts.join("; ")
+        }
+    }
 }
 
 /// Registry health, exposed to the UI and BRP.
@@ -69,6 +89,14 @@ pub(crate) struct ToolRegistryStatus {
     pub registered: usize,
     pub broken: usize,
     pub report: String,
+    /// Summary of the last automatic reconciliation that actually changed the
+    /// registry. `rescan_tools` surfaces it when no newer diff exists.
+    pub last_auto: String,
+    /// Tree revision described by `last_auto`.
+    pub last_auto_revision: u64,
+    /// `rescan_tools(apply: true)` asks the automatic reconciler to run even if
+    /// the revision was already recorded by an earlier dry run.
+    pub pending_apply: bool,
 }
 
 fn fingerprint(definition: &Tool, entry: &str, export: &str, order: u32) -> u64 {
@@ -158,7 +186,9 @@ pub(crate) fn reconcile(
         report.registered.push(name);
     }
 
-    for (name, (entity, _)) in live {
+    let mut removed = live.into_iter().collect::<Vec<_>>();
+    removed.sort_by(|(left, _), (right, _)| left.cmp(right));
+    for (name, (entity, _)) in removed {
         report.removed.push(name);
         if apply {
             commands.entity(entity).despawn();
@@ -176,7 +206,7 @@ pub(crate) fn reconcile_script_tools(
     mut status: ResMut<ToolRegistryStatus>,
 ) {
     let revision = vfs.tools().revision();
-    if revision == status.revision {
+    if revision == status.revision && !status.pending_apply {
         return;
     }
 
@@ -189,14 +219,40 @@ pub(crate) fn reconcile_script_tools(
     for broken in &report.broken {
         warn!("tool manifest: {broken}");
     }
-    if !report.added.is_empty() || !report.removed.is_empty() || !report.changed.is_empty() {
-        info!("tool rescan: {}", report.render());
+    let changed =
+        !report.added.is_empty() || !report.removed.is_empty() || !report.changed.is_empty();
+    let rendered = report.render();
+    if changed {
+        info!("tool rescan: {rendered}");
+        status.last_auto = report.diff_summary();
+        status.last_auto_revision = revision;
     }
 
+    status.pending_apply = false;
     status.revision = revision;
     status.registered = report.registered.len();
     status.broken = report.broken.len();
-    status.report = report.render();
+    status.report = rendered;
+}
+
+/// Record what a rescan call wants the automatic reconciler to do.
+///
+/// Last call wins: an `apply: false` after an `apply: true` cancels the pending
+/// apply, matching the dry-run wording in the result.
+fn record_rescan_intent(
+    status: &mut ToolRegistryStatus,
+    apply: bool,
+    changed: bool,
+    revision: u64,
+) {
+    if apply {
+        if changed {
+            status.pending_apply = true;
+        }
+    } else {
+        status.revision = revision;
+        status.pending_apply = false;
+    }
 }
 
 /// Model-facing `rescan_tools`.
@@ -240,17 +296,30 @@ pub(crate) fn rescan_tools(
         }
     }
 
-    let report = reconcile(world.fs.tools(), &rows, &mut world.commands, apply);
-    // Record the revision even for a dry run: the caller asked for no changes,
-    // so the automatic reconciler must not apply them on the next frame.
-    world.registry_status.revision = world.fs.tools().revision();
-    world.registry_status.registered = report.registered.len();
-    world.registry_status.broken = report.broken.len();
-    world.registry_status.report = report.render();
+    let last_auto = world.registry_status.last_auto.clone();
+    let last_auto_revision = world.registry_status.last_auto_revision;
+    let revision = world.fs.tools().revision();
+
+    // Never spawn/despawn through deferred commands here: a second rescan in
+    // the same assistant batch would not see the first pass's entities and
+    // would create duplicates. The automatic reconciler applies the diff later
+    // in this frame, before the next request is built.
+    let report = reconcile(world.fs.tools(), &rows, &mut world.commands, false);
+    let changed =
+        !report.added.is_empty() || !report.removed.is_empty() || !report.changed.is_empty();
+
+    record_rescan_intent(&mut world.registry_status, apply, changed, revision);
 
     let mut output = report.render();
+    if !changed && last_auto_revision == revision && !last_auto.is_empty() {
+        output.push_str(&format!("\nlast automatic change: {last_auto}"));
+    }
     if !apply {
-        output.push_str("\n(dry run: no entities changed)");
+        output.push_str(
+            "\n(dry run: no entities changed; the automatic reconciler will skip this revision)",
+        );
+    } else if changed {
+        output.push_str("\n(the automatic reconciler will apply this before the next request)");
     }
     (output, false)
 }
@@ -260,11 +329,14 @@ pub(crate) fn rescan_tool_definition() -> Tool {
     Tool {
         name: "rescan_tools".into(),
         description: Some(
-            "Reconcile `.tools` script tools with the live registry. Reports added, \
-             removed, and changed tools plus every invalid manifest. `apply` defaults \
-             to true; set it to false for a dry run. `source` is `vfs` (default, use \
-             in-memory edits) or `disk` (reload `./.tools` first, discarding unmirrored \
-             in-memory edits)."
+            "Reconcile `.tools` script tools with the live registry. Reports how many tools \
+             the scan found plus added/removed/changed from this pass. Hot reload applies \
+             changes after tool calls and before the next request, so an empty diff is \
+             followed by the last automatic change. `apply` defaults to true: it asks that \
+             reconciler to run even if a dry run already recorded the revision. Set it to \
+             false for a dry run that records the revision and prevents the automatic apply. \
+             `source` is `vfs` (default, use in-memory edits) or `disk` (reload `./.tools` \
+             first, discarding unmirrored in-memory edits)."
                 .into(),
         ),
         parameters: HashMap::from([
@@ -333,6 +405,12 @@ mod tests {
         let status = app.world().resource::<ToolRegistryStatus>();
         assert_eq!(status.registered, 1);
         assert_eq!(status.broken, 0);
+        assert_eq!(status.last_auto, "added: demo");
+        assert!(
+            status.report.contains("found in `.tools`"),
+            "{}",
+            status.report
+        );
 
         write_tool(
             &mut app.world_mut().resource_mut::<VirtualFs>(),
@@ -341,6 +419,10 @@ mod tests {
         );
         app.update();
         assert_eq!(script_tools(&mut app), ["demo"]);
+        assert_eq!(
+            app.world().resource::<ToolRegistryStatus>().last_auto,
+            "changed: demo"
+        );
 
         write_tool(
             &mut app.world_mut().resource_mut::<VirtualFs>(),
@@ -349,6 +431,10 @@ mod tests {
         );
         app.update();
         assert_eq!(script_tools(&mut app), ["demo", "extra"]);
+        assert_eq!(
+            app.world().resource::<ToolRegistryStatus>().last_auto,
+            "added: extra"
+        );
 
         app.world_mut()
             .resource_mut::<VirtualFs>()
@@ -356,5 +442,124 @@ mod tests {
             .unwrap();
         app.update();
         assert_eq!(script_tools(&mut app), ["extra"]);
+        assert_eq!(
+            app.world().resource::<ToolRegistryStatus>().last_auto,
+            "removed: demo"
+        );
+    }
+
+    #[test]
+    fn source_only_edit_does_not_replay_the_last_change() {
+        let mut app = App::new();
+        app.init_resource::<ToolRegistryStatus>();
+        app.insert_resource(VirtualFs::default());
+        app.add_systems(Update, reconcile_script_tools);
+
+        write_tool(
+            &mut app.world_mut().resource_mut::<VirtualFs>(),
+            "demo",
+            "first",
+        );
+        app.update();
+        let change_revision = app
+            .world()
+            .resource::<ToolRegistryStatus>()
+            .last_auto_revision;
+
+        app.world_mut()
+            .resource_mut::<VirtualFs>()
+            .write(
+                ".tools/demo/main.js",
+                "export function main() { return 'changed'; }".to_owned(),
+            )
+            .unwrap();
+        app.update();
+
+        let status = app.world().resource::<ToolRegistryStatus>();
+        assert_eq!(status.last_auto, "added: demo");
+        assert_eq!(
+            status.last_auto_revision, change_revision,
+            "a source-only edit must not make the old change look current"
+        );
+        assert_ne!(
+            app.world().resource::<VirtualFs>().tools().revision(),
+            change_revision
+        );
+    }
+
+    #[test]
+    fn removal_order_is_stable() {
+        let mut app = App::new();
+        app.init_resource::<ToolRegistryStatus>();
+        app.insert_resource(VirtualFs::default());
+        app.add_systems(Update, reconcile_script_tools);
+
+        for name in ["beta", "alpha"] {
+            write_tool(&mut app.world_mut().resource_mut::<VirtualFs>(), name, name);
+        }
+        app.update();
+
+        let vfs = &mut app.world_mut().resource_mut::<VirtualFs>();
+        vfs.delete(".tools/alpha/main.js").unwrap();
+        vfs.delete(".tools/beta/main.js").unwrap();
+        app.update();
+
+        assert_eq!(
+            app.world().resource::<ToolRegistryStatus>().last_auto,
+            "removed: alpha, beta"
+        );
+    }
+
+    #[test]
+    fn dry_run_cancels_a_pending_apply() {
+        let mut status = ToolRegistryStatus::default();
+        record_rescan_intent(&mut status, true, true, 7);
+        assert!(status.pending_apply);
+
+        record_rescan_intent(&mut status, false, true, 7);
+        assert!(!status.pending_apply, "the later dry run must win");
+        assert_eq!(status.revision, 7);
+    }
+
+    #[test]
+    fn apply_after_a_dry_run_forces_the_reconciler() {
+        let mut status = ToolRegistryStatus::default();
+        record_rescan_intent(&mut status, false, true, 7);
+        assert!(!status.pending_apply);
+        assert_eq!(status.revision, 7);
+
+        record_rescan_intent(&mut status, true, true, 7);
+        assert!(status.pending_apply);
+    }
+
+    #[derive(Resource, Default)]
+    struct Seen(Vec<String>);
+
+    fn record_advertised(tools: Query<&ToolEntry, With<Advertised>>, mut seen: ResMut<Seen>) {
+        seen.0 = tools
+            .iter()
+            .map(|entry| entry.definition.name.clone())
+            .collect();
+    }
+
+    #[test]
+    fn reconcile_before_request_sees_new_tools() {
+        let mut app = App::new();
+        app.init_resource::<ToolRegistryStatus>();
+        app.insert_resource(VirtualFs::default());
+        app.init_resource::<Seen>();
+        app.add_systems(Update, (reconcile_script_tools, record_advertised).chain());
+
+        write_tool(
+            &mut app.world_mut().resource_mut::<VirtualFs>(),
+            "demo",
+            "first",
+        );
+        app.update();
+
+        assert!(
+            app.world().resource::<Seen>().0.iter().any(|n| n == "demo"),
+            "the request-facing query must see the tool spawned earlier in the frame"
+        );
     }
 }
