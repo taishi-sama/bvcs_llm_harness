@@ -3,6 +3,9 @@
 //! The tree revision is cheap to compare, so a system reconciles entities
 //! whenever `.tools` changes. `rescan_tools` exposes the same diff to the model
 //! and can reload the tree from disk first.
+//!
+//! Registered through the shared `tool_handlers!` macro, like every inline
+//! tool module.
 
 use std::{
     collections::HashMap,
@@ -17,6 +20,7 @@ use serde_json::Value;
 use crate::{
     tools::{
         manifest::{self, ScriptToolSpec},
+        registration::tool_handlers,
         registry::{Advertised, Availability, Execution, ToolEntry},
         script::ScriptTool,
         tree::ToolsTree,
@@ -358,6 +362,10 @@ pub(crate) fn rescan_tool_definition() -> Tool {
             ),
         ]),
     }
+}
+
+tool_handlers! {
+    "rescan_tools" => rescan_tools,
 }
 
 #[cfg(test)]

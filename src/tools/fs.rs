@@ -1,15 +1,13 @@
 //! Filesystem tool handlers (`fs_*`).
 //!
-//! Each handler is a straight move of the matching arm from the legacy
-//! executor: same parameter handling, defaults, bounds, and error strings.
+//! Registered through the shared `tool_handlers!` macro, which generates the
+//! `handler` lookup used by `catalog::execution`.
 
 use serde_json::Value;
 
 use crate::tools::{
     DEFAULT_GREP_MATCHES, MAX_GREP_CONTEXT, MAX_GREP_MATCHES, bool_option, optional_u64,
-    registry::{CallContext, ToolFn},
-    required_u64,
-    world::ToolWorld,
+    registration::tool_handlers, registry::CallContext, required_u64, world::ToolWorld,
 };
 
 fn fs_read(
@@ -207,17 +205,13 @@ fn fs_delete(
     }
 }
 
-/// Handler lookup used by `catalog::execution`.
-pub(crate) fn handler(name: &str) -> Option<ToolFn> {
-    match name {
-        "fs_read" => Some(fs_read),
-        "fs_grep" => Some(fs_grep),
-        "fs_sed" => Some(fs_sed),
-        "fs_ls" => Some(fs_ls),
-        "fs_write" => Some(fs_write),
-        "fs_edit_lines" => Some(fs_edit_lines),
-        "fs_edit_pattern" => Some(fs_edit_pattern),
-        "fs_delete" => Some(fs_delete),
-        _ => None,
-    }
+tool_handlers! {
+    "fs_read" => fs_read,
+    "fs_grep" => fs_grep,
+    "fs_sed" => fs_sed,
+    "fs_ls" => fs_ls,
+    "fs_write" => fs_write,
+    "fs_edit_lines" => fs_edit_lines,
+    "fs_edit_pattern" => fs_edit_pattern,
+    "fs_delete" => fs_delete,
 }

@@ -2,11 +2,15 @@
 //!
 //! Returns a compact one-line signature per match instead of a full JSON
 //! schema: enough to call the tool, roughly a fifth of the tokens.
+//!
+//! Registered through the shared `tool_handlers!` macro, like every inline
+//! tool module.
 
 use llm_api::generic_tool::{ParameterType, Tool};
 use regex::RegexBuilder;
 use serde_json::Value;
 
+use crate::tools::registration::tool_handlers;
 use crate::tools::registry::ToolEntry;
 use crate::tools::{is_truthy, world::ToolWorld};
 
@@ -131,4 +135,8 @@ const fn type_name(parameter: &ParameterType) -> &'static str {
         ParameterType::Boolean => "boolean",
         ParameterType::Object => "object",
     }
+}
+
+tool_handlers! {
+    "search_tools" => search_tools,
 }

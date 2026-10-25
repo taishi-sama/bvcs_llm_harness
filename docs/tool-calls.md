@@ -33,9 +33,16 @@ enum Execution {
 Definitions live in exactly one place: `definitions()` in `src/tools.rs`.
 Exposure policy lives in `src/tools/catalog.rs`:
 
-- `policy(name)` — advertised or manual, `order`, `tags`
+- `policy(name)` — advertised or manual, `order`, `tags`, and `model_only`
 - `execution(name)` — which `Execution` the name maps to
-- `auto_background(name)`, `model_only(name)`, `is_implemented(name)`
+- `auto_background(name)`, `is_implemented(name)`
+
+Inline handler registration is uniform. Every module that implements
+synchronous tools ends with the shared `tool_handlers!` macro from
+`src/tools/registration.rs`, which generates that module's
+`handler(name) -> Option<ToolFn>` lookup. `catalog::execution` chains the lookups
+(`fs`, `agent_tools`, `search`, `rescan`) through `inline_handler` and falls back
+to `no_handler` only for a definition that was never wired up.
 
 Registration runs in `PreStartup` (`src/main.rs`):
 
@@ -256,12 +263,23 @@ running (bounded by Boa's loop iteration limit, `10_000_000`).
    }
    ```
 
-3. Export it via that module's `handler(name)` lookup.
-4. Add a branch in `catalog::execution(name)` (or let the module lookup own it).
-5. Add policy in `catalog::policy(name)` (`advertises` or `manual`).
+3. Register it in that module's `tool_handlers!` block:
+
+   ```rust
+   tool_handlers! {
+       "my_tool" => my_tool,
+   }
+   ```
+
+   The shared macro in `src/tools/registration.rs` generates the module's
+   `handler(name)` lookup; the handler signature is the same for every module.
+4. `catalog::inline_handler` finds it automatically; there is no per-tool
+   branch to add in `catalog::execution`.
+5. Add policy in `catalog::policy(name)` (`advertises` or `manual`). Chain
+   `.model_only()` when scripts and JavaScript must not call the tool (agent
+   lifecycle and the interpreter itself).
 6. If it needs the global background grace, return `true` from
-   `catalog::auto_background(name)`; if scripts must not call it, add it to
-   `catalog::model_only(name)`.
+   `catalog::auto_background(name)`.
 7. Tests: `every_definition_has_a_handler`, the advertisement trim test, plus a
    handler-level test. If it mutates the world, drive it through an `App` test.
 
@@ -322,6 +340,7 @@ call starts.
 | --- | --- |
 | Definitions | `src/tools.rs` (`definitions`) |
 | Exposure policy, registration, gateway definitions | `src/tools/catalog.rs` |
+| Uniform handler-registration macro | `src/tools/registration.rs` |
 | Entity components, `find`, static spawn | `src/tools/registry.rs` |
 | Handler context | `src/tools/world.rs` |
 | Round/budget/detach bookkeeping | `src/tools/schedule.rs` |

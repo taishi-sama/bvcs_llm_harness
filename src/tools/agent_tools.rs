@@ -1,9 +1,8 @@
 //! Agent lifecycle and history tool handlers.
 //!
-//! Extracted from the legacy match in `tools.rs`; `handler` is the dispatch
-//! entry point used by `catalog::execution`.
+//! Registered through the shared `tool_handlers!` macro, which generates the
+//! `handler` lookup used by `catalog::execution`.
 
-use bevy::prelude::Entity;
 use llm_history_model::history::Entry;
 use serde_json::Value;
 
@@ -12,8 +11,7 @@ use crate::{
     messages::{RemoveAgentRequest, RenameAgentRequest, SendAgentMessage},
     tools::{
         entry_sender, entry_type, history_agent, history_window, initial_task_message,
-        optional_i64, optional_u64,
-        registry::{CallContext, ToolFn},
+        optional_i64, optional_u64, registration::tool_handlers, registry::CallContext,
         world::ToolWorld,
     },
 };
@@ -21,9 +19,9 @@ use crate::{
 fn send_message_to_agent(
     world: &mut ToolWorld<'_, '_>,
     arguments: &Value,
-    _source_entity: Entity,
-    source_agent: &str,
+    call: &CallContext<'_>,
 ) -> (String, bool) {
+    let source_agent = call.source_agent;
     let target_name = arguments.get("agent").and_then(Value::as_str);
     let message = arguments.get("message").and_then(Value::as_str);
     match (target_name, message) {
@@ -67,15 +65,14 @@ fn send_message_to_agent(
 fn list_agents(
     world: &mut ToolWorld<'_, '_>,
     _arguments: &Value,
-    _source_entity: Entity,
-    source_agent: &str,
+    call: &CallContext<'_>,
 ) -> (String, bool) {
     let mut names = world.index.by_name.keys().cloned().collect::<Vec<_>>();
     names.sort();
     let available = names
         .into_iter()
         .map(|name| {
-            if name == source_agent {
+            if name == call.source_agent {
                 format!("{name} (you)")
             } else {
                 name
@@ -100,10 +97,9 @@ fn history_target_name<'a>(arguments: &'a Value, source_agent: &'a str) -> &'a s
 fn get_agent_history(
     world: &mut ToolWorld<'_, '_>,
     arguments: &Value,
-    _source_entity: Entity,
-    source_agent: &str,
+    call: &CallContext<'_>,
 ) -> (String, bool) {
-    let target_name = history_target_name(arguments, source_agent);
+    let target_name = history_target_name(arguments, call.source_agent);
     let target = match history_agent(target_name, &world.index, &world.agents) {
         Ok(target) => target,
         Err(err) => return (err, true),
@@ -140,10 +136,9 @@ fn get_agent_history(
 fn get_agent_message(
     world: &mut ToolWorld<'_, '_>,
     arguments: &Value,
-    _source_entity: Entity,
-    source_agent: &str,
+    call: &CallContext<'_>,
 ) -> (String, bool) {
-    let target_name = history_target_name(arguments, source_agent);
+    let target_name = history_target_name(arguments, call.source_agent);
     let target = match history_agent(target_name, &world.index, &world.agents) {
         Ok(target) => target,
         Err(err) => return (err, true),
@@ -195,9 +190,9 @@ fn message_payload(entry: &Entry, sender: String, message_index: u64) -> Value {
 fn spawn_agent(
     world: &mut ToolWorld<'_, '_>,
     arguments: &Value,
-    _source_entity: Entity,
-    source_agent: &str,
+    call: &CallContext<'_>,
 ) -> (String, bool) {
+    let source_agent = call.source_agent;
     if world.index.by_name.len() >= MAX_AGENTS {
         return (
             format!("Agent limit reached ({MAX_AGENTS}); remove an agent first."),
@@ -265,9 +260,10 @@ fn spawn_agent(
 fn rename_self(
     world: &mut ToolWorld<'_, '_>,
     arguments: &Value,
-    source_entity: Entity,
-    source_agent: &str,
+    call: &CallContext<'_>,
 ) -> (String, bool) {
+    let source_entity = call.source_entity;
+    let source_agent = call.source_agent;
     let Some(new_name) = arguments
         .get("name")
         .and_then(Value::as_str)
@@ -304,48 +300,22 @@ fn rename_self(
 fn end_agent(
     world: &mut ToolWorld<'_, '_>,
     _arguments: &Value,
-    source_entity: Entity,
-    _source_agent: &str,
+    call: &CallContext<'_>,
 ) -> (String, bool) {
     world.remove_agent.write(RemoveAgentRequest {
-        agent: source_entity,
+        agent: call.source_entity,
     });
     ("Ending this agent...".to_owned(), false)
 }
 
-/// Handler lookup used by `catalog::execution`.
-///
-/// Each wrapper adapts the per-call [`CallContext`] to the source entity/name
-/// pair the handlers were extracted with.
-macro_rules! agent_tools {
-    ($($name:literal => $wrapper:ident = $handler:ident),* $(,)?) => {
-        $(
-            fn $wrapper(
-                world: &mut ToolWorld<'_, '_>,
-                arguments: &Value,
-                call: &CallContext<'_>,
-            ) -> (String, bool) {
-                $handler(world, arguments, call.source_entity, call.source_agent)
-            }
-        )*
-
-        pub(crate) fn handler(name: &str) -> Option<ToolFn> {
-            Some(match name {
-                $($name => $wrapper,)*
-                _ => return None,
-            })
-        }
-    };
-}
-
-agent_tools! {
-    "send_message_to_agent" => send_message_to_agent_tool = send_message_to_agent,
-    "list_agents" => list_agents_tool = list_agents,
-    "get_agent_history" => get_agent_history_tool = get_agent_history,
-    "get_agent_message" => get_agent_message_tool = get_agent_message,
-    "spawn_agent" => spawn_agent_tool = spawn_agent,
-    "rename_self" => rename_self_tool = rename_self,
-    "end_agent" => end_agent_tool = end_agent,
+tool_handlers! {
+    "send_message_to_agent" => send_message_to_agent,
+    "list_agents" => list_agents,
+    "get_agent_history" => get_agent_history,
+    "get_agent_message" => get_agent_message,
+    "spawn_agent" => spawn_agent,
+    "rename_self" => rename_self,
+    "end_agent" => end_agent,
 }
 
 #[cfg(test)]

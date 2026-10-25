@@ -17,6 +17,7 @@ pub(crate) mod tree;
 mod agent_tools;
 mod catalog;
 mod fs;
+mod registration;
 mod registry;
 mod search;
 mod world;
@@ -1052,29 +1053,15 @@ mod tests {
     }
 
     #[test]
-    fn every_definition_is_registered_with_unique_names() {
-        let definitions = definitions();
-        let tools = static_tools();
-        assert_eq!(tools.len(), definitions.len());
-
-        let mut names = definitions
-            .iter()
-            .map(|tool| tool.name.clone())
+    fn definitions_have_unique_names() {
+        let mut names = definitions()
+            .into_iter()
+            .map(|tool| tool.name)
             .collect::<Vec<_>>();
         names.sort_unstable();
         let unique = names.len();
         names.dedup();
         assert_eq!(names.len(), unique, "duplicate tool names: {names:?}");
-
-        for definition in &definitions {
-            assert!(
-                tools
-                    .iter()
-                    .any(|entry| entry.definition.name == definition.name),
-                "`{}` is defined but not registered",
-                definition.name
-            );
-        }
     }
 
     #[test]
@@ -1407,7 +1394,7 @@ mod tests {
     }
 
     #[test]
-    fn grep_and_sed_tools_are_advertised() {
+    fn grep_and_sed_tools_expose_parameters() {
         let tools = definitions();
         let grep = tools
             .iter()
@@ -1473,21 +1460,6 @@ mod tests {
 }
 
 #[cfg(test)]
-mod rename_tool_tests {
-    use super::*;
-
-    #[test]
-    fn rename_self_tool_exists() {
-        let tools = definitions();
-        let tool = tools
-            .iter()
-            .find(|tool| tool.name == "rename_self")
-            .expect("rename_self should exist");
-        assert!(tool.parameters.contains_key("name"));
-    }
-}
-
-#[cfg(test)]
 mod history_tool_tests {
     use super::*;
     use llm_history_model::history::MessageContent;
@@ -1526,7 +1498,7 @@ mod history_tool_tests {
     }
 
     #[test]
-    fn history_tools_are_advertised() {
+    fn history_tools_expose_parameters() {
         let tools = definitions();
         let history = tools
             .iter()

@@ -607,7 +607,7 @@ mod tests {
     }
 
     #[test]
-    fn appending_respects_block_kind() {
+    fn append_text_only_merges_matching_block_kinds() {
         let mut blocks = Vec::new();
         let mut pos = None;
         append_text(&mut blocks, &mut pos, "a", true);
@@ -619,6 +619,23 @@ mod tests {
                 signature: None,
                 encrypted_content: None,
             }]
+        );
+
+        // Starting a block of the other kind must produce a separate block
+        // instead of appending to the thinking block.
+        pos = None;
+        append_text(&mut blocks, &mut pos, "c", false);
+        append_text(&mut blocks, &mut pos, "d", false);
+        assert_eq!(
+            blocks,
+            vec![
+                DraftBlock::Thinking {
+                    text: "ab".into(),
+                    signature: None,
+                    encrypted_content: None,
+                },
+                DraftBlock::Text { text: "cd".into() },
+            ]
         );
     }
 }

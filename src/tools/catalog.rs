@@ -13,7 +13,7 @@ use serde_json::Value;
 use crate::{
     tools::{
         definitions,
-        registry::{Advertised, Availability, DisabledTool, Execution, ToolEntry},
+        registry::{Advertised, Availability, DisabledTool, Execution, ToolEntry, ToolFn},
     },
     virtual_fs::VirtualFs,
 };
@@ -39,6 +39,7 @@ struct Policy {
     availability: Availability,
     order: u32,
     tags: &'static [&'static str],
+    model_only: bool,
 }
 
 const fn advertises(order: u32, tags: &'static [&'static str]) -> Policy {
@@ -47,6 +48,7 @@ const fn advertises(order: u32, tags: &'static [&'static str]) -> Policy {
         availability: Availability::AnyWay,
         order,
         tags,
+        model_only: false,
     }
 }
 
@@ -56,6 +58,16 @@ const fn manual(order: u32, tags: &'static [&'static str]) -> Policy {
         availability: Availability::OnlyManual,
         order,
         tags,
+        model_only: false,
+    }
+}
+
+impl Policy {
+    /// Tools that scripts and JavaScript must not call (agent lifecycle and
+    /// the interpreter itself).
+    const fn model_only(mut self) -> Self {
+        self.model_only = true;
+        self
     }
 }
 
@@ -63,7 +75,7 @@ const fn manual(order: u32, tags: &'static [&'static str]) -> Policy {
 /// single reviewable diff.
 fn policy(name: &str) -> Policy {
     match name {
-        "execute" => advertises(2, &["dispatch"]),
+        "execute" => advertises(2, &["dispatch"]).model_only(),
         "rescan_tools" => advertises(3, &["dispatch", "tools"]),
         "search_tools" => advertises(1, &["search"]),
 
@@ -76,17 +88,17 @@ fn policy(name: &str) -> Policy {
         "fs_sed" => advertises(16, &["fs"]),
         "fs_delete" => manual(17, &["fs"]),
 
-        "eval_javascript" => advertises(20, &["js"]),
-        "run_javascript" => advertises(21, &["js"]),
+        "eval_javascript" => advertises(20, &["js"]).model_only(),
+        "run_javascript" => advertises(21, &["js"]).model_only(),
         "eval_javascript_reset_context" => manual(22, &["js"]),
 
         "send_message_to_agent" => advertises(30, &["agent"]),
-        "spawn_agent" => advertises(31, &["agent"]),
-        "rename_self" => advertises(32, &["agent"]),
+        "spawn_agent" => advertises(31, &["agent"]).model_only(),
+        "rename_self" => advertises(32, &["agent"]).model_only(),
         "list_agents" => manual(33, &["agent"]),
         "get_agent_history" => manual(34, &["agent"]),
         "get_agent_message" => manual(35, &["agent"]),
-        "end_agent" => manual(36, &["agent"]),
+        "end_agent" => manual(36, &["agent"]).model_only(),
 
         // Unknown names stay reachable but hidden: a definition without a
         // policy is a bug to fix, not a reason to break dispatch.
@@ -94,28 +106,28 @@ fn policy(name: &str) -> Policy {
     }
 }
 
+/// Inline handler lookup across every tool module.
+///
+/// Modules register through the shared `tool_handlers!` macro, so adding a
+/// module means adding exactly one line here; dispatch order never changes
+/// which name wins because each module owns a disjoint name set.
+fn inline_handler(name: &str) -> Option<ToolFn> {
+    crate::tools::fs::handler(name)
+        .or_else(|| crate::tools::agent_tools::handler(name))
+        .or_else(|| crate::tools::search::handler(name))
+        .or_else(|| crate::tools::rescan::handler(name))
+}
+
 fn execution(name: &str) -> Execution {
     if name == "execute" {
         return Execution::Gateway;
-    }
-    if name == "rescan_tools" {
-        return Execution::Inline(crate::tools::rescan::rescan_tools);
-    }
-    if let Some(handler) = crate::tools::fs::handler(name) {
-        return Execution::Inline(handler);
-    }
-    if let Some(handler) = crate::tools::agent_tools::handler(name) {
-        return Execution::Inline(handler);
-    }
-    if name == "search_tools" {
-        return Execution::Inline(crate::tools::search::search_tools);
     }
     if crate::tools::is_js_tool(name) {
         return Execution::Interpreter;
     }
     // A definition with no handler is a bug; `every_definition_has_a_handler`
     // fails in tests rather than letting the model hit this at runtime.
-    Execution::Inline(no_handler)
+    Execution::Inline(inline_handler(name).unwrap_or(no_handler))
 }
 
 fn no_handler(
@@ -131,32 +143,13 @@ pub(crate) fn auto_background(name: &str) -> bool {
     matches!(name, "run_javascript" | "eval_javascript")
 }
 
-/// Tools that scripts and JavaScript must not call (agent lifecycle and the
-/// interpreter itself).
-pub(crate) fn model_only(name: &str) -> bool {
-    matches!(
-        name,
-        "spawn_agent"
-            | "rename_self"
-            | "end_agent"
-            | "eval_javascript"
-            | "run_javascript"
-            | "execute"
-    )
-}
-
 /// Whether a definition has a real handler.
 ///
 /// Tests use this to catch a tool added to `definitions` but never wired into
 /// an execution module, which would otherwise surface only as a runtime error.
 #[cfg(test)]
 pub(crate) fn is_implemented(name: &str) -> bool {
-    crate::tools::fs::handler(name).is_some()
-        || crate::tools::agent_tools::handler(name).is_some()
-        || name == "search_tools"
-        || name == "execute"
-        || name == "rescan_tools"
-        || crate::tools::is_js_tool(name)
+    inline_handler(name).is_some() || name == "execute" || crate::tools::is_js_tool(name)
 }
 
 /// Register script tools found under `.tools`.
@@ -199,11 +192,12 @@ pub(crate) fn static_tools() -> Vec<StaticTool> {
                 availability,
                 order,
                 tags,
+                model_only,
             } = policy(&definition.name);
             StaticTool {
                 execution: execution(&definition.name),
                 auto_background: auto_background(&definition.name),
-                model_only: model_only(&definition.name),
+                model_only,
                 definition,
                 availability,
                 advertised,
